@@ -45,6 +45,7 @@
 
 extern "C" {
 extern const uint8_t mtk_bt_fw[], mtk_bt_fw_end[];
+extern const uint8_t mtk_bt_fw_7922[], mtk_bt_fw_7922_end[];
 }
 
 #define FW_HDR_SIZE       32
@@ -110,7 +111,8 @@ private:
     bool hciReset();
     bool bringUp();
     int wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, uint8_t *evFlag);
-    bool download();
+    bool download(uint32_t chip);
+    uint32_t chipId = 0x7925;       // from REG_DEV_ID in run(); selects the embedded firmware
     void intrArm();
     static void intrDone(void *owner, void *param, IOReturn status, uint32_t bytes);
 };
@@ -217,7 +219,7 @@ bool MtkBtFw::hciReset()
 // Download, endpoint reset option, FUNC_CTRL 1, HCI check.
 bool MtkBtFw::bringUp()
 {
-    if (!download() || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
+    if (!download(chipId) || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
     uint8_t on = 1, f = 0;
     if (wmt(WMT_FUNC_CTRL, 0, &on, 1, &f) < 0) return false;
     say("bluetooth function on (flag %u)", f);
@@ -248,10 +250,11 @@ int MtkBtFw::wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, u
     return -1;
 }
 
-bool MtkBtFw::download()
+bool MtkBtFw::download(uint32_t chip)
 {
-    const uint8_t *fw = mtk_bt_fw;
-    size_t fwlen = (size_t)(mtk_bt_fw_end - mtk_bt_fw);
+    const uint8_t *fw = chip == 0x7922 ? mtk_bt_fw_7922 : mtk_bt_fw;
+    const uint8_t *end = chip == 0x7922 ? mtk_bt_fw_7922_end : mtk_bt_fw_end;
+    size_t fwlen = (size_t)(end - fw);
     if (fwlen < FW_HDR_SIZE + FW_GD_SIZE) { say("firmware blob too small"); return false; }
     uint32_t nsec = le32(fw + FW_HDR_SIZE + 12);
     char date[17] = {0};
@@ -383,7 +386,14 @@ void MtkBtFw::run()
     if (uhwRead(REG_WDT_STATUS, &wdt) && wdt) fwAlive = false;
     if (!ok) { ok = subsysReset() && regRead(REG_DEV_ID, &devId); fwAlive = ok; }
     if (ok) say("chip %04x fw_ver %08x wdt %u", devId & 0xffff, fwVer, wdt);
-    if (ok && (devId & 0xffff) != 0x7925) { say("not an MT7925, leaving it alone"); ok = false; }
+    if (ok) chipId = devId & 0xffff;
+    if (ok && chipId != 0x7925 && chipId != 0x7922) { say("not an MT7925 or MT7922, leaving it alone"); ok = false; }
+    // MT7922 (experimental, contributed for the GA403UV): Linux btmtk_fw_get_filename() picks
+    // BT_RAM_CODE_MT7922_1_<(fwVer & 0xff) + 1>_hdr.bin; only _1_1 is embedded.
+    else if (ok && chipId == 0x7922 && (fwVer & 0xff) != 0) {
+        say("MT7922 needs firmware suffix %x; only _1_1 is embedded", (fwVer & 0xff) + 1);
+        ok = false;
+    }
     else if (ok) {
         if (!fwAlive) { say("firmware of the previous session is dead, resetting"); ok = subsysReset(); }
         if (ok && !bringUp()) {
