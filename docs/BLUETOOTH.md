@@ -27,6 +27,41 @@ standard HCI controller, but only after its RAM code has been downloaded; macOS 
 > shared radio, docs/ROADMAP-AWDL.md §10.29); whether that matters is not known. Recovery: a full shutdown (cold boot) reloads
 > all sections.
 
+### Recovery in the loader (2026-11-03, staged on the ESP, not yet booted)
+
+Linux does not give up on a failed download either: `btmtk_usb_setup` calls `btmtk_reset_sync` when
+`btmtk_setup_firmware_79xx` fails or `FUNC_CTRL` times out, and the USB callback (`btusb_mtk_reset` in `btusb_main.c`) runs
+`btmtk_usb_subsys_reset` and sets the device up again from the start. `MtkBtFw` now does the same in place:
+
+- **Timeout per WMT event** is 10 s (`HCI_INIT_TIMEOUT`, what `btmtk_usb_hci_wmt_sync` waits), not ~2 s as before.
+- **On any failure** (missing WMT event, failed block, bad status, chip id read failed, FUNC_CTRL failed): the MT7925 branch of
+  `btmtk_usb_subsys_reset` (CONNV3 reset register `0x70028610`: bit 5, then bits 8-15 cleared + bit 13, EP_RST_OPT
+  `0x74011890` = `0x00010001`, bit 0; UDMA interrupt status `0x74000024` / `0x74000308` = `0xff`; 100 ms; poll
+  `0x70002510` bit 8 RST_DONE every 20 ms for up to 1 s; device id must read non-zero), drop stale WMT events, then the whole
+  download again from section 0. Up to 4 downloads in all. A section answered "already loaded" is still skipped.
+- **No answer to the very first PATCH_DWNLD query** (no WMT event at all yet, the 2026-10-12 `wmt op 1 flag 0: no event` case)
+  is handled on its own: an HCI Read Local Version (0x1001) is sent; if the controller answers, the RAM code is already
+  running and is left alone (`ready (already running)`); if not, the reset path above is taken.
+- `bt-log` records each attempt (`attempt N: subsystem reset`, `subsys reset done in .. ms`, `attempt N failed after .. ms`)
+  and the first bytes of the first interrupt packet (to see what the 106 dropped packets were). `bt-attempts` = number of
+  downloads used.
+
+Not in it: the USB port reset that Linux queues after the subsystem reset (`usb_queue_reset_device`). If the in-place reset
+does not bring the chip back, that is the next step.
+
+**Next-boot test** (warm reboot several times, after at least one boot with AWDL active; once with a cold boot for comparison):
+```
+ioreg -rc MtkBtFw -l | grep bt-
+system_profiler SPBluetoothDataType | head -12               # real address, not BCM_4350C2 / NULL
+```
+Expected: `bt-state` = `ready`; on a bad warm boot `bt-attempts` > 1 with a `subsys reset done` line before a successful
+download. If `bt-state` = `error` after all attempts, keep the full `bt-log` line.
+
+**Undo** (the previous kext is on the ESP; no sudo, the ESP is user-owned):
+```
+mv /Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext /Volumes/ESP/EFI/OC/Kexts-backup/MtkBtFw.kext.retry-$(date +%Y%m%d-%H%M%S) && cp -R /Volumes/ESP/EFI/OC/Kexts-backup/MtkBtFw.kext.20261103-235649 /Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext
+```
+
 ## Status (2026-10-11, first boot with it)
 
 Works as a controller: `bt-state` = ready after 5.2 s (sections 0-2 downloaded: 74 176 + 332 224 + 41 472 bytes, 0 dropped
