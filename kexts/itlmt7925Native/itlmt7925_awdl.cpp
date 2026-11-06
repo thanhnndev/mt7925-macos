@@ -55,6 +55,18 @@ static uint32_t awdlBlock()
     return v;
 }
 static const uint32_t kAwdlEawWinMs = 64;                 // a whole EAW (4 x 16 TU = 65.5 ms) less 1.5 ms of margin
+// §10.65: consecutive present EAWs on one channel are one window (one ROC acquire, one abort), at most this many. Back-to-back
+// windows of one EAW each could not be met (the setup takes ~35 ms, the gap between them is 1.5 ms: avg 39 ms late), and
+// keeping one ROC across them (§10.61) hung the firmware: an extended ROC outlived the duration it was granted for.
+static uint32_t awdlRunMax()
+{
+    static uint32_t v = 0;
+    if (!v) {
+        uint32_t b = 0;
+        v = (PE_parse_boot_argn("itlmt_awdl_run", &b, sizeof(b)) && b >= 1 && b <= 5) ? b : 3;
+    }
+    return v;
+}
 
 // The AWDL timeline (docs/ROADMAP-AWDL.md §10.28). On Apple hardware the firmware keeps it: it numbers the availability windows
 // (AW, 16 TU), groups four of them into an extended window (EAW, 64 TU) that takes one entry of the 16-slot channel sequence,
@@ -432,7 +444,7 @@ private:
     IOTimerEventSource *awdlLsnTimer = nullptr;  // fires at the listened-to peer's next present EAW
     bool awdlPsfPending = false;                 // a PSF/MIF is due and rides in the next listen window
     uint64_t awdlLsnAtUs = 0;                    // start of the EAW the listen timer is armed for
-    uint8_t awdlLsnCh = 0, awdlLsnSlot = 0;
+    uint8_t awdlLsnCh = 0, awdlLsnSlot = 0, awdlLsnRun = 1;   // awdlLsnRun: EAWs the armed window covers (§10.65)
     uint32_t awdlLsnWins = 0, awdlLsnTx = 0, awdlLsnFail = 0, awdlPeerTlUpd = 0, awdlSlaveAlign = 0;
     uint32_t awdlFamilyState = 1;                // the state the Family itself last set
     uint32_t awdlRoleFromAddr = 0;               // SYNC_STATE with state 1 and another node's address (§10.34)
@@ -1463,6 +1475,9 @@ void itlmt7925AwdlInterface::awdlLsnArm(uint64_t now)
         awdlLsnAtUs = at;
         awdlLsnCh = lch;
         awdlLsnSlot = slot;
+        awdlLsnRun = 1;
+        if (awdlBlock())
+            while (awdlLsnRun < awdlRunMax() && awdlSchedCh(ord + awdlLsnRun) == lch) awdlLsnRun++;
         uint64_t real = awdlNowUs();                             // `now` may be a point in the future (after a window)
         uint32_t lead = awdlSyncVer >= 5 ? kAwdlPreUs : 2000;
         uint64_t d = at > real + lead ? at - real - lead : 200;
@@ -1486,7 +1501,9 @@ void itlmt7925AwdlInterface::awdlLsnFire()
     // gets a share of every EAW.
     bool tx = awdlPsfPending;
     uint64_t at = awdlLsnAtUs;
-    uint32_t dwell = (awdlBlock() && awdlSyncVer >= 5) ? kAwdlEawWinMs : awdlWinMs();
+    uint32_t dwell = (awdlBlock() && awdlSyncVer >= 5)
+                         ? (uint32_t)(awdlLsnRun * kAwdlAwUs * kAwdlAwPerEaw / 1000) - 2   // the whole run, 1.5 ms short
+                         : awdlWinMs();
     IOReturn r = awdlSubmitWindow(awdlLsnCh, dwell, tx, (uint16_t)awdlLsnSlot, awdlSyncVer >= 5 ? at : 0);
     if (r == kIOReturnSuccess) {
         awdlLsnWins++;

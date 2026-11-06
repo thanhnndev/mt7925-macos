@@ -3144,3 +3144,34 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 3. Ping the iPhone's AWDL address (from `ndp -an`), 30 pings.
 4. Run `itlctl itl_awdlchain=64` for 2 minutes. Expect `awdl hold: take=1` lines, `held` growing and `recover #` staying at 0. Ping again.
 5. If there is no reset, try `itl_awdlchain=200` (covers a run of up to 4 EAWs).
+
+### 10.65 Boot 2026-11-06 12:50 (core 25E4B5AF, native 102D1566): the iPhone is master, AirDrop requests go both ways, files do not; chaining still hangs → one window per run (native 6B413594)
+
+**What works now.** The AP was on ch 40 this boot.
+- With the share sheet open, the Mac became the iPhone's **slave** (role=2, master = the iPhone's d2:e6:e3:2f:3d:af). This is the first time.
+- Our TLV 4 now carries exactly the iPhone's sequence: 149 in slots 0-2 and 9-10, ch 6 in slot 8, the rest empty.
+- Mac and iPhone see each other and AirDrop requests arrive in both directions (with the AirDrop code prompt), but no file goes through.
+- Ping to the iPhone: 14/30 answered (+18 duplicates), RTT 24 ms to 1.9 s, average 1.18 s.
+- Wi-Fi was stable for 36 minutes, with no reset while chaining was off.
+
+**Chaining still hangs the firmware, even with the §10.64 fix.**
+- I set `itl_awdlchain=64` at 13:26:54. There were 3 holds (`take=1`, s2-now about 2 ms, rocend-now about 83 ms).
+- At 13:27:16: `rx_filter`/`sniffer on` timed out, then "the firmware stopped answering MCU commands", `recover #1`, and the owner lost Wi-Fi.
+- The MCU history before it shows `roc_acquire@2634 … sniffer off / roc_abort@2969`: one ROC held **335 ms** although it was requested for about 190 ms.
+- The firmware sends no event when a ROC expires, so an extended ROC outlives its grant and the late abort (or the commands around it) kills the firmware. The §10.64 double close was the same failure.
+- **Conclusion: never extend a ROC.** Chaining stays off (default 0); do not turn it on again.
+
+**Change (native 6B413594).**
+- In the schedule (§10.62/64), the listen timer merges consecutive present EAWs on the same channel into **one window**: `awdlLsnRun`, at most `itlmt_awdl_run` EAWs (default 3, range 1-5).
+- The window's dwell is `run x 65.5 ms - 2 ms`, so there is one ROC acquire for exactly that duration (+30 ms margin, as before) and one abort before it expires.
+- This replaces the back-to-back one-EAW windows, which averaged 39 ms late (`avglate=39989us`) because the setup (about 35 ms) cannot fit in a 1.5 ms gap.
+- The iPhone's run of 3 on 149 becomes one 194 ms window instead of 3 late ones. The core is unchanged.
+
+**Undo:** `Kexts-backup/itlmt7925Native.kext.20261106-133052` (102D1566).
+
+**Next boot test:**
+1. Check the UUIDs are 25E4B5AF / 6B413594. Wi-Fi must hold with no `recover #`.
+2. Open the share sheet. Check role=2 and that the self TLV 4 matches the peer TLV 4.
+3. Read the `awdl lead:` line: `avglate` should be far below 39 ms. The `awdl phase` dwell should be up to about 190 ms.
+4. Ping the iPhone 30 times and compare with 14/30 at an average of 1.18 s.
+5. Send a photo in each direction.
