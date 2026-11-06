@@ -3259,3 +3259,26 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 2. Start the recorder right after login and grep early for `regulatory: country` and `clc `. If they have been evicted, use `log show --last boot | grep regulatory`.
 3. Use Wi-Fi and AirDrop for 10 min: no `recover #`, and `lateabort=0` on the chain stat line.
 4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.69 Boot 2026-11-06 16:33 (core 3F4AFE7C, native 6B413594): late aborts come from a slow sniffer-off, not the dwell → abort first, skip an abort past the deadline (core D79C6734)
+
+**What happened.**
+- Wi-Fi was fine: gateway ping averaged 26–36 ms, and there was no `recover #` in the first 6 minutes.
+- `lateabort` reached 12 in 6 minutes: `awdl: roc abort 186–202 ms after the ROC's end`.
+- `clip=0`: the dwell was never cut, so the time before the dwell was not the cause.
+- The phase stats show `soff` (sniffer off) growing by about 200 ms each time a late abort was logged. The firmware sometimes takes about 200 ms to answer the sniffer-off command, and the abort, sent after it, reached the firmware late. The MCU command timeout is 3 s, so this is the firmware's own delay.
+- airportd reads the country from the scan results as `countryCode VN`, so the AP very likely sends a Country IE. The core's country is now on a repeating stat line, so it is no longer evicted from the ring.
+
+**Change (core D79C6734).**
+- The ROC abort is sent as soon as the dwell ends, before the sniffer-off.
+- If an abort would still be past the ROC's deadline, it is skipped: the ROC is timed and the firmware ends it on its own. The next ROC request then waits until the old one has surely ended (grant + its duration + 20 ms). This is logged as `awdl: roc abort skipped, N us past the deadline (dwell …, after it …)`.
+- A sniffer-off that takes 50 ms or more is logged as `awdl: sniffer off took N ms`.
+- The chain stat line now shows `lateabort=` (skipped aborts), `soffslow=`, `cc=` (the country sent to the firmware) and `clc=` (the country of the CLC tables).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-164012` (3F4AFE7C).
+
+**Next boot test:**
+1. Check the UUIDs are D79C6734 / 6B413594.
+2. On the `awdl chain` line: `cc=VN clc=VN` (if `cc=00`, the AP's Country IE was not found). `lateabort` should stay 0 or very low, and `soffslow` shows how often the firmware is slow.
+3. Use Wi-Fi with AirDrop on for 10 min: no `recover #`.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.

@@ -244,7 +244,8 @@ private:
     // §10.61: one ROC held across consecutive windows on the same channel (one firmware channel switch for several AWs)
     uint32_t awdlChainMs = 0;                     // itl_awdlchain: extra off-channel time a held ROC may add (0 = off; §10.63: off by default)
     uint32_t awdlHoldLog = 0;
-    uint32_t awdlRocClip = 0, awdlRocLateAbort = 0;   // §10.68: dwells cut to the ROC deadline / aborts after it
+    uint32_t awdlRocClip = 0, awdlRocLateAbort = 0, awdlSoffSlow = 0;
+    uint64_t awdlRocQuietUs = 0;   // §10.69: no ROC request before this (a skipped abort's ROC is still running)   // §10.68: dwells cut to the ROC deadline / aborts after it
     uint8_t awdlHostPs = 0;
     volatile uint8_t awdlApPsWake = 0;           // ask the link loop for one PM=0 null to the AP                       // itl_awdlps: 1 = host PM=1/PM=0 null frames around each ROC (before §10.66)
     uint8_t awdlHeldCh = 0;                       // channel of the ROC kept open for the next window (0 = none)

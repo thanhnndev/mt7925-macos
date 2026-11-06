@@ -1020,6 +1020,7 @@ void itlmt7925::awdlSyncTx()
     // A timed ROC, as Linux asks for a remain-on-channel (MT7925_ROC_REQ_ROC, maxinterval = the duration). Until §10.40 every
     // window asked for a 5-second JOIN-type ROC and aborted it after 20-100 ms, about 10 times a second; after ~3100 windows
     // (133 never granted) the firmware stopped answering MCU commands and the infrastructure link died with it.
+    uint32_t rocDurMs = 0;                                   // the duration asked for this window's ROC
     {
         uint64_t now = awdlUptimeUs();
         uint32_t ahead = (startUs && startUs > now) ? (uint32_t)((startUs - now) / 1000) : 0;
@@ -1029,7 +1030,12 @@ void itlmt7925::awdlSyncTx()
         // hung it - 364 and 338 ms from acquire to abort for 259 ms asked, 2026-11-06 14:38.
         uint32_t dur = dwellMs + 30 + 25 + 40 + ahead + awdlChainMs;
         if (!onCh && !chained) {
+            // §10.69: a ROC whose abort was skipped (it ran past its deadline) is still the firmware's until it ends on its
+            // own; the next request waits for that (bounded: the quiet time is at most one ROC's duration away).
+            while (awdlUptimeUs() < awdlRocQuietUs) m3Pump(1);
+            now = awdlUptimeUs();
             m3Roc(true, ch, 1, dur);
+            rocDurMs = dur;
             rocEndUs = now + (uint64_t)(dur - 10) * 1000;
             rocDeadlineUs = now + (uint64_t)dur * 1000;
         }
@@ -1042,6 +1048,7 @@ void itlmt7925::awdlSyncTx()
     uint32_t rocT0 = nowMs(), rocMs = 0;
     for (int i = 0; !onCh && !chained && i < 300 && rocWant && !rocGrant; i++) m3Pump(1);   // m3Pump keeps servicing the AP meanwhile
     rocMs = nowMs() - rocT0;
+    uint64_t grantUs = awdlUptimeUs();                       // the firmware counts the ROC's duration from about here
     ph(2);
     bool granted = onCh || chained || rocGrant, bad = !onCh && !chained && rocStatus;
     bool late = !onCh && !chained && granted && rocMs >= 80;
@@ -1136,18 +1143,43 @@ void itlmt7925::awdlSyncTx()
         if (awdlStampSync(f, l, tl)) awdlStamped++;
         else if (tl.periodUs) awdlStampMiss++;
     };
+    // §10.69: the ROC is closed with an abort only while the firmware still holds it. Past the deadline (some step after the
+    // clip overran: 199 ms late on 2026-11-06 16:36 with no dwell cut) the abort is skipped - an abort after the firmware has
+    // ended the ROC is what hung it - and the next ROC waits until this one has surely ended (grant + its duration + 20 ms).
+    uint64_t dwT0 = 0, dwT1 = 0;
+    auto rocClose = [&](uint64_t a, uint64_t b) {
+        uint64_t now = awdlUptimeUs();
+        if (rocDeadlineUs && now > rocDeadlineUs) {
+            awdlRocLateAbort++;
+            rocWant = false;
+            rocGrant = false;
+            awdlRocQuietUs = grantUs + (uint64_t)rocDurMs * 1000 + 20000;
+            if (awdlRocLateAbort <= 8)
+                m3log("awdl: roc abort skipped, %u us past the deadline (dwell %u us, after it %u us, ch=%u grant=%u ms)",
+                      (unsigned)(now - rocDeadlineUs), (unsigned)(b - a), (unsigned)(now - b), ch, rocMs);
+            return;
+        }
+        m3Roc(false, ch);
+    };
+    // The abort goes first, the moment the dwell is over; the sniffer is switched off after it. On 2026-11-06 16:36-16:38 the
+    // sniffer-off command took ~200 ms to be answered 8 times in 2 minutes, and the abort queued behind it reached the
+    // firmware 186-202 ms after the ROC's end.
+    auto snifferOff = [&]() {
+        uint64_t t = awdlUptimeUs();
+        m3SnifferEnable(false);
+        uint32_t ms = (uint32_t)((awdlUptimeUs() - t) / 1000);
+        if (ms >= 50 && awdlSoffSlow++ < 8) m3log("awdl: sniffer off took %u ms (ch=%u)", ms, ch);
+    };
     if (listenOnly) {
+        dwT0 = awdlUptimeUs();
         awdlDwell(dwellMs);
+        dwT1 = awdlUptimeUs();
         ph(5);
         if (hold()) return;
-        m3SnifferEnable(false);
-        ph(6);
-        if (!onCh) {
-            if (rocDeadlineUs && awdlUptimeUs() > rocDeadlineUs && awdlRocLateAbort++ < 6)
-                m3log("awdl: roc abort %u us after the ROC's end", (unsigned)(awdlUptimeUs() - rocDeadlineUs));
-            m3Roc(false, ch);
-        }
+        if (!onCh) rocClose(dwT0, dwT1);
         ph(7);
+        snifferOff();
+        ph(6);
         winEnd();
         ph(8);
         if (!onCh && !chained) awdlPhN++;
@@ -1165,18 +1197,16 @@ void itlmt7925::awdlSyncTx()
         awdlTx2Try++;
         if (m3Tx(frame2, len2, 0, 13, o)) awdlTx2Ok++;
     }
+    dwT0 = awdlUptimeUs();
     awdlDwell(dwellMs);                                      // the whole dwell: data out, frames in
+    dwT1 = awdlUptimeUs();
     ph(5);
     bool held = hold();
     if (!held) {
-        m3SnifferEnable(false);
-        ph(6);
-        if (!onCh) {
-            if (rocDeadlineUs && awdlUptimeUs() > rocDeadlineUs && awdlRocLateAbort++ < 6)
-                m3log("awdl: roc abort %u us after the ROC's end", (unsigned)(awdlUptimeUs() - rocDeadlineUs));
-            m3Roc(false, ch);
-        }
+        if (!onCh) rocClose(dwT0, dwT1);
         ph(7);
+        snifferOff();
+        ph(6);
         winEnd();
         ph(8);
         if (!onCh && !chained) awdlPhN++;
@@ -1198,8 +1228,8 @@ void itlmt7925::awdlSyncTx()
         m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus stale=%u wait=%ums on=%u onch=%u apch=%u", awdlLeadUs,
               awdlLeadEarly, awdlLeadLateN, awdlLeadLateN ? (uint32_t)(awdlLeadLateUs / awdlLeadLateN) : 0, awdlLeadStale,
               awdlLeadWaitMs, awdlLeadOn, awdlOnChWin, tgtCh);
-        m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u", awdlChainN, awdlChainBreak,
-              awdlChainTimeout, awdlChainMs, awdlRocClip, awdlRocLateAbort);
+        m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u (skipped) soffslow=%u cc=%s clc=%s",
+              awdlChainN, awdlChainBreak, awdlChainTimeout, awdlChainMs, awdlRocClip, awdlRocLateAbort, awdlSoffSlow, regCc, clcCc[0] ? clcCc : "-");
         if (awdlPhN) {
             uint32_t a[9];
             for (int i = 0; i < 9; i++) a[i] = (uint32_t)(awdlPhUs[i] / awdlPhN / 100);   // 0.1 ms units
