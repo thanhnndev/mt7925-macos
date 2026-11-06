@@ -378,7 +378,8 @@ int itlmt7925::m3HwPrep()
     static uint8_t dom[16 + 8 * 48];
     unsigned n2 = sizeof(ch2) / sizeof(ch2[0]), n5 = sizeof(ch5) / sizeof(ch5[0]);
     bzero(dom, sizeof(dom));
-    dom[0] = '0'; dom[1] = '0';
+    regCountryFromAp();
+    dom[0] = (uint8_t)regCc[0]; dom[1] = (uint8_t)regCc[1];
     dom[4] = 0; dom[5] = 3; dom[6] = 3;                      // bw_2g 20/40, bw_5g 20..160, bw_6g
     put16(dom + 8, 2);                                       // tag
     put16(dom + 10, (uint16_t)(8 + (n2 + n5) * 8));          // len
@@ -388,8 +389,30 @@ int itlmt7925::m3HwPrep()
     for (unsigned i = 0; i < n5; i++, w += 8) put16(w, ch5[i]);
     int rc = m3Cmd(UNI_SET_DOMAIN_INFO, dom, (size_t)(w - dom), "set_domain");
     if (rc) return rc;
-    if (!clcCc[0] && !noPwr) m3PowerSetup();
+    if ((!clcCc[0] || clcCc[0] != regCc[0] || clcCc[1] != regCc[1]) && !noPwr) m3PowerSetup();
     return rc;
+}
+
+// §10.67: the regulatory country, as Linux takes it (802.11d: the Country IE of the AP, cfg80211 regulatory hint ->
+// mt7925_mcu_regd_update -> set_domain + CLC for that alpha2). Until now the firmware always got "00": the world domain,
+// where every 5 GHz channel is no-initiate-radiation. The firmware then let us transmit on the AP's own channel only, and
+// AWDL unicast on 149 failed 198 of 223 times (2.4 GHz: 2 of 27) on 2026-11-06 14:0x - the iPhone heard almost nothing we
+// sent there, so the AirDrop "Ask" never completed.
+void itlmt7925::regCountryFromAp()
+{
+    char cc[3] = {'0', '0', 0};
+    const uint8_t *ie = tgtIe, *end = tgtIe + (tgtIeLen < sizeof(tgtIe) ? tgtIeLen : sizeof(tgtIe));
+    while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
+        if (ie[0] == 7 && ie[1] >= 3 && ie[2] >= 'A' && ie[2] <= 'Z' && ie[3] >= 'A' && ie[3] <= 'Z') {
+            cc[0] = (char)ie[2];
+            cc[1] = (char)ie[3];
+            break;
+        }
+        ie += 2 + ie[1];
+    }
+    if (cc[0] != regCc[0] || cc[1] != regCc[1]) m3log("regulatory: country %c%c (was %c%c)", cc[0], cc[1], regCc[0], regCc[1]);
+    regCc[0] = cc[0];
+    regCc[1] = cc[1];
 }
 
 // Power tables: CLC (world, indoor) + the SKU limits. Best effort: the firmware ran without them before (they were added without
@@ -405,7 +428,7 @@ int itlmt7925::m3PowerSetup()
         return 0;
     }
     hwEncap = encap & 3;
-    rc = m3Clc("00", 1);                                   // world, indoor; same domain as set_domain
+    rc = m3Clc(regCc, 1);                                  // the country in use (falls back to world rules), indoor
     if (!rc) rc = m3TxPower();
     if (rc) {
         clcCc[0] = 0;                                       // retry the complete setup on the next join

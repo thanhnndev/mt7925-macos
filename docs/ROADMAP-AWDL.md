@@ -3200,3 +3200,37 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 2. Run `ping -c 40 -i 0.5 <gateway>`: no ~3 s batches, RTT under about 20 ms.
 3. Open the share sheet, then repeat the ping plus 30 pings to the iPhone. Send a photo in each direction.
 4. If the gateway RTT is bad again, try `itlctl itl_awdlps=1` and then `=0` (the second also sends a PM=0 null) to see whether the bursts follow it.
+
+### 10.67 Boot 2026-11-06 13:58 (core 05BAA75B, native 6B413594): AirDrop HELLO works, the Ask never arrives; 5 GHz unicast TX fails → regulatory country from the AP (core 4814D0F5)
+
+**Fixed by §10.66.** The gateway ping averaged 19 ms (it was 0.9-2 s), internet 41 ms, no resets. `ps=0/1154`: no host PM=1 nulls.
+
+**AirDrop, iPhone → Mac.** The iPhone showed "Waiting…" and then declined by itself.
+- 14:01:32: sharingd accepted a QUIC (HTTP/3) connection over awdl0. It logged `Received HELLO request` and `Sending HELLO response`, so the AirDrop handshake works over our AWDL for the first time.
+- 14:01:33: the iPhone opened a second stream for the Ask, which never completed.
+- 14:02:41: `Lost BLE device`, then `Attempting Stop AirDrop … Cancelling all connections`.
+- 14:03:20: QUIC reported `No route to host` on awdl0.
+- Ping to the iPhone: 13/20 answered, average 253 ms (was 14/30 at 1.18 s).
+
+**The data, by band.**
+- `awdl txfree`: uc5 = 25 ok / 198 fail, uc24 = 25 / 2. ucheard (the peer was heard in the same window) = 27 / 147.
+- RX unicast from the iPhone: 865 frames.
+- So what we send on 149 almost never reaches the iPhone, while 2.4 GHz works.
+
+**Cause.** The firmware always received the world domain "00", in both `set_domain` and the CLC power tables. In the world domain every 5 GHz channel is no-initiate-radiation, so the firmware lets us transmit at 5 GHz only on the AP's own channel (40). Linux takes the country from the AP's Country IE (802.11d hint → `mt7925_mcu_regd_update` → domain + CLC for that alpha2).
+
+**Change (core 4814D0F5).** `regCountryFromAp()` reads element 7 from the target's IEs.
+- `set_domain` carries that alpha2.
+- The CLC tables are sent for it, falling back to the world rules when the firmware has no rule for it.
+- The power tables are re-sent when the country changes.
+- The log shows `regulatory: country XX (was 00)` and `clc XX env 1 …`.
+- An AP without a Country IE keeps "00".
+
+**Not addressed yet: BLE.** sharingd stopped the session when it lost the iPhone over BLE (a Bluetooth-side issue, the side session bt-make-bluetoothd-le-ad).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-141216` (05BAA75B).
+
+**Next boot test:**
+1. Check the UUIDs are 4814D0F5 / 6B413594. The log should have a `regulatory: country` line (or none if the AP sends no Country IE: then this is not the fix).
+2. Ping the gateway (no bursts) and the internet.
+3. Open the share sheet and send a photo. Read `awdl txfree`: uc5 ok/fail should move toward the 2.4 GHz ratio. Check sharingd for `Received ASK request`.

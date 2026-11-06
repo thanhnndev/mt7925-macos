@@ -314,6 +314,8 @@ private:
     int8_t sarPwr[11];                       // ACPI dynamic SAR limit per mt76 SAR range (0.5 dBm), 127 none; read in m3HwPrep
     uint8_t hwEncap = 0;                     // efuse 0xa71 bits 1:0: selects the CLC tables meant for this module
     char clcCc[3] = {0};                     // country the CLC tables were last sent for
+    char regCc[3] = {'0', '0', 0};           // §10.67: the country in use (the AP's Country IE, else "00" world)
+    void regCountryFromAp();
     // step 4: association complete -> 4-way handshake, keys, Ethernet interface, data path
     bool m3dataOn = false;                   // data frames from the AP are handled (set after association)
     bool m3wantEapol = false;
