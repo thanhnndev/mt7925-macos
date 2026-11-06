@@ -3234,3 +3234,28 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 1. Check the UUIDs are 4814D0F5 / 6B413594. The log should have a `regulatory: country` line (or none if the AP sends no Country IE: then this is not the fix).
 2. Ping the gateway (no bursts) and the internet.
 3. Open the share sheet and send a photo. Read `awdl txfree`: uc5 ok/fail should move toward the 2.4 GHz ratio. Check sharingd for `Received ASK request`.
+
+### 10.68 Boot 2026-11-06 14:25 (core 4814D0F5, native 6B413594): a run window outlived its ROC and the late abort hung the firmware → ROC sized for the whole window, dwell clipped to the ROC deadline (core 3F4AFE7C)
+
+**What happened.**
+- The gateway stayed fine (no bursts, so §10.66 holds).
+- 14:38:41: `recover #` (the firmware stopped answering, then the chip was reset).
+- The MCU history before the reset: `roc_acquire@331 … roc_abort@695` and `roc_acquire@2837 … roc_abort@3175`, so the abort came 364 ms and 338 ms after the acquire, for a ROC of about 259 ms requested.
+- This is the same failure as the held ROC in §10.61/64. The firmware ends the ROC on its own and sends no event; an abort that arrives after that hangs it.
+- The §10.65 run windows (up to 3 EAWs = 196 ms of dwell) plus the ~25 ms grant and the AW-start wait ran past the ROC's end.
+
+**Change (core 3F4AFE7C).**
+- The ROC is requested for `dwell + 30 + 25 + 40 + ahead` ms: dwell, the grant time, the AW-start wait, and a margin.
+- After the AW-start wait the dwell is cut so that the abort is sent at least 40 ms before the ROC's deadline. The first 6 cuts are logged as `awdl: dwell N ms cut to M (ROC deadline)`.
+- Both abort sites log `awdl: roc abort N us after the ROC's end` if an abort is still late.
+- The chain stat line now has `clip=` (dwell cuts) and `lateabort=` (late aborts; should stay 0).
+
+**Not verified: the country fix (§10.67).** The recorder ring had already evicted the early lines, so there was no `regulatory: country` line; only `set_domain rc=0 st=0` remained (14:38:41, after the reset).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-144134` (4814D0F5).
+
+**Next boot test:**
+1. Check the UUIDs are 3F4AFE7C / 6B413594.
+2. Start the recorder right after login and grep early for `regulatory: country` and `clc `. If they have been evicted, use `log show --last boot | grep regulatory`.
+3. Use Wi-Fi and AirDrop for 10 min: no `recover #`, and `lateabort=0` on the chain stat line.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
