@@ -3175,3 +3175,28 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 3. Read the `awdl lead:` line: `avglate` should be far below 39 ms. The `awdl phase` dwell should be up to about 190 ms.
 4. Ping the iPhone 30 times and compare with 14/30 at an average of 1.18 s.
 5. Send a photo in each direction.
+
+### 10.66 Boot 2026-11-06 13:36 (core 25E4B5AF, native 6B413594): the AP buffers our downlink in ~3 s bursts → host power-save nulls off (core 05BAA75B)
+
+**Symptom.** The AP was on ch 40. Internet was very slow: `ping 1.1.1.1` took 0.3-5.9 s, and pings to the gateway (10.0.0.1) took 3 ms to 3 s.
+- With `ping -i 0.5`, replies came back in batches about every 3 s. The RTT fell by 500 ms per packet (2982 → 2479 → 1978 → 1477 → 974 → 474 → 4 ms).
+- AWDL ran no window at all during that ping (psf/lsn counters unchanged). The whole boot had only 51 windows (about 1% airtime), and the result was the same with `ifconfig awdl0 down` (average 905 ms).
+- So this is the AP holding our downlink as for a dozing station, releasing it in bursts.
+
+**Cause (likely).** Since §10.43 the core sends its own null frames to the AP: PM=1 before every ROC and PM=0 after it. Linux mt7925 sends none around a ROC, because the firmware does that signalling itself. Two PS state machines disagreed about whether we were asleep. `ps=51/51` balanced, but the order of the frames on air relative to the firmware's own nulls is unknown.
+
+**Change (core 05BAA75B):**
+- `itl_awdlps` defaults to 0: no host PM=1 null.
+- PM=0 nulls after a window are still sent (harmless; they only say "awake").
+- Setting `itl_awdlps=0` at runtime also sends one PM=0 null right away.
+- `itl_awdlps=1` restores the old behaviour.
+
+**Native 6B413594 (runs, §10.65):** this boot had only 4 peer frames (no share sheet while measured), so it is not judged yet. `stale=67` came from PSF-tick windows submitted for an EAW that a run window already covered.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-134808` (25E4B5AF).
+
+**Next boot test:**
+1. Check the UUIDs are 05BAA75B / 6B413594.
+2. Run `ping -c 40 -i 0.5 <gateway>`: no ~3 s batches, RTT under about 20 ms.
+3. Open the share sheet, then repeat the ping plus 30 pings to the iPhone. Send a photo in each direction.
+4. If the gateway RTT is bad again, try `itlctl itl_awdlps=1` and then `=0` (the second also sends a PM=0 null) to see whether the bursts follow it.

@@ -814,8 +814,13 @@ void itlmt7925::awdlOwnMacApply()
 // A null-data frame to the AP with the power-management bit set (doze) or clear (awake), sent before the radio leaves the AP's
 // channel for an AWDL window and after it comes back (IEEE 802.11 power save: the AP buffers frames for a dozing station until
 // it sees PM=0). ToDS, addr1 = addr3 = the BSSID, on the management queue at the basic rate like the other host-built frames.
+// §10.66: off by default. Linux mt7925 sends no host null frames around a ROC: the firmware does the power-save signalling to
+// the AP itself when it leaves the channel and comes back. On 2026-11-06 13:4x, with these on, the AP held every downlink
+// frame and released them in bursts every ~3 s (gateway RTT 0.5-3 s, falling by the ping interval) while no AWDL window was
+// running at all, even with awdl0 down: it believed the station was dozing.
 void itlmt7925::awdlApPs(bool doze)
 {
+    if (!awdlHostPs && doze) return;
     if (!m3linkUp || !(tgtBssid[0] | tgtBssid[1] | tgtBssid[2] | tgtBssid[3] | tgtBssid[4] | tgtBssid[5])) return;
     uint8_t f[24];
     bzero(f, sizeof(f));
@@ -2483,6 +2488,14 @@ void itlmt7925::m3Link()
         if (now - lastPulse >= 5000) {                       // heartbeat: RX liveness (beacons, data, group frames the AP relayed back)
             lastPulse = now;
             m3log("pulse bcn=%u rxd=%u rxe=%u eth=%u tx=%u echo=%u", tgtBcnCount, stRxData, stRxEapol, stRxEth, stTx, stEcho);
+        }
+        if (awdlApPsWake) {                                  // itl_awdlps=0: tell the AP we are awake, once
+            awdlApPsWake = 0;
+            uint8_t hp = awdlHostPs;
+            awdlHostPs = 1;
+            awdlApPs(false);
+            awdlHostPs = hp;
+            m3log("awdl: PM=0 null sent to the AP (host power save off)");
         }
         if (awdlHeldCh && !cmdPending(CMD_AWDL_SYNC) &&
             (awdlUptimeUs() > awdlHeldUntilUs || cmdPending(CMD_SCAN | CMD_JOIN | CMD_DISCONNECT))) {

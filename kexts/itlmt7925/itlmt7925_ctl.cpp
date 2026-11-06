@@ -68,6 +68,11 @@ IOReturn itlmt7925::setProperties(OSObject *props)
         awdlOmac1 = v ? 1 : 0;                               // AWDL data TX from OMAC 1 (the AWDL address) or OMAC 0
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlomac=%u ", awdlOmac1);
     }
+    if (ctlNum(d, "itl_awdlps", &v)) {
+        awdlHostPs = v ? 1 : 0;                              // host power-save null frames around AWDL ROCs (default off)
+        if (!awdlHostPs) awdlApPsWake = 1;                   // the link loop sends one PM=0 null so the AP stops buffering
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlps=%u ", awdlHostPs);
+    }
     if (ctlNum(d, "itl_awdlchain", &v)) {
         awdlChainMs = v > 200 ? 200 : v;                     // ms a held ROC may extend the absence by (0 = one ROC per window)
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlchain=%u ", awdlChainMs);
