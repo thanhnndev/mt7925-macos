@@ -3306,3 +3306,38 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 2. Use Wi-Fi with AirDrop on for 10 min: no `link lost` or `recover #`. Gateway ping stays under 50 ms.
 3. On the `awdl chain` line: `cc=VN clc=VN`, plus the `lateabort` and `soffslow` counts.
 4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.71 Boots 2026-11-07 (core 6DCB589A, native 6B413594): always-abort holds; idle AWDL took 47% of the airtime → idle duty limit (core DE2C6D63)
+
+**Always sending the abort (§10.70) holds.**
+- The 14:xx boot stayed linked for 2.5 h on channel 56 (DFS) with 142 late aborts and no firmware hang.
+- `cc=VN`: the country comes from the AP's Country IE.
+- `clc=-`: no power tables are sent, because the boot-args carry `itlmt_nopwr=1`.
+- Sending them on the live link (`itl_pwr=40`, 14:23:26) logged `clc VN env 1 encap 0: power 5 ext 5`. The firmware then went silent, the link was lost and the chip was reset (`recover #1`), reconnecting about 25 s later. **Do not send power tables on a live link.**
+- `soff` (sniffer-off) is about 55 ms on average now that it follows the abort: the firmware answers once it is back on the AP's channel. The wait keeps polling RX, so it does not cost the link.
+
+**Wi-Fi with a VPN (WARP, utun0, MTU 1280), 23:35 boot, no AirDrop going on:**
+
+| | awdl0 up (idle) | awdl0 down |
+|---|---|---|
+| gateway ping | 85 ms avg, 276 max, 5% loss | 5.6 ms |
+| 1.1.1.1 via VPN | 147 ms avg, 421 max | 41.5 ms, flat |
+| download | 1.0 MB/s | 7.4 MB/s |
+| upload | 0.47 MB/s | 1.35 MB/s |
+
+`awdl duty`: 546 s off the AP's channel in 19 min (47%), 170 ms per window, while only 15 AWDL frames were heard (`af=15`). The scheduled-window flag (§10.62) exempts every window from the 50% share rule, so with nobody to talk to the radio still spent half its time on channel 149.
+
+**Change (core DE2C6D63): idle duty.**
+- When no AWDL peer has been heard for 5 s and no AWDL data is queued, an off-channel window must be followed by `awdlIdleShare` (default 9) times its absence on the AP's channel. That is about 10% off-channel, about one window every 1.7 s. This applies to scheduled windows too.
+- A frame from a peer (action frame or data) lifts the limit at once.
+- Windows on the AP's own channel are not limited.
+- The runtime switch is `itl_awdlidle=N` (0 = off, at most 50).
+- The `awdl duty` line shows `idle=<windows skipped>/x<share>`.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261107-233909` (6DCB589A), or `itlctl itl_awdlidle=0` at runtime.
+
+**Next boot test:**
+1. Check the UUIDs are DE2C6D63 / 6B413594.
+2. With the VPN on and no AirDrop: gateway ping under 15 ms, VPN download over 5 MB/s. On the `awdl duty` line the idle count grows and off/elapsed is about 10%.
+3. Open AirDrop on the iPhone near the Mac: the Mac should appear within a few seconds (the limit lifts once the iPhone is heard).
+4. Send a photo each way. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.

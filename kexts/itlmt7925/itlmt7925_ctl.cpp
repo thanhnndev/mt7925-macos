@@ -73,6 +73,11 @@ IOReturn itlmt7925::setProperties(OSObject *props)
         if (!awdlHostPs) awdlApPsWake = 1;                   // the link loop sends one PM=0 null so the AP stops buffering
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlps=%u ", awdlHostPs);
     }
+    if (ctlNum(d, "itl_awdlidle", &v)) {
+        awdlIdleShare = v > 50 ? 50 : (uint8_t)v;            // AP time per off-channel ms while no AWDL peer is heard (0 = off)
+        if (!awdlIdleShare) awdlIdleUntilMs = 0;
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlidle=%u ", awdlIdleShare);
+    }
     if (ctlNum(d, "itl_awdlchain", &v)) {
         awdlChainMs = v > 200 ? 200 : v;                     // ms a held ROC may extend the absence by (0 = one ROC per window)
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlchain=%u ", awdlChainMs);

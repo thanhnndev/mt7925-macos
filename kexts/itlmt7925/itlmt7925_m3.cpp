@@ -904,6 +904,12 @@ void itlmt7925::awdlSyncTx()
         awdlDutySkip++;
         return;
     }
+    if (!awdlHeldCh && awdlIdleUntilMs && (int32_t)(nowMs() - awdlIdleUntilMs) < 0 && !(m3linkUp && awdlChannel == tgtCh) &&
+        awdlDataTxTail == awdlDataTxHead) {
+        awdlFrameDone = seq;
+        awdlIdleSkip++;
+        return;
+    }
     // Snapshot under the mailbox lock: the interface may hand over the next frame (and timeline) while this one is on air.
     uint8_t *frame = awdlTxBuf, *frame2 = awdlTxBuf2;           // only the link thread touches these
     if (cmdLock) IOLockLock(cmdLock);
@@ -1005,6 +1011,18 @@ void itlmt7925::awdlSyncTx()
         awdlOffN++;
         t += off;
         awdlNextWinMs = t ? t : 1;
+        // §10.71: idle AWDL (no peer heard for 5 s, nothing queued) leaves the AP awdlIdleShare times the absence, scheduled
+        // windows included. On 2026-11-07 with no AirDrop going on the radio was off the AP's channel 47% of the time: gateway
+        // ping 85 ms (max 276, 5% lost), 1.0 MB/s down through the VPN; with awdl0 down 5.6 ms and 7.4 MB/s. A peer heard in
+        // a window lifts it at once (awdlPeerHeard).
+        uint32_t now = nowMs();
+        bool idle = awdlIdleShare && (!awdlPeerLastMs || now - awdlPeerLastMs > 5000) && awdlDataTxTail == awdlDataTxHead;
+        if (idle) {
+            uint32_t u = now + off * awdlIdleShare;
+            awdlIdleUntilMs = u ? u : 1;
+        } else {
+            awdlIdleUntilMs = 0;
+        }
     };
     // The "pass frames from other BSS" filter is reprogrammed in every window: the firmware resets it when the channel changes,
     // so a filter set once per link was gone by the time the radio parked on the next social channel. All four bits the chip
@@ -1229,8 +1247,9 @@ void itlmt7925::awdlSyncTx()
             m3log("awdl phase (0.1ms avg over %u): setup=%u roc=%u grant=%u scfg=%u wait=%u dwell=%u soff=%u abort=%u end=%u",
                   awdlPhN, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
         }
-        m3log("awdl duty: off=%u ms in %u windows (avg %u) skip=%u ps=%u/%u apbcn=%u", awdlOffMs, awdlOffN,
-              awdlOffN ? awdlOffMs / awdlOffN : 0, awdlDutySkip, awdlPsTx[1], awdlPsTx[0], tgtBcnCount);
+        m3log("awdl duty: off=%u ms in %u windows (avg %u) skip=%u idle=%u/x%u ps=%u/%u apbcn=%u", awdlOffMs, awdlOffN,
+              awdlOffN ? awdlOffMs / awdlOffN : 0, awdlDutySkip, awdlIdleSkip, awdlIdleShare, awdlPsTx[1], awdlPsTx[0],
+              tgtBcnCount);
         m3log("awdl rxstat: oui=%u sig=%u bss=%u nm=%u fx=%u stamp=%u/%u mif=%u/%u full=%u data rx=%u hdr=%u/%u tx=%u/%u/%u/%u stale=%u",
               awdlOuiHits, awdlSigHits, awdlBssidHits, awdlNearMiss, awdlForensics, awdlStamped, awdlStampMiss, awdlTx2Ok,
               awdlTx2Try, awdlRxRingFull, awdlDataRx, awdlDataRxHdr[0], awdlDataRxHdr[1], awdlDataTxQueued, awdlDataTxSent,
@@ -1416,6 +1435,9 @@ void itlmt7925::awdlDwell(uint32_t dwellMs)
 
 void itlmt7925::awdlPeerHeard(const uint8_t *sa)
 {
+    uint32_t now = nowMs();
+    awdlPeerLastMs = now ? now : 1;
+    awdlIdleUntilMs = 0;                                     // a peer is here: full duty from the next window (§10.71)
     int slot = 0;
     for (int i = 0; i < 4; i++) {
         if (memcmp(awdlPeers[i].mac, sa, 6) == 0) { slot = i; break; }
