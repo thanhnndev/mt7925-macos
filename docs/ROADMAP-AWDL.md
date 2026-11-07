@@ -3282,3 +3282,27 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 2. On the `awdl chain` line: `cc=VN clc=VN` (if `cc=00`, the AP's Country IE was not found). `lateabort` should stay 0 or very low, and `soffslow` shows how often the firmware is slow.
 3. Use Wi-Fi with AirDrop on for 10 min: no `recover #`.
 4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.70 Boot 2026-11-07 09:12 (core D79C6734, native 6B413594): a skipped abort left the radio on the AWDL channel → the abort is always sent (core 6DCB589A)
+
+**What happened.** Wi-Fi was unstable and the owner switched to USB internet sharing.
+- 6 chip resets in 10 minutes (`recover #6`), each after `link lost: no beacon or data from the AP for 15 s`. The AP was on channel 56 (DFS) this time.
+- The one visible case: `awdl: roc abort skipped, 186992 us past the deadline (dwell 1101 us, after it 0 us, ch=149 grant=21 ms)`.
+- After that line the beacon count stayed at 1279 and RX stopped. Four seconds later: `postmortem silent 4s`. Fifteen seconds later the link was lost.
+- So **the firmware does not end a timed ROC by itself**. Without the abort the radio stays on the AWDL channel. The §10.69 skip was wrong.
+- In §10.69 the 12 late aborts were sent and did no harm, so a late abort is not by itself what hung the firmware at 14:38 (§10.68).
+- This late window lost its time **before** the dwell (dwell 1.1 ms after the clip): the grant was 21 ms, so it was the sniffer config or the wait for the AW start.
+
+**Change (core 6DCB589A).**
+- The ROC is always aborted. The skip and the wait for a quiet time are removed.
+- The abort is still sent before the sniffer-off.
+- A late abort is logged as `awdl: roc abort N us past the deadline (dwell …, after it …)`.
+- A sniffer config or sniffer-off that takes 50 ms or more is logged (`awdl: sniffer config took N ms` / `sniffer off took N ms`) and counted in `soffslow=`.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261107-092411` (D79C6734). The last build without §10.69 is `Kexts-backup/itlmt7925.kext.20261106-164012` (3F4AFE7C).
+
+**Next boot test:**
+1. Check the UUIDs are 6DCB589A / 6B413594.
+2. Use Wi-Fi with AirDrop on for 10 min: no `link lost` or `recover #`. Gateway ping stays under 50 ms.
+3. On the `awdl chain` line: `cc=VN clc=VN`, plus the `lateabort` and `soffslow` counts.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.

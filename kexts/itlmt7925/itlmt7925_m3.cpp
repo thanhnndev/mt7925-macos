@@ -1020,7 +1020,6 @@ void itlmt7925::awdlSyncTx()
     // A timed ROC, as Linux asks for a remain-on-channel (MT7925_ROC_REQ_ROC, maxinterval = the duration). Until §10.40 every
     // window asked for a 5-second JOIN-type ROC and aborted it after 20-100 ms, about 10 times a second; after ~3100 windows
     // (133 never granted) the firmware stopped answering MCU commands and the infrastructure link died with it.
-    uint32_t rocDurMs = 0;                                   // the duration asked for this window's ROC
     {
         uint64_t now = awdlUptimeUs();
         uint32_t ahead = (startUs && startUs > now) ? (uint32_t)((startUs - now) / 1000) : 0;
@@ -1030,12 +1029,7 @@ void itlmt7925::awdlSyncTx()
         // hung it - 364 and 338 ms from acquire to abort for 259 ms asked, 2026-11-06 14:38.
         uint32_t dur = dwellMs + 30 + 25 + 40 + ahead + awdlChainMs;
         if (!onCh && !chained) {
-            // §10.69: a ROC whose abort was skipped (it ran past its deadline) is still the firmware's until it ends on its
-            // own; the next request waits for that (bounded: the quiet time is at most one ROC's duration away).
-            while (awdlUptimeUs() < awdlRocQuietUs) m3Pump(1);
-            now = awdlUptimeUs();
             m3Roc(true, ch, 1, dur);
-            rocDurMs = dur;
             rocEndUs = now + (uint64_t)(dur - 10) * 1000;
             rocDeadlineUs = now + (uint64_t)dur * 1000;
         }
@@ -1048,14 +1042,18 @@ void itlmt7925::awdlSyncTx()
     uint32_t rocT0 = nowMs(), rocMs = 0;
     for (int i = 0; !onCh && !chained && i < 300 && rocWant && !rocGrant; i++) m3Pump(1);   // m3Pump keeps servicing the AP meanwhile
     rocMs = nowMs() - rocT0;
-    uint64_t grantUs = awdlUptimeUs();                       // the firmware counts the ROC's duration from about here
     ph(2);
     bool granted = onCh || chained || rocGrant, bad = !onCh && !chained && rocStatus;
     bool late = !onCh && !chained && granted && rocMs >= 80;
     if (!onCh && !chained) awdlRocLat[!granted ? 4 : late ? 3 : rocMs < 10 ? 0 : rocMs < 40 ? 1 : 2]++;
     if (granted) { awdlWinBand[ch > 14]++; awdlWinSeq++; }
     else awdlNeverBand[ch > 14]++;
-    if (granted && !bad && !late && !chained) m3SnifferConfig(ch);       // the sniffer follows the radio to the social channel
+    if (granted && !bad && !late && !chained) {                          // the sniffer follows the radio to the social channel
+        uint64_t t = awdlUptimeUs();
+        m3SnifferConfig(ch);
+        uint32_t ms = (uint32_t)((awdlUptimeUs() - t) / 1000);
+        if (ms >= 50 && awdlSoffSlow++ < 8) m3log("awdl: sniffer config took %u ms (ch=%u)", ms, ch);
+    }
     ph(3);
     if (!granted || bad || late) {
         awdlTxRocFail++;
@@ -1143,22 +1141,17 @@ void itlmt7925::awdlSyncTx()
         if (awdlStampSync(f, l, tl)) awdlStamped++;
         else if (tl.periodUs) awdlStampMiss++;
     };
-    // §10.69: the ROC is closed with an abort only while the firmware still holds it. Past the deadline (some step after the
-    // clip overran: 199 ms late on 2026-11-06 16:36 with no dwell cut) the abort is skipped - an abort after the firmware has
-    // ended the ROC is what hung it - and the next ROC waits until this one has surely ended (grant + its duration + 20 ms).
+    // The ROC is always closed with an abort, late or not. §10.69 skipped an abort past the deadline, on the idea that the
+    // firmware ends a timed ROC by itself: it does not. On 2026-11-07 09:1x, after the one skipped abort (ch 149, 187 ms past),
+    // no beacon of the AP was received again (the radio stayed on 149), the firmware went silent 4 s later and the link was
+    // lost at 15 s - six chip resets in ten minutes. Late aborts that were sent (12 in 6 minutes on 2026-11-06) did no harm.
+    // A late abort is logged with where the time went: before the dwell (grant, sniffer config, AW wait) or after it.
     uint64_t dwT0 = 0, dwT1 = 0;
     auto rocClose = [&](uint64_t a, uint64_t b) {
         uint64_t now = awdlUptimeUs();
-        if (rocDeadlineUs && now > rocDeadlineUs) {
-            awdlRocLateAbort++;
-            rocWant = false;
-            rocGrant = false;
-            awdlRocQuietUs = grantUs + (uint64_t)rocDurMs * 1000 + 20000;
-            if (awdlRocLateAbort <= 8)
-                m3log("awdl: roc abort skipped, %u us past the deadline (dwell %u us, after it %u us, ch=%u grant=%u ms)",
-                      (unsigned)(now - rocDeadlineUs), (unsigned)(b - a), (unsigned)(now - b), ch, rocMs);
-            return;
-        }
+        if (rocDeadlineUs && now > rocDeadlineUs && awdlRocLateAbort++ < 8)
+            m3log("awdl: roc abort %u us past the deadline (dwell %u us, after it %u us, ch=%u grant=%u ms)",
+                  (unsigned)(now - rocDeadlineUs), (unsigned)(b - a), (unsigned)(now - b), ch, rocMs);
         m3Roc(false, ch);
     };
     // The abort goes first, the moment the dwell is over; the sniffer is switched off after it. On 2026-11-06 16:36-16:38 the
@@ -1228,7 +1221,7 @@ void itlmt7925::awdlSyncTx()
         m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus stale=%u wait=%ums on=%u onch=%u apch=%u", awdlLeadUs,
               awdlLeadEarly, awdlLeadLateN, awdlLeadLateN ? (uint32_t)(awdlLeadLateUs / awdlLeadLateN) : 0, awdlLeadStale,
               awdlLeadWaitMs, awdlLeadOn, awdlOnChWin, tgtCh);
-        m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u (skipped) soffslow=%u cc=%s clc=%s",
+        m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u soffslow=%u cc=%s clc=%s",
               awdlChainN, awdlChainBreak, awdlChainTimeout, awdlChainMs, awdlRocClip, awdlRocLateAbort, awdlSoffSlow, regCc, clcCc[0] ? clcCc : "-");
         if (awdlPhN) {
             uint32_t a[9];
