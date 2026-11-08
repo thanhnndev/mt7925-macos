@@ -3490,4 +3490,4 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 
 - `stat-log` over the whole test: `txf` failures stayed at 29 of 145942 freed, retries 0.30 per frame. `noslot` rose 12014 → 13269 during the upload (TX ring full: host back-pressure, not loss).
 - `rty` stayed around 83%. It does not stop TCP here, but it is still the open uplink item (ACK/BlockAck heard by the AP).
-- The link is HT40 only (300 Mb/s PHY), so 43 Mb/s down is not yet a measure of the driver's ceiling.
+- The link is HT40 only (300 Mb/s PHY), so 43 Mb/s down is not yet a measure of the driver's ceiling. The owner notes the café's internet line itself is slow, so these numbers are bounded by the line, not by the Wi-Fi link.
