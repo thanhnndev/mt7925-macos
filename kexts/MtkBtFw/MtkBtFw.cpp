@@ -13,6 +13,15 @@
 // The interface is opened only for that and closed again, so bluetoothd (with BlueToolFixup) can use the controller. A section
 // that is already loaded (warm reboot from Windows/Linux) is skipped by the chip's answer, as in Linux.
 //
+// A warm reboot does not power-cycle the chip. If the Bluetooth firmware of the previous session hung (its watchdog fired), the
+// chip keeps that state: the control endpoint stalls, or WMT still answers but HCI does not and the firmware streams a coredump
+// on the ACL pipe. bluetoothd then times out on HCI Reset, records the USB controller as failed and falls back to a UART
+// controller that does not exist, restarting every 15 s. So after FUNC_CTRL the loader sends HCI Reset itself and waits for
+// its Command Complete. If that, or any earlier step, fails, it resets the Bluetooth subsystem (Linux btmtk_usb_subsys_reset,
+// MT7925 CONNV3 path; Linux reaches it through btmtk_reset_sync, see commit b3078bb2ee12 "mt7925: trigger reset on WMT
+// timeout") and loads the whole firmware again, once. A dead firmware is also detected up front (WDT status, stalled register
+// read) so the reset comes first.
+//
 // IOLog of these kexts does not reach dmesg or the unified log on this machine: the result is in the registry,
 //   ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-log"'
 #include <IOKit/IOService.h>
@@ -39,6 +48,12 @@ enum { WMT_PATCH_DWNLD = 0x1, WMT_FUNC_CTRL = 0x6 };
 #define REG_FW_VER        0x80021004
 #define REG_EP_RST_OPT    0x74011890
 #define EP_RST_IN_OUT_OPT 0x00010001
+#define REG_BT_MISC       0x70002510
+#define BT_RST_DONE       0x00000100
+#define REG_RESET_CONNV3  0x70028610
+#define REG_WDT_STATUS    0x740003A0
+#define REG_UDMA_INT_STA  0x74000024
+#define REG_UDMA_INT_STA1 0x74000308
 
 static void startThread(void (*fn)(void *), void *arg)
 {
@@ -60,6 +75,7 @@ private:
     IOBufferMemoryDescriptor *intrBuf = nullptr;
     volatile bool intrStop = false, intrBusy = false;
     uint32_t intrPackets = 0;
+    volatile int hciResetStatus = -1;                // status byte of the HCI Reset Command Complete, -1 = none seen
     uint8_t *cmd = nullptr, *ev = nullptr;          // control transfer buffers (wired)
     char log[1200] = {0};
     size_t loglen = 0;
@@ -71,6 +87,10 @@ private:
     IOReturn ctrl(uint8_t type, uint8_t req, uint16_t value, uint16_t index, void *buf, uint16_t len, uint32_t *done);
     bool regRead(uint32_t reg, uint32_t *val);
     bool uhwWrite(uint32_t reg, uint32_t val);
+    bool uhwRead(uint32_t reg, uint32_t *val);
+    bool subsysReset();
+    bool hciReset();
+    bool bringUp();
     int wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, uint8_t *evFlag);
     bool download();
     void intrArm();
@@ -127,6 +147,63 @@ bool MtkBtFw::uhwWrite(uint32_t reg, uint32_t val)
     IOReturn r = ctrl(0x5e, 0x02, (uint16_t)(reg >> 16), (uint16_t)(reg & 0xffff), cmd, 4, nullptr);
     if (r != kIOReturnSuccess) { say("uhw %08x write failed %08x", reg, r); return false; }
     return true;
+}
+
+// btmtk_usb_uhw_reg_read: request type 0xde, bRequest 0x01. Answered by the USB hardware, also when the firmware is dead.
+bool MtkBtFw::uhwRead(uint32_t reg, uint32_t *val)
+{
+    uint32_t n = 0;
+    IOReturn r = ctrl(0xde, 0x01, (uint16_t)(reg >> 16), (uint16_t)(reg & 0xffff), ev, 4, &n);
+    if (r != kIOReturnSuccess || n != 4) { say("uhw %08x read failed %08x n=%u", reg, r, n); return false; }
+    *val = le32(ev);
+    return true;
+}
+
+// btmtk_usb_subsys_reset for dev_id 0x7925 (CONNV3), then the RST_DONE poll and the device id check.
+bool MtkBtFw::subsysReset()
+{
+    uint32_t v = 0;
+    if (!uhwRead(REG_RESET_CONNV3, &v) || !uhwWrite(REG_RESET_CONNV3, v | (1u << 5))) return false;
+    if (!uhwRead(REG_RESET_CONNV3, &v)) return false;
+    v = (v & 0xFFFF00FFu) | (1u << 13);
+    if (!uhwWrite(REG_RESET_CONNV3, v) || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
+    if (!uhwRead(REG_RESET_CONNV3, &v) || !uhwWrite(REG_RESET_CONNV3, v | 1u)) return false;
+    if (!uhwWrite(REG_UDMA_INT_STA, 0xff) || !uhwRead(REG_UDMA_INT_STA, &v)) return false;
+    if (!uhwWrite(REG_UDMA_INT_STA1, 0xff) || !uhwRead(REG_UDMA_INT_STA1, &v)) return false;
+    IOSleep(100);
+    bool done = false;
+    for (int i = 0; i < 50 && !done; i++) {                        // readx_poll_timeout(20 ms, 1 s)
+        if (uhwRead(REG_BT_MISC, &v) && (v & BT_RST_DONE)) done = true;
+        else IOSleep(20);
+    }
+    uint32_t id = 0;
+    bool idOk = regRead(REG_DEV_ID, &id) && id;
+    say("subsys reset: %s, dev id %08x", done ? "done" : "timeout", id);
+    return done && idOk;
+}
+
+// HCI Reset as bluetoothd will send it; the Command Complete arrives on the interrupt endpoint (intrDone).
+bool MtkBtFw::hciReset()
+{
+    if (!intrPipe) { say("no interrupt pipe, HCI check skipped"); return true; }
+    hciResetStatus = -1;
+    cmd[0] = 0x03; cmd[1] = 0x0c; cmd[2] = 0x00;
+    IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, 3, nullptr);
+    if (r != kIOReturnSuccess) { say("HCI Reset send failed %08x", r); return false; }
+    for (int i = 0; i < 200 && hciResetStatus < 0; i++) IOSleep(10);
+    if (hciResetStatus < 0) { say("HCI Reset: no Command Complete in 2 s"); return false; }
+    say("HCI Reset complete, status %d", hciResetStatus);
+    return hciResetStatus == 0;
+}
+
+// Download, endpoint reset option, FUNC_CTRL 1, HCI check.
+bool MtkBtFw::bringUp()
+{
+    if (!download() || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
+    uint8_t on = 1, f = 0;
+    if (wmt(WMT_FUNC_CTRL, 0, &on, 1, &f) < 0) return false;
+    say("bluetooth function on (flag %u)", f);
+    return hciReset();
 }
 
 // One WMT command and its event. Returns 0 and the event's flag byte, or -1.
@@ -200,11 +277,15 @@ bool MtkBtFw::download()
     return true;
 }
 
-void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t)
+void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t bytes)
 {
     MtkBtFw *me = (MtkBtFw *)owner;
     me->intrBusy = false;
-    if (status == kIOReturnSuccess) me->intrPackets++;
+    if (status == kIOReturnSuccess) {
+        me->intrPackets++;
+        const uint8_t *e = (const uint8_t *)me->intrBuf->getBytesNoCopy();
+        if (bytes >= 6 && e[0] == 0x0e && e[3] == 0x03 && e[4] == 0x0c) me->hciResetStatus = e[5];
+    }
     if (!me->intrStop && status != kIOReturnAborted && status != kIOReturnNotOpen) me->intrArm();
 }
 
@@ -253,16 +334,21 @@ void MtkBtFw::run()
         intrArm();
     }
 
-    uint32_t devId = 0, fwVer = 0;
-    bool ok = regRead(REG_DEV_ID, &devId) && regRead(REG_FW_VER, &fwVer);
-    if (ok) say("chip %04x fw_ver %08x", devId & 0xffff, fwVer);
+    // A stalled register read or a set watchdog status means the firmware of the previous session hung: reset first.
+    uint32_t devId = 0, fwVer = 0, wdt = 0;
+    bool ok = regRead(REG_DEV_ID, &devId);
+    bool fwAlive = ok && regRead(REG_FW_VER, &fwVer);
+    if (uhwRead(REG_WDT_STATUS, &wdt) && wdt) fwAlive = false;
+    if (!ok) { ok = subsysReset() && regRead(REG_DEV_ID, &devId); fwAlive = ok; }
+    if (ok) say("chip %04x fw_ver %08x wdt %u", devId & 0xffff, fwVer, wdt);
     if (ok && (devId & 0xffff) != 0x7925) { say("not an MT7925, leaving it alone"); ok = false; }
-    if (ok) ok = download();
-    if (ok) ok = uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT);
-    uint8_t on = 1, f = 0;
-    if (ok && wmt(WMT_FUNC_CTRL, 0, &on, 1, &f) < 0) ok = false;
-    if (ok) say("bluetooth function on (flag %u)", f);
-
+    else if (ok) {
+        if (!fwAlive) { say("firmware of the previous session is dead, resetting"); ok = subsysReset(); }
+        if (ok && !bringUp()) {
+            say("bring-up failed, subsystem reset and full reload");
+            ok = subsysReset() && bringUp();
+        }
+    }
     intrStop = true;
     if (intrPipe) {
         intrPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);

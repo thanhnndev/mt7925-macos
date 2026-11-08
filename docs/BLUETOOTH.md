@@ -276,11 +276,66 @@ Undo: boot-arg `-btledlfxnoadv` (advertising patches off, length patches stay on
 `rm -rf /Volumes/ESP/EFI/OC/Kexts/BtLeDlFix.kext && cp -R /Volumes/ESP/EFI/OC/Kexts-backup/BtLeDlFix.kext.20261104-152640 /Volumes/ESP/EFI/OC/Kexts/BtLeDlFix.kext`
 (the v1.1.0 build: mouse works, no advertising), then reboot.
 
+## bluetoothd restart loop after a warm reboot (macOS 26.7.2 / 25G332, found 2026-11-08)
+
+**Symptom.** `bluetoothd` restarts every ~15 s (100+ PIDs in 30 min), each one leaves an `ExcUserFault_bluetoothd-*.ips`
+(EXC_GUARD, `os_fault_with_payload`) and ReportCrash parses them at 11-13 % of a core at idle. System Information shows the
+placeholder (BCM_4350C2, Address NULL, State Off, Transport UART). MtkBtFw says `bt-state` = `ready`.
+
+**Chain of events (unified log, 2026-11-08).**
+1. First `bluetoothd` of the boot finds the USB controller (`[bm3_usb] Found external Bluetooth dongle -- setting chipset to
+   THIRD_PARTY_DONGLE`) and sends HCI Reset. The controller does not answer (`HCI expected event 14 with opcode
+   OI_DHCI_RESET_OPCODE timedout`), and meanwhile ~9 600 packets arrive on the ACL pipe (`OI_HCIIfc_DataReceived, HCI not
+   initialized - discarding ACL packet`): the firmware's coredump/log stream (Linux btusb routes ACL handles 0xfc6f, 0x05ff,
+   0x05fe, 0x2efd to the diag channel).
+2. `ERROR -- Third Party USB Bluetooth dongle failed initialization. Switching to internal Bluetooth module`. bluetoothd writes
+   NVRAM `bluetoothExternalDongleFailed` = `01`.
+3. Every later `bluetoothd` of that boot reads the flag, says `External Bluetooth dongle was not found -- setting chipset to
+   default BCM_4350C2`, picks the board's UART transport (`FindTransportType -- UART Transport`, `H4BC`, from the
+   MacBookPro16,2 board id), waits 15 s for `/dev/cu.BLTH`, fails (`Transport layer initialization failed`) and restarts. That is
+   the loop; it lasts until the next boot (OpenCore's NVRAM Delete/Add resets the flag to `00`, which works).
+
+**Why the controller did not answer.** A warm reboot (restart, or the 17:33 hard reset) does not power-cycle the chip. The
+Bluetooth firmware of the previous session had hung and its watchdog had fired. Read on the live system with
+`tools/mtkbtctl regs` (UHW registers, answered by the USB hardware): `WDT status 00000001`, and every firmware register read
+(vendor request 0x63) and HCI command on the control endpoint stalled (`e0004051`). MtkBtFw did not notice: on a warm reboot
+the chip reports sections 0-1 as already loaded, section 2 and FUNC_CTRL went through, and MtkBtFw never checked HCI.
+A cold boot cuts power to the chip and clears this, which is why it "always fixes it". Boots that day: 11:57 (MtkBtFw
+disabled for §10.74, no firmware: same NVRAM path), 12:14 and 17:33 failed; 14:23 (cold), 14:51, 15:04 worked.
+
+Linux has the same case: commit b3078bb2ee12 "Bluetooth: mt7925: trigger reset on WMT timeout" (2026-08) says the MT7925 "can
+enumerate successfully after a warm reboot while the WMT function-control command remains unresponsive", and recovers through
+`btmtk_reset_sync` → `btusb_mtk_reset` → `btmtk_usb_subsys_reset` + firmware reload. Linux 6.12 did the subsystem reset before
+every download; that was removed upstream (33634e2ab7c6, other USB devices failed to enumerate on Linux 6.11+) in favour of a
+reset on failure.
+
+**Live recovery 2026-11-08 18:2x (no reboot).** `tools/mtkbtctl recover fw/BT_RAM_CODE_MT7925_1_1_hdr.bin`: CONNV3 subsystem
+reset (`reset done`, dev id 7925), all three sections downloaded again (0 and 1 were no longer "already loaded"), FUNC_CTRL,
+HCI Reset → `0e 04 01 03 0c 00`. Then NVRAM `bluetoothExternalDongleFailed=%00` and one `launchctl kickstart -k
+system/com.apple.bluetoothd`: `Stack Did Start`, System Information `Address DC:56:7B:34:81:D6, State On, THIRD_PARTY_DONGLE,
+v9736 c4881`. (The first try needed the kickstart because a Command Complete of a test HCI Reset was still queued in the chip and
+bluetoothd took it as an orphan event; MtkBtFw always consumes its own event.)
+
+**Fix: MtkBtFw 0.2.0.**
+* Before the download: the device id via vendor request 0x63; the firmware version register and UHW `WDT status` (0x740003A0).
+  A stalled read or a set watchdog → subsystem reset first.
+* After FUNC_CTRL: HCI Reset on the control endpoint, Command Complete read on the interrupt endpoint (2 s).
+* Any failure → `btmtk_usb_subsys_reset` (MT7925: CONNV3 0x70028610 bits 5, 13, 0; EP reset option; UDMA_INT_STA[1] = 0xff;
+  poll BT_MISC bit 8, 1 s) and the whole bring-up once more.
+* `bt-log` shows `wdt`, `subsys reset: done`, `HCI Reset complete, status 0`.
+
+Undo: `rm -rf /Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext && cp -R /Volumes/ESP/EFI/OC/Kexts-backup/MtkBtFw.kext.20261108-183128
+/Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext` (0.1.0).
+
+`tools/mtkbtctl` (build: `clang -O2 -Wall -framework IOKit -framework CoreFoundation -o mtkbtctl tools/mtkbtctl.c`, no root
+needed) works only while no one has interface 0 open, i.e. while bluetoothd sits on the UART fallback: `regs` (read only),
+`probe` (HCI Reset + counts coredump packets), `recover <fw>`.
+
 ## Pieces
 
 | Piece | What it does |
 |---|---|
-| `kexts/MtkBtFw` | Matches interface 0 of 0489:e11e, opens it, downloads `fw/BT_RAM_CODE_MT7925_1_1_hdr.bin` (embedded) and turns the Bluetooth function on, then closes the interface again. The procedure is Linux `drivers/bluetooth/btmtk.c` (`btmtk_usb_setup`, `btmtk_setup_firmware_79xx`, `btmtk_usb_hci_wmt_sync`): WMT commands as HCI vendor command 0xfc6f on the control endpoint, WMT events polled with a vendor IN request (bRequest 1, wValue 0x30), sections in 250-byte blocks, endpoint reset option 0x74011890 = 0x00010001, WMT FUNC_CTRL 1. Sections the chip reports as already loaded (warm reboot from Windows/Linux) are skipped. |
+| `kexts/MtkBtFw` | Matches interface 0 of 0489:e11e, opens it, downloads `fw/BT_RAM_CODE_MT7925_1_1_hdr.bin` (embedded) and turns the Bluetooth function on, then closes the interface again. The procedure is Linux `drivers/bluetooth/btmtk.c` (`btmtk_usb_setup`, `btmtk_setup_firmware_79xx`, `btmtk_usb_hci_wmt_sync`): WMT commands as HCI vendor command 0xfc6f on the control endpoint, WMT events polled with a vendor IN request (bRequest 1, wValue 0x30), sections in 250-byte blocks, endpoint reset option 0x74011890 = 0x00010001, WMT FUNC_CTRL 1. Sections the chip reports as already loaded (warm reboot from Windows/Linux) are skipped. Since 0.2.0 it checks the result with an HCI Reset and, if the firmware of the previous session is dead or the check fails, resets the Bluetooth subsystem and loads everything again (see the restart loop section above). |
 | `BlueToolFixup.kext` 2.7.2 | From [acidanthera/BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM/releases) (needs Lilu). Required on macOS 12+ so `bluetoothd` accepts a non-Apple controller. Not in this repository; copy it from the release zip. |
 | `kexts/BtLeDlFix` | Lilu plugin, binary patches of `bluetoothd`: a BLE link does not wait for an HCI LE Data Length Change event the MT7925 never sends (macOS 15), and BT 5.0 advertising sets are enabled for the third-party controller, with each set's random address written before it is enabled, so LE advertising (AirDrop, Nearby) works (macOS 26, see above). Install: `EFI/OC/Kexts/BtLeDlFix.kext` + a `Kernel/Add` entry after Lilu. |
 | NVRAM `7C436110-...:bluetoothExternalDongleFailed` = `00`, `bluetoothInternalControllerInfo` = 14 x `00` | Also listed in NVRAM/Delete so OpenCore writes them every boot (BrcmPatchRAM README: needed for non-Broadcom controllers). |
