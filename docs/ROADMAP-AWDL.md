@@ -3462,3 +3462,19 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 2. Let Wi-Fi join on its own. Read `m3-log`: `eeprom(efuse) rc=0 st=0`, `clc VN env 1 …`, `txpower: … rc=0`.
 3. Read `stat-log` `txf=` (freed/…/fail/retries) and the `eapol summary` `txFail=`. Working: fails a few %, retries well under 1 per frame.
 4. If TX still fails: the calibration path is not the whole answer. Next is to compare against the firmware itself with REA (the `EFUSE_CTRL` handler, what the firmware does without SKU) and the ACPI SAR/MTCL path (`mt792x_acpi_sar.c`).
+
+### 10.76 Cold boot 2026-11-08 14:23 (core A171AD24, native B9AE6E64, Bluetooth on): data TX works again
+
+**What the log shows (read only, nothing run on the network):**
+- `eeprom(efuse) rc=0 st=0` (format WHOLE). `sar: MTDS v2 MTGS v2 -> 2g 59 5g 59` (29.5 dBm, so the world ceiling 40 = 20 dBm is the limit). `clc 00 env 1: power 6 ext 6`, `txpower: 21 commands … rc=0`.
+- AP: "Agapi 5G" `24:de:c6:11:e8:f0`, ch 44, HT40 only (`vht=0 he=0`), no Country IE (domain "00"), RSSI −56 dBm. Auth, assoc and EAPOL each went through on the first frame (`txFail=0`).
+- `stat-log` at 123 s, L6: `txf=15373/0/0/29/3722`. 0.2% failed, 0.24 retries per frame. On 11:57 (§10.75) it was 81% failed, 11.6 retries.
+- MtkBtFw + BtLeDlFix loaded, BT firmware v9736. macOS shows Bluetooth `Off` (the user toggle).
+
+**What this does and does not prove.** The owner is at a different place, so the AP and the RSSI (−56 vs −63) changed together with the fix, the power tables and the cold boot. TX working is a fact; which of the four made the difference is not separated yet (chưa xác định).
+
+**Still open:** `rty=13717/16968`: 81% of the AP's unicast frames carry the retry bit (30% in October). The AP is re-sending most of its frames, so it likely still misses many of our ACKs/BlockAcks. These control responses are sent by the hardware at a legacy rate. This is the same weak-uplink sign as before, and the next thing to trace.
+
+**Next (when the owner allows a test on the live link):**
+1. A short speed test and a gateway ping on this AP, to measure what `rty` 81% costs.
+2. Back at "10.07 Cafe" (ch 36, −63 dBm): if TX works there too, the eeprom/power fix is confirmed. If not, run `itl_nopwr=1` + reconnect there to separate the power tables from the eeprom fix.
