@@ -3610,3 +3610,15 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - **Contents:** includes everything in 206D41C8 (aponly, ABI gate).
 - **Next boot:** check that the `ctl:faultLoop=own` trace is present and the ABI gate prints "ok". Then measure CCFaultReporter wakes (the same method as the 890M trace); expect close to 0 with Wi-Fi idle. Install only with the owner's approval; the peer batches installs.
 - **Installed 2026-11-08 22:13** with the owner's OK, by the iGPU session. Backup of 206D41C8: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261108-221302`. On the next boot, also run the §10.80 AirDrop test (`aponly=1/157/n`).
+
+### 10.83 Boot 2026-11-08 23:51 (native 25F33563): the ABI verdict and faultLoop were not visible → fixed properties (native A62C12D2, built, not installed)
+
+- **Seen:** `itlmt-native-abi` was absent from ioreg. Neither the `itlmt7925Native: abi` line nor `ctl:faultLoop` was in `log show --last boot`.
+- **Why the ABI property was missing:** `abiPublish` ran from `_realmain` at module start. At that point the core `itlmt7925` service is not registered yet, so `copyMatchingService` returned null and nothing was set.
+- **Why the log lines were missing:** this boot did not keep the early IOLog lines in the unified log. The `itlmt_native_trace` ring (2 KB) had already been overwritten by AWDL entries.
+- **faultLoop on this boot:** boot-args do not set `itlmt_native_faultwq`, so the code took the own-loop path. A fault reporter that failed to start would have stopped the native start ("no fault reporter"), but Wi-Fi came up.
+- **Fix:**
+  - The gate keeps its verdict in a static.
+  - `start()` publishes `itlmt-native-abi` on the controller and on its provider (the core).
+  - `makeFaultReporter` sets a fixed `itlmt-native-faultloop` = own|wq.
+- **Next boot:** `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.

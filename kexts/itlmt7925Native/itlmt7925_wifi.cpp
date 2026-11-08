@@ -109,6 +109,9 @@ private:
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(itlmt7925Wifi, IO80211Controller)
 
+// §10.83: the ABI gate's verdict, kept for start() to publish (the core service is not registered yet at module start).
+static char gItlAbiText[600] = "not run";
+
 namespace {
 
 const char kOwnerId[] = "com.itlmt7925.native";
@@ -219,6 +222,7 @@ bool itlmt7925Wifi::makeFaultReporter(IOService *owner)
         if (!shared) faultLoop = IOWorkLoop::workLoop();
         IOWorkLoop *fl = faultLoop ? faultLoop : (IOWorkLoop *)wq;
         itlmtTrace(this, "ctl:faultLoop=%s", faultLoop ? "own" : "wq");
+        setProperty("itlmt-native-faultloop", faultLoop ? "own" : "wq");   // §10.83: a fixed property; the trace ring rolls over
         if (dataStream)
             ccFault = CCFaultReporter::withStreamWorkloop((CCDataStream *)dataStream, fl);
         if (ccFault)
@@ -239,6 +243,9 @@ bool itlmt7925Wifi::start(IOService *provider)
     }
     itlmtCallInit();
     itlmtTrace(this, "ctl:start");
+    // §10.83: publish the ABI verdict here, on this controller and on the core (provider); _realmain runs too early for a lookup.
+    setProperty("itlmt-native-abi", gItlAbiText);
+    if (provider) provider->setProperty("itlmt-native-abi", gItlAbiText);
     itlmtTrace(this, "ctl:createWorkQueue begin");
     if (!createWorkQueue()) {
         IOLog(LOGT "no work queue\n");
@@ -921,6 +928,7 @@ extern "C" kern_return_t itlNativeAbiGate(kmod_info_t *, void *)
     if (!bad) snprintf(text, sizeof(text), "ok: %u classes match the 25G241 layouts", (unsigned)(sizeof(kAbiClasses) / sizeof(kAbiClasses[0])));
     else snprintf(text, sizeof(text), "MISMATCH (running/built): %s%s", out, force ? " - loaded anyway (itlmt_native_abiforce)" : " - native Wi-Fi not loaded");
     IOLog("itlmt7925Native: abi %s\n", text);
+    strlcpy(gItlAbiText, text, sizeof(gItlAbiText));
     abiPublish(text);
     return (bad && !force) ? KERN_FAILURE : KERN_SUCCESS;
 }
