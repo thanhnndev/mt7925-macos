@@ -3553,3 +3553,27 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 3. Read `m3-log` `awdl lead`: `late` should drop well below `early`, and `avglate` should fall far below 39 ms. Read `awdl txfree` `uc5` ok/fail (was 197/492) and `itlmt-awdl` `cut=`.
 4. sharingd: no repeated `DISCOVER request timeout`, and the transfer should get past the code step.
 5. If ROC windows are still late: the sniffer-off (21.6 ms) and the ROC grant (21.4 ms) are next, against Linux `mt7925_mcu_set_roc` / `mt7925_mcu_abort_roc` and how mt76 sets the sniffer.
+
+### 10.80 Boot 2026-11-08 20:53 (core BBFBA198, native 39C8FDA0): windows on time, but the devices no longer find each other → the gap is off; present only on the AP's channel when the peer uses it (native A2880A4E)
+
+**What the gap did.**
+- The window timing improved: `avglate` 39.5 → 9.3 ms. Late ROC windows averaged ~18 ms; late on-channel windows 4.2 ms (`onlate=121/4178us`). `cut=146/40`.
+- But AirDrop got worse: the owner saw neither device from the other. sharingd found the peer's `_airdrop` service, but every `DISCOVER` stayed `in_progress resolver` (the peer's hostname never resolved over awdl0) and timed out after 5 s.
+- Driver: `dtx=32/32/0/0/32/0`: the stack handed us only 32 frames, all multicast (mDNS), and `txfree grp=2/30`. No unicast was ever queued (`uc=0/0`), because nothing resolved.
+- We were slave (`role=2`) of `c2:cc:1f:b0:61:ad` (−33 dBm, the iPhone next to the Mac).
+
+**Cause.** The gap broke §10.62's rule: advertised presence must equal real presence. Our sequence still claimed every 149 EAW in full, but the window now left after 23.5 ms. The peer's answers in the rest of those EAWs were sent where we no longer were.
+
+**Change (native A2880A4E, core unchanged BBFBA198):**
+- `itlmt_awdl_gap` defaults to 0 (off).
+- New `awdlApOnly()` (boot-arg `itlmt_awdl_aponly`, default 1). When the followed peer's sequence contains the station's own channel (from the core's `ITL_NATIVE_STATUS`, cached for 1 s), `awdlSchedCh` keeps only those EAWs. That one function feeds both our advertised sequence (`awdlTlv4`, line ~937) and the listen windows, so the two stay identical.
+- With the AP on 157 and the iPhone's `157 157 149 – – – – 157 6 157 149 157 – – – 157`, we are present in its six 157 EAWs. These need no ROC (§10.58): no setup latency, no sniffer-off/abort, and nothing taken from the AP.
+- `itlmt-awdl` ends with `aponly=<on>/<ap ch>/<slots dropped>`.
+
+**Undo:** `Kexts-backup/itlmt7925Native.kext.20261108-205700` (39C8FDA0), or boot-arg `itlmt_awdl_aponly=0`. Native B9AE6E64 (before §10.79) is in `…20261108-203846`.
+
+**Next boot test (warm reboot):**
+1. Check the UUIDs are BBFBA198 / A2880A4E. Read `itlmt-awdl`: `aponly=1/157/<n>` with n growing, and `itlmt-awdl-self-tlv4` with 157 in the iPhone's 157 slots and 0 elsewhere.
+2. Both devices should list each other in AirDrop. Send a photo Mac → iPhone and iPhone → Mac.
+3. `awdl lead`: most windows `onch`; `awdl txfree` `uc5` ok/fail (was 197/492 in §10.78).
+4. If the iPhone does not list the Mac: it may stop treating us as reachable once our sequence overlaps its own in only 6 slots. Then the fallback is `itlmt_awdl_aponly=0`, and the next step is to make the 149 windows meet their AW (sniffer-off and ROC grant time against Linux).

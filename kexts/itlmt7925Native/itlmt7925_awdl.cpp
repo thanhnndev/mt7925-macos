@@ -59,12 +59,29 @@ static uint32_t awdlBlock()
 // on-channel teardown ~1 ms + ROC setup ~35 ms (157 -> 149), ROC teardown ~27 ms (sniffer off 21.6 + end 5.4) + on-channel
 // setup 5 ms (149 -> 157). Without it every channel change started the next window ~39 ms late, past the 16 TU AW, and
 // 71% of AWDL unicast at 5 GHz went unanswered. Boot-arg itlmt_awdl_gap=<ms> (0 = off, at most 60).
+// §10.80: OFF by default. Leaving an EAW early while the sequence still claims all of it breaks the rule of §10.62
+// (advertised presence = real presence): on 2026-11-08 20:53 the peer's hostname never resolved over awdl0 (30 of 32
+// multicast frames failed). awdlApOnly() below removes the unreachable slots from the sequence instead.
 static uint32_t awdlGapMs()
 {
     static uint32_t v = 0xffffffff;
     if (v == 0xffffffff) {
         uint32_t b = 0;
-        v = PE_parse_boot_argn("itlmt_awdl_gap", &b, sizeof(b)) ? (b > 60 ? 60 : b) : 40;
+        v = PE_parse_boot_argn("itlmt_awdl_gap", &b, sizeof(b)) ? (b > 60 ? 60 : b) : 0;
+    }
+    return v;
+}
+// §10.80: when the followed peer's sequence uses the station's own AP channel, be present only in those EAWs (no ROC: the
+// radio is already there, §10.58) and drop its other channels from our sequence. On 2026-11-08 the iPhone's sequence was
+// 157 157 149 - - - - 157 6 157 149 157 - - - 157 with the AP on 157: the 149 EAWs sit right after 157 ones, and a ROC
+// window there cannot be set up in the 1.5 ms between them (39 ms late, 71% of unicast lost, §10.78/§10.79). The 157
+// EAWs are free and still give the peer 6 of 16 to reach us. Boot-arg itlmt_awdl_aponly=0 turns it off.
+static uint32_t awdlApOnly()
+{
+    static uint32_t v = 0xffffffff;
+    if (v == 0xffffffff) {
+        uint32_t b = 1;
+        v = PE_parse_boot_argn("itlmt_awdl_aponly", &b, sizeof(b)) ? (b ? 1 : 0) : 1;
     }
     return v;
 }
@@ -459,6 +476,9 @@ private:
     bool awdlPsfPending = false;                 // a PSF/MIF is due and rides in the next listen window
     uint64_t awdlLsnAtUs = 0;                    // start of the EAW the listen timer is armed for
     uint8_t awdlLsnCh = 0, awdlLsnSlot = 0, awdlLsnRun = 1;   // awdlLsnRun: EAWs the armed window covers (§10.65)
+    uint8_t awdlApCh = 0;                         // §10.80: the station's channel while linked (0 = not linked), cached
+    uint32_t awdlApChMs = 0, awdlApOnlyHits = 0;
+    uint8_t awdlApChannel();
     uint8_t awdlLsnNextCh = 0;                    // §10.79: channel of the present EAW right after the run (0 = none / same)
     uint32_t awdlLsnCut = 0;                      // §10.79: windows shortened so the next one can be set up in time
     uint32_t awdlLsnWins = 0, awdlLsnTx = 0, awdlLsnFail = 0, awdlPeerTlUpd = 0, awdlSlaveAlign = 0;
@@ -1044,7 +1064,7 @@ void itlmt7925AwdlInterface::awdlPublishState()
     char b[900];
     snprintf(b, sizeof(b),
              "role=%u chg=%u master=%02x%02x%02x%02x%02x%02x top=%02x%02x%02x%02x%02x%02x eaws=%u posted=%u fail=%u end=%u/%u late=%u syncs=%u adj=%d psf=%u/%u mif=%u/%u oob=a%u/o%u/s%u/x%u "
-             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d cut=%u/%u",
+             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d cut=%u/%u aponly=%u/%u/%u",
              (unsigned)awdlRole, (unsigned)awdlRoleChanges, awdlMasterAddr[0], awdlMasterAddr[1], awdlMasterAddr[2],
              awdlMasterAddr[3], awdlMasterAddr[4], awdlMasterAddr[5], awdlTopMaster[0], awdlTopMaster[1], awdlTopMaster[2],
              awdlTopMaster[3], awdlTopMaster[4], awdlTopMaster[5], (unsigned)awdlTlEaws, (unsigned)awdlTlPosted, (unsigned)awdlTlPostFail, (unsigned)awdlTlEndPosted,
@@ -1060,7 +1080,7 @@ void itlmt7925AwdlInterface::awdlPublishState()
              (unsigned)awdlDrxNotUs, (unsigned)awdlDrxFail, (unsigned)awdlDrxDup, (unsigned)awdlPmSelf, (unsigned)awdlPmUs, (unsigned)awdlPmOther,
              awdlPmLast[0], awdlPmLast[1], awdlPmLast[2], awdlPmLast[3], awdlPmLast[4], awdlPmLast[5], (unsigned)awdlPmSeq,
              (unsigned)awdlRxBand[0], (unsigned)awdlRxBand[1], (int)awdlRxRssiMin[0], (int)awdlRxRssiMax[0],
-             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1], (unsigned)awdlLsnCut, (unsigned)awdlGapMs());
+             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1], (unsigned)awdlLsnCut, (unsigned)awdlGapMs(), (unsigned)awdlApOnly(), (unsigned)awdlApCh, (unsigned)awdlApOnlyHits);
     setProperty("itlmt-awdl", b);
 }
 
@@ -1222,6 +1242,21 @@ static bool awdlUsableCh(uint8_t ch)
 }
 
 // The channel this interface is on in sequence slot `slot` under the presence schedule, 0 = with the AP (§10.62).
+// §10.80: the station's channel from the core (ITL_NATIVE_STATUS), refreshed at most once a second.
+uint8_t itlmt7925AwdlInterface::awdlApChannel()
+{
+    uint32_t now = (uint32_t)(awdlNowUs() / 1000);
+    if (awdlApChMs && now - awdlApChMs < 1000) return awdlApCh;
+    awdlApChMs = now ? now : 1;
+    static ItlNativeStatus st;                    // ~600 bytes: not on the stack; only the work loop calls this
+    bzero(&st, sizeof(st));
+    st.version = 1;
+    bool ok = coreDev && coreDev->callPlatformFunction(ITL_NATIVE_STATUS, false, &st, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+    uint8_t ch = (ok && st.state == ITL_NATIVE_UP) ? st.channel : 0;
+    awdlApCh = (ch >= 36 && ch <= 48 && !(ch % 4)) || (ch >= 149 && ch <= 165 && (ch % 4) == 1) || (ch >= 1 && ch <= 13) ? ch : 0;
+    return awdlApCh;
+}
+
 uint8_t itlmt7925AwdlInterface::awdlSchedCh(uint32_t slot)
 {
     slot &= 15;
@@ -1235,6 +1270,13 @@ uint8_t itlmt7925AwdlInterface::awdlSchedCh(uint32_t slot)
         for (uint32_t i = 0; i < p->n && i < 16; i++) if (awdlUsableCh(p->ch[i])) any = true;
         if (any && p->n) {
             uint8_t c = p->ch[slot % p->n];
+            // §10.80: the peer uses our AP's channel: only those EAWs (they cost the AP nothing and can always be met)
+            uint8_t ap = awdlApOnly() ? awdlApChannel() : 0;
+            if (ap) {
+                bool hasAp = false;
+                for (uint32_t i = 0; i < p->n && i < 16; i++) if (p->ch[i] == ap) hasAp = true;
+                if (hasAp) { if (c != ap) awdlApOnlyHits++; return c == ap ? c : 0; }
+            }
             return awdlUsableCh(c) ? c : 0;
         }
     }
