@@ -364,6 +364,9 @@ private:
     bool awdlOwnSent = false;
     int awdlOwnRc = 1;                            // 1 = not sent yet
     void awdlOwnMacApply();
+    void awdlOwnMacClear();
+    volatile uint8_t awdlOff = 0, ctlAwdlReq = 0;   // §10.72 itl_awdloff
+    uint8_t regForceWorld = 0;                      // §10.72 itl_ccworld
     // The last MCU commands (name, rc, uptime ms), dumped when the firmware stops answering (docs/ROADMAP-AWDL.md §10.42).
     struct McuHist { const char *name; int rc; uint32_t ms; };
     McuHist mcuHist[24] = {};

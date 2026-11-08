@@ -401,7 +401,8 @@ int itlmt7925::m3HwPrep()
 void itlmt7925::regCountryFromAp()
 {
     char cc[3] = {'0', '0', 0};
-    const uint8_t *ie = tgtIe, *end = tgtIe + (tgtIeLen < sizeof(tgtIe) ? tgtIeLen : sizeof(tgtIe));
+    const uint8_t *ie = regForceWorld ? tgtIe : tgtIe, *end = tgtIe + (tgtIeLen < sizeof(tgtIe) ? tgtIeLen : sizeof(tgtIe));
+    if (regForceWorld) end = ie;                             // itl_ccworld=1 (§10.72): "00", as main
     while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
         if (ie[0] == 7 && ie[1] >= 3 && ie[2] >= 'A' && ie[2] <= 'Z' && ie[3] >= 'A' && ie[3] <= 'Z') {
             cc[0] = (char)ie[2];
@@ -813,6 +814,29 @@ bool itlmt7925::awdlStampSync(uint8_t *frame, uint32_t len, const AwdlTimeline &
 // {tag 0 ACTIVE, len 12, active, link_idx, omac_addr}). The RMAC acknowledges unicast frames whose addr1 matches an active
 // OMAC; with only the station address programmed, a peer's unicast to awdl0 was never ACKed (the iPhone's SYN-ACK arrived
 // up to 22 times, the same TCP timestamp each time: 802.11 retries). Sent on the link thread, between radio windows.
+// §10.72: the second OMAC off again (DEV_INFO active=0), so the firmware has only the station's interface.
+void itlmt7925::awdlOwnMacClear()
+{
+    if (!awdlOwnSent || awdlOwnRc != 0) { awdlOwnSent = false; return; }
+    uint8_t a[6];
+    if (cmdLock) IOLockLock(cmdLock);
+    memcpy(a, awdlOwnAddr, 6);
+    if (cmdLock) IOLockUnlock(cmdLock);
+    uint8_t dev[16];
+    bzero(dev, sizeof(dev));
+    dev[0] = 1; dev[1] = 0xff;
+    put16(dev + 4, 0); put16(dev + 6, 12);
+    dev[8] = 0; dev[9] = 1;                                  // inactive, link_idx 1
+    memcpy(dev + 10, a, 6);
+    uint8_t q = awdlQuiet;
+    awdlQuiet = 0;
+    int rc = m3Cmd(0x01, dev, sizeof(dev), "awdl own mac off (omac 1)");
+    awdlQuiet = q;
+    awdlOwnSent = false;
+    awdlOwnRc = -1;
+    m3log("awdl own mac off rc=%d", rc);
+}
+
 void itlmt7925::awdlOwnMacApply()
 {
     uint8_t a[6];
@@ -885,6 +909,11 @@ void itlmt7925::awdlSyncTx()
         return;
     }
     if (awdlBackoffUntilMs && (int32_t)(nowMs() - awdlBackoffUntilMs) < 0) {   // after a ROC the firmware never granted
+        if (awdlHeldCh) awdlHeldClose();
+        awdlFrameDone = __atomic_load_n(&awdlFrameSeq, __ATOMIC_ACQUIRE);
+        return;
+    }
+    if (awdlOff) {                                           // itl_awdloff=1 (§10.72): no window, no second OMAC
         if (awdlHeldCh) awdlHeldClose();
         awdlFrameDone = __atomic_load_n(&awdlFrameSeq, __ATOMIC_ACQUIRE);
         return;

@@ -3341,3 +3341,45 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 2. With the VPN on and no AirDrop: gateway ping under 15 ms, VPN download over 5 MB/s. On the `awdl duty` line the idle count grows and off/elapsed is about 10%.
 3. Open AirDrop on the iPhone near the Mac: the Mac should appear within a few seconds (the limit lifts once the iPhone is heard).
 4. Send a photo each way. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.72 Boot 2026-11-08 09:12 (core DE2C6D63, native 6B413594): Wi-Fi weak even with awdl0 down → find the root cause in one boot with runtime switches (core 645E44F5)
+
+**What the owner sees.** Wi-Fi is too weak to use; they switched to USB tethering from the phone. On the same network and in the same spot the phone gets about 50 Mb/s up, 35 ms unloaded and 136 ms loaded (fast.com).
+
+**Measured through en1 (AP on channel 36, 80 MHz):**
+
+| | awdl0 up | awdl0 down |
+|---|---|---|
+| download | 0.11–0.26 MB/s | 1.97 MB/s |
+| upload | – | 0.37 MB/s |
+| gateway ping | 36 ms avg | 115 ms avg, 390 max |
+
+- stat-log at up=459 s (AWDL running): the firmware retried every transmitted frame 1.7 times on average (`txf` fwRetry 67250 for 39406 freed) and 6.4% failed outright. 34% of the received frames were retransmissions (`rty=23442/68513`): the AP repeats its frames, most likely because it does not hear our ACKs and BlockAcks.
+- The link side is the weak one, not only the AWDL windows. On main, with the same boot-args (`itlmt_nopwr=1`), this driver measured 33–41 MB/s (docs/TEST-NATIVE-WIFI.md, round 26d).
+
+**What dev/awdl changes on the plain station link (diff against main):**
+1. `set_domain` carries the AP's country (VN), not "00" (§10.67).
+2. A second OMAC is active in the firmware (`awdl own mac (omac 1)`, DEV_INFO active=1) from the first AWDL frame on, for as long as the boot lasts.
+3. The AWDL windows themselves (ROC, sniffer, promiscuous filter).
+4. Not new, but suspect for weak uplink: with `itlmt_nopwr=1` the firmware never gets CLC or SKU power tables. Sending them on a live link hung it (§10.71). Linux sends them at init and with every regulatory change.
+
+**Change (core 645E44F5): runtime switches, so one boot separates the suspects (`build/itlctl`, root).**
+- `itl_awdloff=1`: no AWDL window, and the second OMAC is switched off again (DEV_INFO active=0). `0` turns AWDL back on.
+- `itl_ccworld=1`: `set_domain` sends "00" from the next join.
+- `itl_nopwr=0`: the CLC and SKU tables are sent at the next join, before the link is up, as Linux does.
+- `itl_lvl=6` reconnects, so the last two take effect.
+- `scripts/wifi-ab.sh` (root) runs the matrix and saves `build/wifi-ab-<time>.txt`:
+  - A: as booted
+  - B: AWDL off
+  - C: B + domain "00"
+  - D: B + country + power tables at join
+  - E: D + AWDL on
+
+  Each row records gateway ping, download and upload through en1, plus the retry counters before and after.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-093328` (DE2C6D63).
+
+**Next boot test:**
+1. Check the UUIDs are 645E44F5 / 6B413594. Turn Wi-Fi on.
+2. Run `sudo bash scripts/wifi-ab.sh` (about 4 minutes; the Wi-Fi link reconnects twice).
+3. The row that gets back toward the phone's numbers names the cause. The fix then goes into the default configuration.
