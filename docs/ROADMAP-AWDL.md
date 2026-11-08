@@ -3478,3 +3478,16 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 **Next (when the owner allows a test on the live link):**
 1. A short speed test and a gateway ping on this AP, to measure what `rty` 81% costs.
 2. Back at "10.07 Cafe" (ch 36, −63 dBm): if TX works there too, the eeprom/power fix is confirmed. If not, run `itl_nopwr=1` + reconnect there to separate the power tables from the eeprom fix.
+
+**Test on the live link (owner's go-ahead, 14:3x, everything bound to en1, the only interface up; USB tethering off):**
+
+| | result |
+|---|---|
+| gateway ping (20) | 0% loss, avg 9.2 ms, max 27.7 |
+| 1.1.1.1 ping (10) | 0% loss, avg 45.9 ms |
+| download, Cloudflare 25 MB | 5.4 MB/s (~43 Mb/s) |
+| upload, Cloudflare 20 MB | 7.4 MB/s (~59 Mb/s; the phone did ~50 Mb/s up at 10.07 Cafe) |
+
+- `stat-log` over the whole test: `txf` failures stayed at 29 of 145942 freed, retries 0.30 per frame. `noslot` rose 12014 → 13269 during the upload (TX ring full: host back-pressure, not loss).
+- `rty` stayed around 83%. It does not stop TCP here, but it is still the open uplink item (ACK/BlockAck heard by the AP).
+- The link is HT40 only (300 Mb/s PHY), so 43 Mb/s down is not yet a measure of the driver's ceiling.
