@@ -3491,3 +3491,24 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - `stat-log` over the whole test: `txf` failures stayed at 29 of 145942 freed, retries 0.30 per frame. `noslot` rose 12014 → 13269 during the upload (TX ring full: host back-pressure, not loss).
 - `rty` stayed around 83%. It does not stop TCP here, but it is still the open uplink item (ACK/BlockAck heard by the AP).
 - The link is HT40 only (300 Mb/s PHY), so 43 Mb/s down is not yet a measure of the driver's ceiling. The owner notes the café's internet line itself is slow, so these numbers are bounded by the line, not by the Wi-Fi link.
+
+### 10.77 Boot 2026-11-08 20:26 (core A171AD24, native B9AE6E64, Bluetooth on): a strong AP, full speed; AirDrop test next
+
+**Wi-Fi, "Thanh coffee"** `9c:5d:12:89:1f:24`, ch 157, VHT80 (`bw=2 center=155`), Country IE US (`regulatory: country US`, `clc US … power 8 ext 8`, `txpower … rc=0`), RSSI −41 dBm. Test bound to en1 (owner's go-ahead), USB tethering off:
+
+| | result |
+|---|---|
+| gateway ping (20) | 0% loss, avg 2.5 ms |
+| 1.1.1.1 ping (10) | 0% loss, avg 60 ms (one 339 ms outlier) |
+| download, Cloudflare 50 MB | 26.8 MB/s (~215 Mb/s) |
+| upload, Cloudflare 40 MB | 25.6 MB/s (~205 Mb/s) |
+
+- `stat-log` across the test: `txf` 42 failed of 370401, 0.09 retries per frame. `rty=8432/261728`: the AP re-sends 3.2% of its frames (October at −38 dBm: ~30%; §10.76 on the HT40 AP: 83%).
+- So the 83% of §10.76 was tied to that link (HT40-only AP, or the line the owner called laggy), not a general uplink fault. If it comes back on an HT-only AP, trace the HT-only path (no VHT in STA_REC) against Linux.
+
+**AirDrop.** awdl0 is up, Bluetooth is on (BT firmware ready in 5.1 s, HCI reset ok), and AWDL had not run yet this boot. The §10.67 blocker was 5 GHz unicast to the iPhone failing (uc5 25 ok / 198 fail): the same 5 GHz transmit weakness that §10.75 fixed for the station link. The photo test of §10.68–§10.71 was never run because Wi-Fi was down. sharingd's `DiscoverableMode` is `Off` (AirDrop receiving off), so iPhone → Mac needs it set to Everyone first.
+
+**Test (owner, with the iPhone nearby):**
+1. AirDrop receiving on the Mac: Everyone for 10 minutes.
+2. iPhone → Mac: send one photo. Then Mac → iPhone.
+3. Read: sharingd (`Received ASK request`, `Lost BLE device`), the core's `awdl txfree` uc5 ok/fail, `awdl duty`, and no `recover #` or `link lost`.
