@@ -3598,3 +3598,6 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - The AWDL message struct sizes (`itlmt7925_awdl.cpp` 132–201) are data formats, not class layouts. They can only be checked by reading the Family's code per build.
 
 **Install:** not yet; waiting for the owner, batched with the next reboot (it carries the §10.80 AWDL change too).
+
+**Installed (owner's go-ahead, 2026-11-08 22:08):** native 206D41C8 (§10.80 + §10.81) with core BBFBA198. Undo: `Kexts-backup/itlmt7925Native.kext.20261108-220841` (A2880A4E).
+**Next boot:** `ioreg -l | grep itlmt-native-abi` → `ok: 10 classes …`; then the §10.80 AirDrop test.
