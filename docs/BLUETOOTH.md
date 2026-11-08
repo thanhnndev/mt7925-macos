@@ -367,6 +367,37 @@ CPU near 0, and in the HCI trace `2035 <set> <addr>` st=00 before each `2039 01 
 (`/Library/Preferences/com.apple.MobileBluetooth.debug.plist`) is still on for that check; remove the plist afterwards (it
 rotates a 5 MB file every ~2 min while advertising loops).
 
+### Verified, boot 2026-11-08 21:51, and an audit for the whole macOS 26 line
+
+* MtkBtFw 0.2.0: the firmware was hung again after the warm reboot (`wmt op 1 flag 0: no event`); MtkBtFw reset the subsystem,
+  reloaded all sections, `HCI Reset complete, status 0`. Controller On, NVRAM flag stays `00`.
+* BtLeDlFix 1.3.0: 0× `STATUS 718`, `Started advertising successfully`, bluetoothd 0.9-1.9 % CPU (was 15-29 %).
+* `tools/btledl-check.py` (new): reads `/usr/sbin/bluetoothd` (the page cache shows BtLeDlFix's patched pages) and prints, per
+  patch, `applied` / `will-match` / `MISSING`. On 25G332 all four macOS 26 patches are `applied`. Run it after every macOS
+  update; `will-match` or `applied` for all four means Bluetooth LE keeps working on that build.
+
+Audit (owner's rule: gates and patterns hold for all of macOS 26 / Darwin 25.x, never one build):
+
+| item | how it is bound | outcome if a future 26.x changes it |
+|---|---|---|
+| BtLeDlFix load range | Lilu `KernelVersion::Monterey..Tahoe` (Darwin 21-25, major only); config `MinKernel 21.0.0` | macOS 27: plugin off, no patches |
+| LE length (26) | masked sequence, unique | miss: BLE devices that need the length step stall at connect |
+| advertising sets check | exact bytes incl. vtable slot `0x9c0`; the slot is the identity (masked, the same sequence occurs 24-62× for other capability checks) | miss: spec sets off, no LE advertising, no loop |
+| random-address flag / resend | masked sequences, unique | miss with the sets check applied: the 718 loop (this incident); `btledl-check` shows it |
+| MtkBtFw | matches USB 0489:e11e interface 0; no OS check; IOUSBHostFamily KPI | independent of macOS builds |
+| BlueToolFixup 2.7.2 | upstream acidanthera | upstream's own patterns |
+| NVRAM `bluetoothExternalDongleFailed` | OpenCore Delete+Add every boot | flag can only last one boot |
+
+The one combination that is not fail-safe is "sets check applied, random-address patches missed". The patches are applied per
+page as pages are validated, so the kext cannot make one depend on another; `btledl-check.py` is the guard.
+
+Remaining boot-time cost: on a warm boot that needs the subsystem reset, MtkBtFw takes ~9.7 s and the first bluetoothd
+(~15 s after boot) probes the interface while MtkBtFw still holds it, finds no Bluetooth interfaces, falls back to UART once
+and restarts 15 s later on USB (one ExcUserFault per such boot; the NVRAM flag is not set). Cold boots and warm boots with a
+healthy firmware (1.7 s) are not affected.
+
+The HCI file trace plist was removed 2026-11-08 21:5x (tracing stops at the next bluetoothd start).
+
 ## Pieces
 
 | Piece | What it does |
