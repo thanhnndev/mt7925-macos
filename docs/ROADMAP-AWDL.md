@@ -3435,3 +3435,30 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
    - If data TX works (few failures, retries well under 1 per frame): the Bluetooth bring-up is the cause. Compare it with Linux btmtk + mt7925 (WMT, coexistence/antenna setup) using REA. Then re-enable Bluetooth with the fix.
    - If TX still fails: Bluetooth is cleared. Look next at persistent chip state (efuse/eeprom, firmware files) against the 2026-10-26 build.
 3. Undo: copy `config.plist.bak-20261108-115436` back to `config.plist`.
+
+### 10.75 Boot 2026-11-08 11:57 (main's core F3E732F4, Bluetooth kexts off, warm): our 5 GHz transmit is weak, not new → eeprom command fixed, power tables at join, Bluetooth back on (core A171AD24, native B9AE6E64)
+
+**Result of §10.74.** Without MtkBtFw/BtLeDlFix, on main's driver, TX still fails on "10.07 Cafe" (ch 36, VHT80, −63 dBm):
+- `txf=389/0/0/315/4527`: 81% of data frames failed, ~11.6 retries each (the full retry limit).
+- Fixed-rate OFDM-6 frames fail too: EAPOL M2 failed 12 of 13 (`txFail=12`), auth got no response on 4 of 8 frames.
+- So it is not rate control and not Bluetooth (only a warm reboot though; see the cold boot below). Our frames mostly do not reach the AP.
+
+**It is not a regression in time.** The October rounds were also on 5 GHz (ch 40 HE160, ch 52 DFS 160), but at −37..−40 dBm right next to the AP. Even there our TX needed 1.6–1.7 attempts per frame and the AP re-sent ~30% of its frames because it missed our ACKs (docs/TEST-NATIVE-WIFI.md round 24/26). A healthy radio at −38 dBm has almost no retries. The uplink has been short of margin all along; at −63 dBm the margin is gone. The scan shows the café's 2.4 GHz BSS at −74 dBm, so 2.4 GHz is no way around it.
+
+**Divergence from Linux found.** `mt7925_mcu_set_eeprom` sends `UNI_EFUSE_BUFFER_MODE` with `format = EE_FORMAT_WHOLE` (1). We sent 0 (`EE_FORMAT_BIN`) since 2026-10-12, although our comment said "whole". This command tells the firmware where its calibration data comes from (efuse), which includes the per-channel TX power calibration. Linux mt76_connac_mcu.h: `EE_MODE_EFUSE = 0`, `EE_FORMAT_BIN = 0`, `EE_FORMAT_WHOLE = 1`.
+
+**Checked, same as Linux or not TX-power related:** the data TXD (no power or antenna field in Linux either), `mt792x_mac_init_band` (MAC timing/MIB/RCPI registers only).
+
+**Change (one batch):**
+1. Core: the eeprom command sends format 1 (`itlmt7925_m3.cpp` `m3HwPrep`).
+2. `itlmt_nopwr=1` removed from boot-args: the CLC + SKU power tables go out at join, before the link, as Linux does at every regulatory update. They were accepted at join on 11:19 (`rc=0`); only sending them on a live link hung the firmware (§10.71).
+3. MtkBtFw + BtLeDlFix re-enabled (Bluetooth back for the owner).
+4. dev/awdl kexts back on the ESP (core A171AD24, native B9AE6E64), so the runtime switches (`itl_nopwr`, `itl_awdloff`, `itl_ccworld`) are there if needed.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-122505` (main F3E732F4), `Kexts-backup/itlmt7925Native.kext.20261108-122505` (main 3A02974A), `config.plist.bak-20261108-122505` (BT off, `itlmt_nopwr=1`).
+
+**Next boot: a cold boot.** Shut down fully (not restart), wait 10 s, power on. This also clears any Bluetooth firmware left in the chip from earlier boots.
+1. Check the UUIDs are A171AD24 / B9AE6E64 and that MtkBtFw/BtLeDlFix are loaded.
+2. Let Wi-Fi join on its own. Read `m3-log`: `eeprom(efuse) rc=0 st=0`, `clc VN env 1 …`, `txpower: … rc=0`.
+3. Read `stat-log` `txf=` (freed/…/fail/retries) and the `eapol summary` `txFail=`. Working: fails a few %, retries well under 1 per frame.
+4. If TX still fails: the calibration path is not the whole answer. Next is to compare against the firmware itself with REA (the `EFUSE_CTRL` handler, what the firmware does without SKU) and the ACPI SAR/MTCL path (`mt792x_acpi_sar.c`).

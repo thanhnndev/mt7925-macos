@@ -347,7 +347,9 @@ int itlmt7925::m3HwPrep()
         // steps the Linux driver does once after the firmware runs: firmware log to host, eeprom = efuse, RTS threshold
         m3hw = true;
         static const uint8_t fwlog[12] = {0, 0, 0, 0, 0, 0, 8, 0, 1, 0, 0, 0};            // UNI_WSYS_CONFIG_FW_LOG_CTRL, ctrl 1
-        static const uint8_t eeprom[12] = {0, 0, 0, 0, 2, 0, 8, 0, 0, 0, 0, 0};          // UNI_EFUSE_BUFFER_MODE: efuse, whole
+        // UNI_EFUSE_BUFFER_MODE (tag 2, len 8): buffer_mode EE_MODE_EFUSE (0), format EE_FORMAT_WHOLE (1), buf_len 0, as
+        // mt7925_mcu_set_eeprom. §10.75: byte 9 was 0 (EE_FORMAT_BIN) since 2026-10-12 although the comment said "whole".
+        static const uint8_t eeprom[12] = {0, 0, 0, 0, 2, 0, 8, 0, 0, 1, 0, 0};
         static const uint8_t rts[16] = {0, 0, 0, 0, 8, 0, 12, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0};   // band 0, len 0x92b, pkt 2
         m3Cmd(0x0b, fwlog, sizeof(fwlog), "fw_log");
         m3Cmd(0x2d, eeprom, sizeof(eeprom), "eeprom(efuse)");
