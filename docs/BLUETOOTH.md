@@ -388,7 +388,7 @@ Audit (owner's rule: gates and patterns hold for all of macOS 26 / Darwin 25.x, 
 | BlueToolFixup 2.7.2 | upstream acidanthera | upstream's own patterns |
 | NVRAM `bluetoothExternalDongleFailed` | OpenCore Delete+Add every boot | flag can only last one boot |
 
-**BtLeDlFix 1.4.0 (built, not installed):** per-patch hit counters, read on demand with `sysctl debug.btledlfix`
+**BtLeDlFix 1.4.0 (staged on the ESP 2026-11-08 22:03, owner OK; backup `Kexts-backup/BtLeDlFix.kext.20261108-220308` = 1.3.0):** per-patch hit counters, read on demand with `sysctl debug.btledlfix`
 (`len15=0 len26=1 advsets=1 randaddr=1 resend=1 adv=on` expected on 26.x once bluetoothd runs). Only increments happen in the
 page-validation path. A macOS 26 counter at 0 after bluetoothd started = that pattern misses on this build.
 Masking the advertising-sets slot was tested and rejected: masked, the sequence matches 24-62 sites (one per capability check).
