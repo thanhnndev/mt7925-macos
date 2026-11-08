@@ -73,6 +73,7 @@
 #include <Headers/kern_version.hpp>
 
 #include <sys/vnode.h>
+#include <sys/sysctl.h>
 
 #define MODULE_SHORT "btledl"
 
@@ -129,6 +130,22 @@ static const uint8_t kAdvResendReplMask[] = {
 static mach_vm_address_t orig_cs_validate {};
 static bool advPatchEnabled = true;
 
+// Per-patch hit counts (pages of bluetoothd patched since boot; a page evicted and validated again counts again). Only plain
+// increments happen in the page-validation path; the text is built when someone reads `sysctl debug.btledlfix`. A macOS 26
+// patch at 0 after bluetoothd has started means its pattern no longer matches this build (see tools/btledl-check.py).
+enum { kHitLen15, kHitLen26, kHitAdv, kHitAddr, kHitResend, kHitCount };
+static volatile uint32_t patchHits[kHitCount];
+
+static int btledlSysctl SYSCTL_HANDLER_ARGS {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "len15=%u len26=%u advsets=%u randaddr=%u resend=%u adv=%s", patchHits[kHitLen15],
+             patchHits[kHitLen26], patchHits[kHitAdv], patchHits[kHitAddr], patchHits[kHitResend],
+             advPatchEnabled ? "on" : "off");
+    return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, btledlfix, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED, nullptr, 0, btledlSysctl,
+            "A", "BtLeDlFix patch hits");
+
 static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data,
                                      int *validated_p, int *tainted_p, int *nx_p) {
     char path[PATH_MAX];
@@ -137,21 +154,32 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     static constexpr size_t dirLength = sizeof("/usr/sbin/") - 1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0) &&
         strcmp(path + dirLength, "bluetoothd") == 0) {
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLenOriginal, kLenPatched))
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLenOriginal, kLenPatched)) {
             SYSLOG(MODULE_SHORT, "patched LE data length wait in %s", path);
-        if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kLen26Original, kLen26FindMask, kLen26Patched, kLen26ReplMask, 1, 0))
+            patchHits[kHitLen15]++;
+        }
+        if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kLen26Original, kLen26FindMask, kLen26Patched, kLen26ReplMask, 1, 0)) {
             SYSLOG(MODULE_SHORT, "patched LE data length wait (macOS 26) in %s", path);
-        if (advPatchEnabled && KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAdvOriginal, kAdvPatched))
+            patchHits[kHitLen26]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAdvOriginal, kAdvPatched)) {
             SYSLOG(MODULE_SHORT, "patched LE advertising sets check in %s", path);
-        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvAddrOriginal, kAdvAddrFindMask, kAdvAddrPatched, kAdvAddrReplMask, 1, 0))
+            patchHits[kHitAdv]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvAddrOriginal, kAdvAddrFindMask, kAdvAddrPatched, kAdvAddrReplMask, 1, 0)) {
             SYSLOG(MODULE_SHORT, "patched advertising set random address flag in %s", path);
-        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvResendOriginal, kAdvResendFindMask, kAdvResendPatched, kAdvResendReplMask, 1, 0))
+            patchHits[kHitAddr]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvResendOriginal, kAdvResendFindMask, kAdvResendPatched, kAdvResendReplMask, 1, 0)) {
             SYSLOG(MODULE_SHORT, "patched advertising set random address resend in %s", path);
+            patchHits[kHitResend]++;
+        }
     }
 }
 
 static void pluginStart() {
     SYSLOG(MODULE_SHORT, "start");
+    sysctl_register_oid(&sysctl__debug_btledlfix);
     if (checkKernelArgument("-btledlfxnoadv")) {
         advPatchEnabled = false;
         SYSLOG(MODULE_SHORT, "LE advertising patch disabled by -btledlfxnoadv");
