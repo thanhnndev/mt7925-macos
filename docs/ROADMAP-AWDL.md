@@ -3530,3 +3530,26 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 **Where AirDrop stands:** discovery, BLE advertising, the TLS connection and the PIN exchange work. The data exchange after the PIN fails because AWDL unicast is lost when our windows miss the iPhone's.
 
 **Next (trace, no change yet):** measure the window start error against the iPhone's advertised schedule (AW sequence + offset in its sync parameters) per window, and find where the 39 ms comes from (ROC grant latency 21 ms + sniffer-off 22 ms, or the lead computation). Compare the ROC request timing with Linux mt7925 `mt7925_mcu_set_roc` / `abort_roc` usage.
+
+### 10.79 Why AWDL windows are 39 ms late: a channel change between back-to-back EAWs leaves no time for the setup → gap before a channel change (core BBFBA198, native 39C8FDA0)
+
+**Evidence (boot 20:26, read from the driver):**
+- The iPhone's channel sequence (`itlmt-awdl-peer-tlv4`, 16 EAWs): `157 157 149 – – – – 157 6 157 149 157 – – – 157`. Our own (`itlmt-awdl-self-tlv4`) mirrors it, as §10.64 intends. The AP is on 157.
+- A window on 157 needs no ROC (§10.58, setup ~5 ms). A window on 149 needs a ROC: `awdl phase` setup 4.8 + ROC 0.3 + grant 21.4 + sniffer config 6.7 ≈ 33 ms (learned `lead=35208us`), and its teardown costs sniffer-off 21.6 + end 5.4 ≈ 27 ms.
+- Same-channel EAWs are one window (§10.65), but 157→149 (slots 1→2, 9→10) and 149→157 (10→11) follow each other with only the 1.5 ms margin. The link thread runs one window at a time ([itlmt7925_m3.cpp:2640](../kexts/itlmt7925/itlmt7925_m3.cpp)), so the next window's setup starts only when the previous one ends: 35 ms late for 149, ~30 ms late for 157 after a 149 window. Measured: `late=239 avglate=39454us` against `early=139`.
+- An EAW is 64 TU, but the guaranteed part is the AW (16 TU) at its start. A 149 window 35–39 ms late misses all of it, which fits `uc5=197/492` (71% fail) while the station link on the same radio loses 0.1%.
+- The comment above `awdlRunMax` already recorded "avg 39 ms late" for back-to-back windows (§10.65); merging same-channel runs fixed only that case.
+
+**Change (native 39C8FDA0):** `awdlLsnArm` records the channel of the present EAW right after the run (`awdlLsnNextCh`). When it differs, `awdlLsnFire` shortens this window by `itlmt_awdl_gap` (default 40 ms, 0 = off, max 60), never below the AW + 2 ms. The next arm still finds that EAW, and the core's existing lead wait sets it up in time. `itlmt-awdl` ends with `cut=<windows shortened>/<gap ms>`.
+- Cost: a 157 run of two EAWs listens 89 ms instead of 129; a lone 149 EAW 23.5 ms instead of 63.5 (the AW is 16.4 ms). The 157 EAWs cost the AP nothing, and the 149 ones now meet their AW instead of missing it.
+
+**Instrumentation (core BBFBA198):** `awdl lead` adds `onlate=<n>/<avg us>`: late windows on the AP's channel, separated from ROC windows.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-203846` (A171AD24), `Kexts-backup/itlmt7925Native.kext.20261108-203846` (B9AE6E64), or the boot-arg `itlmt_awdl_gap=0`.
+
+**Next boot test (warm reboot is enough; Wi-Fi + AirDrop):**
+1. Check the UUIDs are BBFBA198 / 39C8FDA0. Wi-Fi should behave as in §10.77 (only AWDL scheduling changed).
+2. AirDrop receiving set to Everyone, iPhone nearby. Send a photo Mac → iPhone, then iPhone → Mac, and enter the code.
+3. Read `m3-log` `awdl lead`: `late` should drop well below `early`, and `avglate` should fall far below 39 ms. Read `awdl txfree` `uc5` ok/fail (was 197/492) and `itlmt-awdl` `cut=`.
+4. sharingd: no repeated `DISCOVER request timeout`, and the transfer should get past the code step.
+5. If ROC windows are still late: the sniffer-off (21.6 ms) and the ROC grant (21.4 ms) are next, against Linux `mt7925_mcu_set_roc` / `mt7925_mcu_abort_roc` and how mt76 sets the sniffer.

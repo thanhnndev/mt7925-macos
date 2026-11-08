@@ -238,6 +238,7 @@ private:
     uint64_t awdlStartUs = 0;
     uint32_t awdlLeadUs = 30000, awdlLeadEarly = 0, awdlLeadLateN = 0, awdlLeadStale = 0, awdlLeadWaitMs = 0;
     uint64_t awdlLeadLateUs = 0;
+    uint32_t awdlLateOnN = 0; uint64_t awdlLateOnUs = 0;   // §10.79: late windows on the AP's channel
     uint32_t awdlOnChWin = 0;
     uint64_t awdlPhUs[9] = {};                    // per-phase time of ROC windows (§10.59)
     uint32_t awdlPhN = 0;                     // windows run on the AP's own channel: no ROC, no AP cost (§10.58)

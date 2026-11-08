@@ -54,6 +54,20 @@ static uint32_t awdlBlock()
     }
     return v;
 }
+// §10.79: room a window leaves before the next present EAW when that EAW is on another channel: this window's teardown
+// plus the next one's setup. Measured 2026-11-08 (iPhone sequence 157 157 149 - - - - 157 6 157 149 157 ..., AP on 157):
+// on-channel teardown ~1 ms + ROC setup ~35 ms (157 -> 149), ROC teardown ~27 ms (sniffer off 21.6 + end 5.4) + on-channel
+// setup 5 ms (149 -> 157). Without it every channel change started the next window ~39 ms late, past the 16 TU AW, and
+// 71% of AWDL unicast at 5 GHz went unanswered. Boot-arg itlmt_awdl_gap=<ms> (0 = off, at most 60).
+static uint32_t awdlGapMs()
+{
+    static uint32_t v = 0xffffffff;
+    if (v == 0xffffffff) {
+        uint32_t b = 0;
+        v = PE_parse_boot_argn("itlmt_awdl_gap", &b, sizeof(b)) ? (b > 60 ? 60 : b) : 40;
+    }
+    return v;
+}
 static const uint32_t kAwdlEawWinMs = 64;                 // a whole EAW (4 x 16 TU = 65.5 ms) less 1.5 ms of margin
 // §10.65: consecutive present EAWs on one channel are one window (one ROC acquire, one abort), at most this many. Back-to-back
 // windows of one EAW each could not be met (the setup takes ~35 ms, the gap between them is 1.5 ms: avg 39 ms late), and
@@ -445,6 +459,8 @@ private:
     bool awdlPsfPending = false;                 // a PSF/MIF is due and rides in the next listen window
     uint64_t awdlLsnAtUs = 0;                    // start of the EAW the listen timer is armed for
     uint8_t awdlLsnCh = 0, awdlLsnSlot = 0, awdlLsnRun = 1;   // awdlLsnRun: EAWs the armed window covers (§10.65)
+    uint8_t awdlLsnNextCh = 0;                    // §10.79: channel of the present EAW right after the run (0 = none / same)
+    uint32_t awdlLsnCut = 0;                      // §10.79: windows shortened so the next one can be set up in time
     uint32_t awdlLsnWins = 0, awdlLsnTx = 0, awdlLsnFail = 0, awdlPeerTlUpd = 0, awdlSlaveAlign = 0;
     uint32_t awdlFamilyState = 1;                // the state the Family itself last set
     uint32_t awdlRoleFromAddr = 0;               // SYNC_STATE with state 1 and another node's address (§10.34)
@@ -1028,7 +1044,7 @@ void itlmt7925AwdlInterface::awdlPublishState()
     char b[900];
     snprintf(b, sizeof(b),
              "role=%u chg=%u master=%02x%02x%02x%02x%02x%02x top=%02x%02x%02x%02x%02x%02x eaws=%u posted=%u fail=%u end=%u/%u late=%u syncs=%u adj=%d psf=%u/%u mif=%u/%u oob=a%u/o%u/s%u/x%u "
-             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d",
+             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d cut=%u/%u",
              (unsigned)awdlRole, (unsigned)awdlRoleChanges, awdlMasterAddr[0], awdlMasterAddr[1], awdlMasterAddr[2],
              awdlMasterAddr[3], awdlMasterAddr[4], awdlMasterAddr[5], awdlTopMaster[0], awdlTopMaster[1], awdlTopMaster[2],
              awdlTopMaster[3], awdlTopMaster[4], awdlTopMaster[5], (unsigned)awdlTlEaws, (unsigned)awdlTlPosted, (unsigned)awdlTlPostFail, (unsigned)awdlTlEndPosted,
@@ -1044,7 +1060,7 @@ void itlmt7925AwdlInterface::awdlPublishState()
              (unsigned)awdlDrxNotUs, (unsigned)awdlDrxFail, (unsigned)awdlDrxDup, (unsigned)awdlPmSelf, (unsigned)awdlPmUs, (unsigned)awdlPmOther,
              awdlPmLast[0], awdlPmLast[1], awdlPmLast[2], awdlPmLast[3], awdlPmLast[4], awdlPmLast[5], (unsigned)awdlPmSeq,
              (unsigned)awdlRxBand[0], (unsigned)awdlRxBand[1], (int)awdlRxRssiMin[0], (int)awdlRxRssiMax[0],
-             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1]);
+             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1], (unsigned)awdlLsnCut, (unsigned)awdlGapMs());
     setProperty("itlmt-awdl", b);
 }
 
@@ -1478,6 +1494,11 @@ void itlmt7925AwdlInterface::awdlLsnArm(uint64_t now)
         awdlLsnRun = 1;
         if (awdlBlock())
             while (awdlLsnRun < awdlRunMax() && awdlSchedCh(ord + awdlLsnRun) == lch) awdlLsnRun++;
+        {
+            uint32_t nOrd = ord + awdlLsnRun;
+            uint8_t nCh = awdlBlock() ? awdlSchedCh(nOrd) : p->ch[nOrd % (p->n ? p->n : 16)];
+            awdlLsnNextCh = (nCh && nCh != lch && awdlUsableCh(nCh)) ? nCh : 0;
+        }
         uint64_t real = awdlNowUs();                             // `now` may be a point in the future (after a window)
         uint32_t lead = awdlSyncVer >= 5 ? kAwdlPreUs : 2000;
         uint64_t d = at > real + lead ? at - real - lead : 200;
@@ -1504,6 +1525,13 @@ void itlmt7925AwdlInterface::awdlLsnFire()
     uint32_t dwell = (awdlBlock() && awdlSyncVer >= 5)
                          ? (uint32_t)(awdlLsnRun * kAwdlAwUs * kAwdlAwPerEaw / 1000) - 2   // the whole run, 1.5 ms short
                          : awdlWinMs();
+    // §10.79: the next present EAW follows at once on another channel: end this one early enough for that window to be set
+    // up before its AW opens. The AW (16 TU) at the start of this window is always kept.
+    if (awdlBlock() && awdlSyncVer >= 5 && awdlLsnNextCh && awdlGapMs()) {
+        uint32_t minMs = kAwdlAwUs / 1000 + 2;
+        uint32_t cut = dwell > minMs + awdlGapMs() ? dwell - awdlGapMs() : minMs;
+        if (cut < dwell) { dwell = cut; awdlLsnCut++; }
+    }
     IOReturn r = awdlSubmitWindow(awdlLsnCh, dwell, tx, (uint16_t)awdlLsnSlot, awdlSyncVer >= 5 ? at : 0);
     if (r == kIOReturnSuccess) {
         awdlLsnWins++;

@@ -1128,6 +1128,7 @@ void itlmt7925::awdlSyncTx()
         } else {
             awdlLeadLateN++;
             awdlLeadLateUs += g - startUs;
+            if (onCh) { awdlLateOnN++; awdlLateOnUs += g - startUs; }   // §10.79: late windows on the AP's channel (no ROC)
         }
         uint64_t end = startUs + (uint64_t)dwellMs * 1000, now = awdlUptimeUs();
         dwellMs = end > now + 1000 ? (uint32_t)((end - now) / 1000) : 1;   // the dwell is counted from the AW start
@@ -1267,8 +1268,9 @@ void itlmt7925::awdlSyncTx()
               awdlRocLat[3], awdlRocLat[4]);
         m3log("awdl band: af=%u/%u win=%u/%u never=%u/%u dfs=%u (2.4/5 GHz)", awdlAfBand[0], awdlAfBand[1], awdlWinBand[0],
               awdlWinBand[1], awdlNeverBand[0], awdlNeverBand[1], awdlDfsSkip);
-        m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus stale=%u wait=%ums on=%u onch=%u apch=%u", awdlLeadUs,
-              awdlLeadEarly, awdlLeadLateN, awdlLeadLateN ? (uint32_t)(awdlLeadLateUs / awdlLeadLateN) : 0, awdlLeadStale,
+        m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus onlate=%u/%uus stale=%u wait=%ums on=%u onch=%u apch=%u", awdlLeadUs,
+              awdlLeadEarly, awdlLeadLateN, awdlLeadLateN ? (uint32_t)(awdlLeadLateUs / awdlLeadLateN) : 0, awdlLateOnN,
+              awdlLateOnN ? (uint32_t)(awdlLateOnUs / awdlLateOnN) : 0, awdlLeadStale,
               awdlLeadWaitMs, awdlLeadOn, awdlOnChWin, tgtCh);
         m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u soffslow=%u cc=%s clc=%s",
               awdlChainN, awdlChainBreak, awdlChainTimeout, awdlChainMs, awdlRocClip, awdlRocLateAbort, awdlSoffSlow, regCc, clcCc[0] ? clcCc : "-");
