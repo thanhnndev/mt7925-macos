@@ -331,6 +331,42 @@ Undo: `rm -rf /Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext && cp -R /Volumes/ESP/EFI/O
 needed) works only while no one has interface 0 open, i.e. while bluetoothd sits on the UART fallback: `regs` (read only),
 `probe` (HCI Reset + counts coredump packets), `recover <fw>`.
 
+## LE advertising loop again on 26.7.2 (25G332), found 2026-11-08 20:53: BtLeDlFix 1.3.0 masks build-specific bytes
+
+**Symptom.** Boot 20:52: `bluetoothd` at 15-29 % CPU, ~17 000 log lines/s, ~180×/s `failed to start advertising instance 1
+with status STATUS 718`. The controller itself was fine (MtkBtFw 0.2.0 had recovered a hung firmware on this warm boot:
+`wmt op 1 flag 0: no event; bring-up failed, subsystem reset and full reload; ... HCI Reset complete, status 0`).
+
+**HCI trace** (`bluetoothd-hci-latest.pklg`, 31 580 records in ~2 min): an endless `2036` (ext adv parameters, set 0, own
+address type random) st=00 → `2037` (data) st=00 → `2039 01 01 00 ...` (enable) **st=0x12** → `2039 00 00` (disable all), and
+no `2035` (LE Set Advertising Set Random Address) at all: the second cause above, back again.
+
+**Why.** bluetoothd's page cache shows which BtLeDlFix patches were applied on 25G332: LE length (26), advertising sets and
+the random-address resend are patched; the random-address flag patch is not. Its pattern held the rel32 of the `call` it
+NOPs: `83 b8 34 03 00 00 03 77 2a 31 ff e8 3e 6b ce ff` in 25G241, `... e8 1e 6c ce ff` in 25G332. So with the flag cleared
+the stack never writes the set's random address and every Enable fails.
+
+**Fix (1.3.0).** The macOS 26 patterns describe the instruction sequence and mask what changes between builds (call / jump
+displacements, struct field offsets, the stack slot and the register of the length flag), via Lilu
+`findAndReplaceWithMask`; the replace mask writes only the changed instruction:
+
+| patch | find (`??` masked) | becomes |
+|---|---|---|
+| LE length (26) | `83 f8 08 0f 95 c0 44 20 ?? 88 45 ??` | `39 c0 90` (cmp eax,eax; nop) |
+| random-address flag | `83 b8 ?? ?? ?? ?? 03 77 ?? 31 ff e8 ?? ?? ?? ??` | call → `0f 1f 44 00 00` |
+| random-address resend | `44 33 84 08 ?? ?? ?? ?? 8b 54 3a 03 33 94 08 ?? ?? ?? ?? 44 09 c2 0f 84 ?? ?? ?? ??` | je → `66 0f 1f 44 00 00` |
+
+Each is unique in the 25G332 x86_64 slice (checked on the file with the applied patches reverted) and covers the 25G241
+bytes. The advertising-sets patch keeps its exact bytes: its only build-dependent part is the vtable slot `0x9c0`, which is what
+identifies the call (masked, the sequence occurs 1 137 times). The kext's OS gate stays Monterey..Tahoe (kernel major), not a
+build. Staged 2026-11-08 21:49 on the ESP, previous build in `Kexts-backup/BtLeDlFix.kext.20261108-214939` (1.2.0).
+
+Next boot check: 0 lines of
+`/usr/bin/log show --last 5m --style compact --predicate 'process == "bluetoothd"' | grep -c "STATUS 718"`, `bluetoothd`
+CPU near 0, and in the HCI trace `2035 <set> <addr>` st=00 before each `2039 01 01 <set>` st=00. The HCI file trace
+(`/Library/Preferences/com.apple.MobileBluetooth.debug.plist`) is still on for that check; remove the plist afterwards (it
+rotates a 5 MB file every ~2 min while advertising loops).
+
 ## Pieces
 
 | Piece | What it does |
