@@ -38,7 +38,6 @@ Nếu bạn dùng build khác, hãy kiểm tra trước ([GUIDE §7](docs/GUIDE.
 - **Tích hợp macOS (native):** `IO80211Controller` và giao diện Skywalk. Có menu Wi-Fi, danh sách trong System Settings, RSSI và
   tốc độ, sự kiện chất lượng link (để macOS không ngắt mạng sau 60 giây), CoreCapture, ioctl NSS.
 - **Tự phục hồi:** khi mất link, driver reset chip, nạp lại firmware rồi kết nối lại.
-- **ItlWiFi.app:** app trên thanh menu để quét, kết nối và đo tốc độ, dùng cho chế độ legacy.
 - **Bluetooth:** `MtkBtFw` nạp firmware Bluetooth MT7925 qua USB (theo quy trình `btmtk` của Linux) để `bluetoothd` thấy một controller thật;
   `BtLeDlFix` (plugin Lilu) giúp thiết bị BLE kết nối xong. Chi tiết và việc còn mở: [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
 - **Test tự động trong CI:** WPA2, phân tích HT/VHT/HE, Block Ack, kiểm tra stub sinh ra khớp với header.

@@ -38,7 +38,6 @@ Sequoia build only on `24H32`. On any other build, check it first (see [GUIDE §
 - **Native macOS integration:** an `IO80211Controller` and a Skywalk interface. You get the Wi-Fi menu, the System Settings list,
   RSSI and rate, link-quality events (so macOS does not drop the link after 60 s), CoreCapture, and the NSS ioctl.
 - **Recovery:** when the link is lost, the driver resets the chip, reloads the firmware and joins again.
-- **ItlWiFi.app:** a menu bar app that scans, joins and runs a speed test, for the Ethernet-style legacy mode.
 - **Bluetooth:** `MtkBtFw` downloads the MT7925 Bluetooth firmware over USB (the Linux `btmtk` procedure), so `bluetoothd` sees a real
   controller; `BtLeDlFix` (a Lilu plugin) lets BLE devices finish connecting. Details and the open items: [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
 - **Host tests in CI:** WPA2 crypto vectors, HT/VHT/HE capability parsing, the Block Ack reorder buffer, and a check that the
@@ -95,7 +94,6 @@ separate kexts. Bluetooth is checked on the GA403WM only (USB `0489:e11e`); othe
 | `kexts/itlmt7925Native/` | native front end: `IO80211Controller`, infrastructure interface, (AWDL interface on `dev/awdl`) |
 | `kexts/MtkBtFw/` | Bluetooth: downloads the controller firmware over USB |
 | `kexts/BtLeDlFix/` | Bluetooth: Lilu plugin so BLE devices connect through this controller |
-| `macos/ItlWiFi/` | menu bar app for legacy mode |
 | `fw/` | MediaTek Wi-Fi and Bluetooth firmware from linux-firmware (its own license, see `fw/README.md`) |
 | `scripts/` | build, install and test helpers (`build.sh`, `native-wifi-test.sh`, `inject-creds.ps1`, ...) |
 | `tools/` | ABI research tools (kernel collection readers, vtable/slot checkers, header generators) |
