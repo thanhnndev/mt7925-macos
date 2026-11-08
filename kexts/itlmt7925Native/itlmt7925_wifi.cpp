@@ -840,3 +840,76 @@ IOReturn itlmt7925Wifi::newUserClient(task_t task, void *securityID, UInt32 type
     itlmtCall(this, 'u', (type << 16) | ((uint32_t)r & 0xffff));
     return r;
 }
+
+// ---------------------------------------------------------------------------------------------
+// ABI gate (docs/ROADMAP-AWDL.md §10.81). The IO80211 / Skywalk class layouts in ../itlmt7925/io80211/*.h were generated from
+// 25G241 and are checked only by static_asserts at build time. Every class of this kext derives from them, so a later macOS 26
+// build whose Family changed a layout would be wrong from the first constructor on. This runs as the module's _realmain:
+// after libkmodc++ registered our metaclasses (the Family is linked by then) and before IOKit can create any object of this
+// kext. A mismatch logs, publishes `itlmt-native-abi` on the core and fails the load: no native Wi-Fi, no panic.
+// Boot-arg itlmt_native_abiforce=1 loads anyway (debugging only).
+// ---------------------------------------------------------------------------------------------
+#include "../itlmt7925/io80211/IO80211InfraInterface.h"
+#include "../itlmt7925/io80211/IO80211VirtualInterface.h"
+#include "../itlmt7925/io80211/IO80211AWDLProtocol.h"
+#include "../itlmt7925/io80211/IO80211SkywalkInterface.h"
+#include "../itlmt7925/io80211/IOSkywalkNetworkInterface.h"
+#include "../itlmt7925/io80211/IOSkywalkInterface.h"
+#include "../itlmt7925/io80211/IO80211CommandGate.h"
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
+#include <libkern/c++/OSString.h>
+#include <IOKit/IOService.h>
+#include <mach/kmod.h>
+
+namespace {
+struct AbiClass { const char *name; uint32_t built; };
+const AbiClass kAbiClasses[] = {
+    { "IO80211Controller",         (uint32_t)sizeof(IO80211Controller) },
+    { "IO80211SkywalkInterface",   (uint32_t)sizeof(IO80211SkywalkInterface) },
+    { "IO80211InfraInterface",     (uint32_t)sizeof(IO80211InfraInterface) },
+    { "IO80211InfraProtocol",      (uint32_t)sizeof(IO80211InfraProtocol) },
+    { "IO80211VirtualInterface",   (uint32_t)sizeof(IO80211VirtualInterface) },
+    { "IO80211AWDLProtocol",       (uint32_t)sizeof(IO80211AWDLProtocol) },
+    { "IOSkywalkNetworkInterface", (uint32_t)sizeof(IOSkywalkNetworkInterface) },
+    { "IOSkywalkInterface",        (uint32_t)sizeof(IOSkywalkInterface) },
+    { "IO80211WorkQueue",          (uint32_t)sizeof(IO80211WorkQueue) },
+    { "IO80211CommandGate",        (uint32_t)sizeof(IO80211CommandGate) },
+};
+
+void abiPublish(const char *text)
+{
+    IOService *core = IOService::copyMatchingService(IOService::serviceMatching("itlmt7925"));
+    if (!core) return;
+    OSString *s = OSString::withCString(text);
+    if (s) { core->setProperty("itlmt-native-abi", s); s->release(); }
+    core->release();
+}
+}
+
+extern "C" kern_return_t itlNativeAbiGate(kmod_info_t *, void *)
+{
+    char out[512];
+    size_t used = 0;
+    int bad = 0;
+    out[0] = 0;
+    for (const AbiClass &c : kAbiClasses) {
+        const OSSymbol *sym = OSSymbol::withCStringNoCopy(c.name);
+        const OSMetaClass *m = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+        if (sym) sym->release();
+        uint32_t real = m ? (uint32_t)m->getClassSize() : 0;
+        if (real != c.built) {
+            bad++;
+            if (used < sizeof(out))
+                used += (size_t)snprintf(out + used, sizeof(out) - used, "%s%s=%#x/%#x", bad > 1 ? " " : "", c.name, real, c.built);
+        }
+    }
+    uint32_t force = 0;
+    PE_parse_boot_argn("itlmt_native_abiforce", &force, sizeof(force));
+    char text[600];
+    if (!bad) snprintf(text, sizeof(text), "ok: %u classes match the 25G241 layouts", (unsigned)(sizeof(kAbiClasses) / sizeof(kAbiClasses[0])));
+    else snprintf(text, sizeof(text), "MISMATCH (running/built): %s%s", out, force ? " - loaded anyway (itlmt_native_abiforce)" : " - native Wi-Fi not loaded");
+    IOLog("itlmt7925Native: abi %s\n", text);
+    abiPublish(text);
+    return (bad && !force) ? KERN_FAILURE : KERN_SUCCESS;
+}

@@ -3577,3 +3577,24 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 2. Both devices should list each other in AirDrop. Send a photo Mac → iPhone and iPhone → Mac.
 3. `awdl lead`: most windows `onch`; `awdl txfree` `uc5` ok/fail (was 197/492 in §10.78).
 4. If the iPhone does not list the Mac: it may stop treating us as reachable once our sequence overlaps its own in only 6 slots. Then the fallback is `itlmt_awdl_aponly=0`, and the next step is to make the 149 windows meet their AW (sniffer-off and ROC grant time against Linux).
+
+### 10.81 Version gate for the native front end (whole macOS 26 line), from the version-gate audit (native 206D41C8, not installed)
+
+**Request** (from the 890M session's audit, owner's rule): every ABI assumption must hold for the whole macOS 26 / Darwin 25.x line, detected at run time, fail safe (disable and log, never panic). The IO80211/Skywalk headers in `kexts/itlmt7925/io80211/*.h` were generated from 25G241 and checked only by `static_assert`s.
+
+**Change (native 206D41C8, includes §10.80's A2880A4E):**
+- `itlNativeAbiGate` (`itlmt7925_wifi.cpp`) is the module's `_realmain` (`kmod_info.c`). libkmodc++'s `_start` runs it after our metaclasses are registered and the Family is linked, and before IOKit can construct any object of this kext. A check in `start()` would come too late: `itlmt7925Wifi` is itself an `IO80211Controller` subclass, so a wrong layout is already wrong at construction.
+- For 10 classes (IO80211Controller, IO80211SkywalkInterface, IO80211InfraInterface, IO80211InfraProtocol, IO80211VirtualInterface, IO80211AWDLProtocol, IOSkywalkNetworkInterface, IOSkywalkInterface, IO80211WorkQueue, IO80211CommandGate), it compares `OSMetaClass::getMetaClassWithName(name)->getClassSize()` with `sizeof` from our headers. A missing class counts as a mismatch.
+- On a mismatch: `IOLog`, `itlmt-native-abi` = `MISMATCH (running/built): …` on the core service, and `KERN_FAILURE`, so the kext does not load and native Wi-Fi stays off without a panic. Boot-arg `itlmt_native_abiforce=1` loads anyway (debugging). On success: `itlmt-native-abi` = `ok: 10 classes match the 25G241 layouts`.
+- The diagnostics recorder (`itlmtCallers`) stored callers minus a 25G241 static address (`kWorkQueueStatic`). It now stores them relative to `IO80211WorkQueue::workQueue` itself, which is valid on any build.
+
+**Checked against the running build (25G332, macOS 26.7.2) before staging:**
+- All 10 names are registered (`ioclasscount`).
+- The size each `…::MetaClass::MetaClass()` passes to `OSMetaClass::OSMetaClass(name, super, size)` in `BootKernelExtensions.kc` equals our header value for all 10 (0x128, 0x128, 0x130, 0x130, 0x130, 0x130, 0xe0, 0xb0, 0x50, 0x18). So the gate passes on this machine.
+
+**Not covered yet:**
+- Vtable slot order. A class can keep its size and still move a virtual. Checking a few slots against symbols needs a symbol lookup at run time, which the kernel does not export to kexts.
+- `corecapture_min.h` `CCPipe::startPipe` slot +0x868.
+- The AWDL message struct sizes (`itlmt7925_awdl.cpp` 132–201) are data formats, not class layouts. They can only be checked by reading the Family's code per build.
+
+**Install:** not yet; waiting for the owner, batched with the next reboot (it carries the §10.80 AWDL change too).

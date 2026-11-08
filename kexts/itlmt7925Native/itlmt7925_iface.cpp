@@ -119,8 +119,9 @@ uint32_t gCallN = 0, gCallOverflow = 0;
 char *gCallText = nullptr;
 IOLock *gCallLock = nullptr;
 
-// Static address of an exported Family function (ABI-2: IO80211WorkQueue::workQueue); runtime minus this = KASLR slide.
-const uint64_t kWorkQueueStatic = 0xffffff8002258fccull;
+// Static address of IO80211WorkQueue::workQueue in 25G241 (ABI-2), for reading old recorder output only. Since §10.81 the
+// recorder stores callers relative to the symbol itself, so nothing depends on this build's address.
+[[maybe_unused]] const uint64_t kWorkQueueStatic = 0xffffff8002258fccull;
 
 }
 
@@ -162,7 +163,9 @@ void itlmtCallers(uint32_t out[3], uintptr_t fp)
 {
     out[0] = out[1] = out[2] = 0;
     if (fp < 0xffffff8000000000ull || (fp & 7)) return;     // kernel stack addresses only
-    uint64_t slide = (uint64_t)(uintptr_t)&IO80211WorkQueue::workQueue - kWorkQueueStatic;
+    // §10.81: return addresses relative to IO80211WorkQueue::workQueue (an exported Family symbol), valid on every build; add
+    // that symbol's static address of the running build to map one into a disassembly (25G241: kWorkQueueStatic).
+    uint64_t slide = (uint64_t)(uintptr_t)&IO80211WorkQueue::workQueue;
     uintptr_t start = fp;
     for (int i = 0; i < 3; i++) {
         uintptr_t *f = (uintptr_t *)fp;
