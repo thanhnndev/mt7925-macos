@@ -3409,3 +3409,29 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
    - If it works: the regression is in dev/awdl. Bisect it offline before anything goes back on the ESP.
    - If it fails the same way: the base driver has a TX problem with this AP. Compare STA_REC (HT/VHT/RA) with Linux mt7925.
 3. The core's `stat-log` (ioreg) shows `txf=` and `rty=` without any extra test traffic.
+
+### 10.74 Boot 2026-11-08 11:47 (main's core F3E732F4, native 3A02974A): main fails the same way → test without the Bluetooth half
+
+**What happened.** With main's driver (no AWDL code) Wi-Fi still gets no network.
+- AP `20:54:ef`, channel 149.
+- Auth, assoc and the 4-way handshake complete.
+- Then `txf=188/0/0/142/2015`: 142 of 188 data frames failed, 2015 retries (about 11 per frame).
+- The AP disassociated us (reason 3), the chip was reset (`recover #1`), and the network was no longer seen in the scan.
+
+**So the regression is not in the Wi-Fi code.** The same code measured 29–36 MB/s on 2026-10-18…26 (docs/TEST-NATIVE-WIFI.md). What has changed on the chip since then is the Bluetooth half:
+- MtkBtFw loads the MT7925 Bluetooth firmware (since 2026-11-02, 0182666).
+- BtLeDlFix turns on continuous LE advertising for AirDrop (since 2026-11-04, 59db42b).
+
+Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, rate-adapted TX failing with about 11 retries) is what a coexistence arbiter denying WLAN TX looks like. macOS reports Bluetooth `State: Off`, but the BT firmware is still loaded.
+
+**Test (owner's go-ahead, 2026-11-08 11:54).**
+- `MtkBtFw.kext` and `BtLeDlFix.kext` are disabled in config.plist (`Enabled` false; only those two lines changed).
+- Backup: `EFI/OC/config.plist.bak-20261108-115436`.
+- The kexts are still main's.
+
+**Next boot (read only, nothing run on the network without asking):**
+1. Check that MtkBtFw/BtLeDlFix are not loaded (`kextstat`).
+2. Read `stat-log` `txf=` (freed/…/failed/retries) once Wi-Fi joins on its own.
+   - If data TX works (few failures, retries well under 1 per frame): the Bluetooth bring-up is the cause. Compare it with Linux btmtk + mt7925 (WMT, coexistence/antenna setup) using REA. Then re-enable Bluetooth with the fix.
+   - If TX still fails: Bluetooth is cleared. Look next at persistent chip state (efuse/eeprom, firmware files) against the 2026-10-26 build.
+3. Undo: copy `config.plist.bak-20261108-115436` back to `config.plist`.
