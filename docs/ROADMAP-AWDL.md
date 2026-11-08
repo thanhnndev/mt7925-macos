@@ -3602,10 +3602,11 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 **Installed (owner's go-ahead, 2026-11-08 22:08):** native 206D41C8 (§10.80 + §10.81) with core BBFBA198. Undo: `Kexts-backup/itlmt7925Native.kext.20261108-220841` (A2880A4E).
 **Next boot:** `ioreg -l | grep itlmt-native-abi` → `ok: 10 classes …`; then the §10.80 AirDrop test.
 
-### 10.82 CoreCapture fault reporter on its own work loop (native 25F33563, built, not installed)
+### 10.82 CoreCapture fault reporter on its own work loop (native 25F33563, installed)
 
 - **Report (session "iGPU trên Colbalt64", 890M thermal trace):** CCFaultReporter is woken ~600 times/s through itlmt7925's CoreCapture pipes.
 - **Cause, from BootKernelExtensions.kc:** `CCFaultReporter::initWithStreamWorkloop` creates an `IOTimerEventSource` (`spinDeferredCapture`) and calls `addEventSource` on the work loop it is given. `makeFaultReporter` passed `wq`, our IO80211 work queue: the busy loop that serves RX, AWDL timers and every Family command. The reporter's event source therefore ran on each of those wakes.
 - **Fix:** the reporter gets its own idle `IOWorkLoop::workLoop()` (`faultLoop`). In `free()` it is released after `ccFault`. The trace line `ctl:faultLoop=own|wq` shows which loop is in use. Boot-arg `itlmt_native_faultwq=1` restores the shared queue for an A/B test.
 - **Contents:** includes everything in 206D41C8 (aponly, ABI gate).
 - **Next boot:** check that the `ctl:faultLoop=own` trace is present and the ABI gate prints "ok". Then measure CCFaultReporter wakes (the same method as the 890M trace); expect close to 0 with Wi-Fi idle. Install only with the owner's approval; the peer batches installs.
+- **Installed 2026-11-08 22:13** with the owner's OK, by the iGPU session. Backup of 206D41C8: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261108-221302`. On the next boot, also run the §10.80 AirDrop test (`aponly=1/157/n`).
