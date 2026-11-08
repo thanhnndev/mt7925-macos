@@ -101,6 +101,7 @@ private:
     CCStream *dataStream = nullptr;         // a CCDataStream (options type 1)
     bool faultPipeStarted = false;          // ditto for the fault pipe; without it the first fault flush panics corecapture
     CCFaultReporter *ccFault = nullptr;
+    IOWorkLoop *faultLoop = nullptr;        // §10.82: the reporter's own idle loop (its timer event source lives there)
     IO80211FaultReporter *fault = nullptr;
     itlmt7925WifiInterface *iface = nullptr;
 };
@@ -209,8 +210,17 @@ bool itlmt7925Wifi::makeFaultReporter(IOService *owner)
             itlmtTrace(this, "ctl:faultPipe=%u", (unsigned)(faultPipeStarted ? 1 : 0));
             if (!faultPipeStarted) IOLog(LOGT "fault pipe start failed (fault flushes will panic)\n");
         }
+        // §10.82: CCFaultReporter::initWithStreamWorkloop adds an IOTimerEventSource (spinDeferredCapture) to the loop it is
+        // given. On our IO80211 work queue - the busy loop that serves RX, AWDL timers and every Family command - that event
+        // source ran with each of its wakes (the 890M session's thermal trace: CCFaultReporter ~600 wakes/s). It only needs a
+        // loop for that timer, so it gets its own idle one. Boot-arg itlmt_native_faultwq=1: the shared queue as before.
+        uint32_t shared = 0;
+        PE_parse_boot_argn("itlmt_native_faultwq", &shared, sizeof(shared));
+        if (!shared) faultLoop = IOWorkLoop::workLoop();
+        IOWorkLoop *fl = faultLoop ? faultLoop : (IOWorkLoop *)wq;
+        itlmtTrace(this, "ctl:faultLoop=%s", faultLoop ? "own" : "wq");
         if (dataStream)
-            ccFault = CCFaultReporter::withStreamWorkloop((CCDataStream *)dataStream, (IOWorkLoop *)wq);
+            ccFault = CCFaultReporter::withStreamWorkloop((CCDataStream *)dataStream, fl);
         if (ccFault)
             fault = IO80211FaultReporter::allocWithParams(ccFault);
         ok = fault != nullptr;
@@ -550,6 +560,7 @@ void itlmt7925Wifi::free()
     dropInterface();
     rel(fault);       fault = nullptr;
     rel(ccFault);     ccFault = nullptr;
+    rel(faultLoop);   faultLoop = nullptr;    // after the reporter whose timer it holds
     rel(dataStream);  dataStream = nullptr;
     rel(dataPipe);    dataPipe = nullptr;
     rel(logStream);   logStream = nullptr;
