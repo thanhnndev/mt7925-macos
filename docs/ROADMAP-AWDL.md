@@ -3383,3 +3383,29 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 1. Check the UUIDs are 645E44F5 / 6B413594. Turn Wi-Fi on.
 2. Run `sudo bash scripts/wifi-ab.sh` (about 4 minutes; the Wi-Fi link reconnects twice).
 3. The row that gets back toward the phone's numbers names the cause. The fix then goes into the default configuration.
+
+### 10.73 Boot 2026-11-08 11:19 (core 645E44F5, native 6B413594): data frames never reach the AP → main's driver staged to get Wi-Fi back (core F3E732F4, native 3A02974A)
+
+**What happened.** No network over Wi-Fi. The owner went back to USB tethering, then turned Wi-Fi off. They asked that nothing touch the live network until Wi-Fi works again; USB tethering has panicked this machine before.
+- AP: `ee:74:d7:57:85:bb`, channel 36, VHT only (`he=0/0`), 80 MHz (`bw=2 center=42`). The link was stepped down to fast level 3.
+- RSSI −62 to −65 dBm (CoreWLAN), noise 0; the reported rate stayed at 54.
+- Receiving works: the AP's M1 arrived 11 times.
+- Transmitting does not:
+  - Fixed-rate frames (auth, EAPOL at OFDM 6) mostly get through.
+  - The rate-adapted data frames fail. After the link came up, 52 of 65 freed data frames were reported failed, with 740 retries (about 11 per frame). DHCP and ping got no answer: 90–100% loss.
+  - EAPOL M2 failed 10 of 11 times in one join (`txFail=10`) and 0 of 2 in the next.
+- `itl_nopwr=0` + reconnect: the power tables went out at join (`clc VN env 1 … power 5 ext 5`, `txpower … rc=0`), but data TX stayed the same.
+- `itl_awdloff=1` + reconnect: no change (90% ping loss).
+- So neither AWDL nor the missing power tables explains it.
+- The data TXWI is the same as on main: `o.omac` defaults to 0 and FIXED_RATE is unchanged. The suspects now are the rate control's view of the peer (STA_REC: VHT/HT capabilities, LDPC/STBC, NSS, bandwidth), or something this AP needs that the base driver does not do.
+
+**Change.** Main's core and native (origin/main 50570a3, no AWDL code) are staged on the ESP, so the next boot gets Wi-Fi back on code that measured 33–41 MB/s.
+- The dev/awdl kexts are kept in `Kexts-backup/itlmt7925.kext.20261108-113905` (645E44F5) and `Kexts-backup/itlmt7925Native.kext.20261108-113905` (6B413594).
+- Boot-args are unchanged.
+
+**Next boot test (nothing on the live link beyond normal use):**
+1. Check the UUIDs are F3E732F4 / 3A02974A.
+2. Use Wi-Fi normally on the same AP.
+   - If it works: the regression is in dev/awdl. Bisect it offline before anything goes back on the ESP.
+   - If it fails the same way: the base driver has a TX problem with this AP. Compare STA_REC (HT/VHT/RA) with Linux mt7925.
+3. The core's `stat-log` (ioreg) shows `txf=` and `rty=` without any extra test traffic.
