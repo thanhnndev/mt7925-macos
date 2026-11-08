@@ -3512,3 +3512,21 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 1. AirDrop receiving on the Mac: Everyone for 10 minutes.
 2. iPhone → Mac: send one photo. Then Mac → iPhone.
 3. Read: sharingd (`Received ASK request`, `Lost BLE device`), the core's `awdl txfree` uc5 ok/fail, `awdl duty`, and no `recover #` or `link lost`.
+
+### 10.78 Same boot (20:32–20:34): AirDrop Mac → iPhone reaches the PIN step, then stalls; AWDL 5 GHz unicast still fails 71%
+
+**sharingd (log stream, owner sending a photo with the macOS 26 AirDrop PIN):**
+- 20:32:08 the Mac discovers the iPhone over AWDL (Bonjour `_airdrop._tcp`). 20:32:15 receiving switched to Everyone.
+- From 20:32:39 the Mac opens TCP + TLS to the iPhone's port 8770 over awdl0. Each connection is `ready` after 1.6–1.9 s (slow), then `DISCOVER request timeout` after 5 s, cancel, retry (C2…C7).
+- 20:33:04 one DISCOVER answer did arrive: `Decoded PIN info dictionary`, `Showing PIN pair prompt`. The owner entered the code; the iPhone stays on "loading" because the following requests time out the same way.
+- 20:32:56 `Lost BLE device` once (not the blocker here: the TLS retries continue).
+
+**Core counters (`awdl …` lines):**
+- `awdl txfree: uc5=197/492` (ok/fail): 71% of AWDL unicast at 5 GHz fails; `ucheard=193/320` (62% even when the peer was heard in that window); `uc24=126/51` (29%).
+- The station link on the same radio is clean now (0.1% fail, §10.77), so this is not the §10.75 transmit weakness: it is specific to AWDL.
+- `awdl lead: lead=35208us early=139 late=239 avglate=39454us`: our windows start on average 39 ms after the slot we aimed for. An AWDL availability window is ~16 TU, so most of our 5 GHz unicast goes out when the iPhone has already left channel 149 → no ACK. The 2.4 GHz share has a different schedule, which fits its lower loss.
+- `awdl duty: off=54200 ms in 312 windows (avg 173 ms)`, `phase … grant=21.4 ms soff=21.6 ms dwell=112.6 ms`: the ROC grant and sniffer-off alone take ~43 ms per window.
+
+**Where AirDrop stands:** discovery, BLE advertising, the TLS connection and the PIN exchange work. The data exchange after the PIN fails because AWDL unicast is lost when our windows miss the iPhone's.
+
+**Next (trace, no change yet):** measure the window start error against the iPhone's advertised schedule (AW sequence + offset in its sync parameters) per window, and find where the 39 ms comes from (ROC grant latency 21 ms + sniffer-off 22 ms, or the lead computation). Compare the ROC request timing with Linux mt7925 `mt7925_mcu_set_roc` / `abort_roc` usage.
