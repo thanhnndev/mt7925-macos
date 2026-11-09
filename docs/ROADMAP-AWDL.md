@@ -3623,7 +3623,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
   - `makeFaultReporter` sets a fixed `itlmt-native-faultloop` = own|wq.
 - **Next boot:** `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
 
-### 10.84 Boot 2026-11-09 09:31, "Medicomm" (160 MHz): Wi-Fi drops = the sniffer config's width code (core 2773F995, built, not installed)
+### 10.84 Boot 2026-11-09 09:31, "Medicomm" (160 MHz): Wi-Fi drops = the sniffer config's width code (core 2773F995, installed)
 
 **Wi-Fi drops.** The link is on "Medicomm", `34:98:b5:a2:73:44`, ch 40, `bw=3 center=50` (HE 160 MHz, rate 2402), RSSI −42 dBm. `wifi-events`: up at 19 s; at 465 s "firmware not answering MCU commands"; reset and firmware reload; up again at 491 and 506 s. `m3-log` shows where it stopped:
 
@@ -3644,3 +3644,5 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - Peers were heard almost only on 5 GHz: `band=3/643`, `rssi5=-93..-61`, `weak=624` of 646 frames below −70 dBm. These look like other people's devices in the café; the peer that published its sync TLV, `46:5c:f4:97:bd:e6`, runs 149 with one slot on 6.
 - sharingd ran no Bonjour DISCOVER this boot: the AirDrop sheet never reached browsing while the logs were kept.
 - Because the link kept resetting (firmware reload, every AWDL window torn down), this AirDrop result says nothing yet. Re-test with the AirDrop sheet open after the core fix: `itlmt-awdl` (syncs, role, rx and weak against the owner's iPhone address), plus sharingd `AirDropNW.Discovery`.
+- **Installed 2026-11-09 09:46** with the owner's OK. Backup of BBFBA198: `EFI/OC/Kexts-backup/itlmt7925.kext.20261109-094632`. Native stays 25F33563.
+- **Next boot:** `wifi-events` has no "firmware not answering" line; `m3-log` has no `sniffer cfg rc=-110`. Then run the AirDrop test with the sheet open on both devices.
