@@ -3611,7 +3611,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - **Next boot:** check that the `ctl:faultLoop=own` trace is present and the ABI gate prints "ok". Then measure CCFaultReporter wakes (the same method as the 890M trace); expect close to 0 with Wi-Fi idle. Install only with the owner's approval; the peer batches installs.
 - **Installed 2026-11-08 22:13** with the owner's OK, by the iGPU session. Backup of 206D41C8: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261108-221302`. On the next boot, also run the §10.80 AirDrop test (`aponly=1/157/n`).
 
-### 10.83 Boot 2026-11-08 23:51 (native 25F33563): the ABI verdict and faultLoop were not visible → fixed properties (native A62C12D2, built, not installed)
+### 10.83 Boot 2026-11-08 23:51 (native 25F33563): the ABI verdict and faultLoop were not visible → fixed properties (native A62C12D2, installed)
 
 - **Seen:** `itlmt-native-abi` was absent from ioreg. Neither the `itlmt7925Native: abi` line nor `ctl:faultLoop` was in `log show --last boot`.
 - **Why the ABI property was missing:** `abiPublish` ran from `_realmain` at module start. At that point the core `itlmt7925` service is not registered yet, so `copyMatchingService` returned null and nothing was set.
@@ -3646,3 +3646,4 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - Because the link kept resetting (firmware reload, every AWDL window torn down), this AirDrop result says nothing yet. Re-test with the AirDrop sheet open after the core fix: `itlmt-awdl` (syncs, role, rx and weak against the owner's iPhone address), plus sharingd `AirDropNW.Discovery`.
 - **Installed 2026-11-09 09:46** with the owner's OK. Backup of BBFBA198: `EFI/OC/Kexts-backup/itlmt7925.kext.20261109-094632`. Native stays 25F33563.
 - **Next boot:** `wifi-events` has no "firmware not answering" line; `m3-log` has no `sniffer cfg rc=-110`. Then run the AirDrop test with the sheet open on both devices.
+- **Native A62C12D2 installed 2026-11-09 09:58** (§10.83) by the iGPU session, with the owner's OK. Backup of 25F33563: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261109-095805`. Next boot also check: `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
