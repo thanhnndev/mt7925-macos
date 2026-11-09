@@ -3622,3 +3622,25 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
   - `start()` publishes `itlmt-native-abi` on the controller and on its provider (the core).
   - `makeFaultReporter` sets a fixed `itlmt-native-faultloop` = own|wq.
 - **Next boot:** `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
+
+### 10.84 Boot 2026-11-09 09:31, "Medicomm" (160 MHz): Wi-Fi drops = the sniffer config's width code (core 2773F995, built, not installed)
+
+**Wi-Fi drops.** The link is on "Medicomm", `34:98:b5:a2:73:44`, ch 40, `bw=3 center=50` (HE 160 MHz, rate 2402), RSSI −42 dBm. `wifi-events`: up at 19 s; at 465 s "firmware not answering MCU commands"; reset and firmware reload; up again at 491 and 506 s. `m3-log` shows where it stopped:
+
+- `awdl: sniffer off took 73 ms (ch=40)`, then `mcu hist … rx_filter:0 sniffer on:0 sniffer cfg:-110 sniffer off:-110`.
+- The timed-out command is the sniffer config of an on-channel AWDL window (AP channel 40). §10.58 gave such windows the link's real width.
+- The postmortem shows `txwm 32/29`: three commands queued that the firmware never took. The supervisor then reset the chip (`recover #2`).
+
+**Cause, compared with Linux** (`mt7925_mcu_config_sniffer`, current mcu.c):
+- The `bw` byte is the sniffer's own `ch_width` table: 20 and 40 → 0, 80 → 1, 160 → 2, 80+80 → 3, 320 → 6. sco gives the 40 MHz side, centre_ch2 is set only for 80+80.
+- We wrote `fastBw` unchanged, which is CMD_CBW_*: 0 = 20, 1 = 40, 2 = 80, 3 = 160.
+- On a 160 MHz AP the firmware got 80+80 with centre2 = 0, and stopped answering at that command.
+- On the 80 MHz APs of §10.77/§10.80 it got "160 around 155". That did not hang, but it was wrong.
+
+**Fix:** map `fastBw` through `{0, 0, 1, 2}`. Off-channel windows stay 20 MHz (0).
+
+**AirDrop on this boot (read from ioreg, no test run):**
+- `syncs=0`, and we are our own master (`top=` self).
+- Peers were heard almost only on 5 GHz: `band=3/643`, `rssi5=-93..-61`, `weak=624` of 646 frames below −70 dBm. These look like other people's devices in the café; the peer that published its sync TLV, `46:5c:f4:97:bd:e6`, runs 149 with one slot on 6.
+- sharingd ran no Bonjour DISCOVER this boot: the AirDrop sheet never reached browsing while the logs were kept.
+- Because the link kept resetting (firmware reload, every AWDL window torn down), this AirDrop result says nothing yet. Re-test with the AirDrop sheet open after the core fix: `itlmt-awdl` (syncs, role, rx and weak against the owner's iPhone address), plus sharingd `AirDropNW.Discovery`.

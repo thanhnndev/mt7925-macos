@@ -1375,7 +1375,12 @@ void itlmt7925::m3SnifferConfig(uint8_t ch)
     uint8_t *v = u + 4;                                      // aid, band, bw, control, sco, center, center2, drop_err
     put16(v + 0, 0);                                         // aid: not a station context
     v[2] = ch > 14 ? 2 : 1;                                  // band: 1 = 2.4 GHz, 2 = 5 GHz
-    v[3] = apWidth ? fastBw : 0;                             // CMD_CBW_*: 20 MHz off the AP channel
+    // bw is not CMD_CBW_* (fastBw: 0 = 20, 1 = 40, 2 = 80, 3 = 160) but mt7925_mcu_config_sniffer's own ch_width table:
+    // 20 and 40 -> 0 (40 comes from sco), 80 -> 1, 160 -> 2, 80+80 -> 3. §10.84: fastBw went in unchanged, so a 160 MHz AP
+    // (Medicomm, ch 40 center 50) gave 3 = 80+80 with center2 0, and the firmware stopped answering at that "sniffer cfg"
+    // (chip reset, link lost); an 80 MHz AP gave 2 = 160.
+    static const uint8_t kSnifferBw[4] = { 0, 0, 1, 2 };
+    v[3] = apWidth && fastBw < 4 ? kSnifferBw[fastBw] : 0;   // 20 MHz off the AP channel
     v[4] = ch;                                               // control channel
     v[5] = apWidth ? (ch < fastCenter ? 1 : ch > fastCenter ? 3 : 0) : 0;   // sco: secondary above / below (as bss_rlm)
     v[6] = apWidth ? fastCenter : ch;                        // center channel
