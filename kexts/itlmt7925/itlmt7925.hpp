@@ -503,6 +503,9 @@ private:
     void tsSample(uint32_t now);
     char rssiProbe[700] = {0};               // RXD layout samples of the first beacons with RX vector, for the signal decoder
     uint8_t rssiProbeN = 0;
+    uint32_t lastRxv = 0;                    // P-RXV dword 3 of the last frame rxRssi() decoded (RCPI0..3)
+    char awdlRssiRaw[640] = {0};             // §10.86: ring of AWDL action-frame samples: sa, ch, d1, hdr offset, RCPI bytes
+    uint32_t awdlRssiRawN = 0;
     // A-MSDU receive (level 4): the hardware splits an A-MSDU into one RX packet per subframe (first / middle / last in RXD4),
     // each with the 802.11 header. The subframes of one MPDU are collected in a bundle and handed to the reorder buffer together.
     struct AmsduAsm { bool active; uint8_t tid; bool reorder; uint16_t sn; uint32_t used, t; uint8_t buf[ITL_BA_SLOT_BYTES]; };

@@ -406,6 +406,7 @@ void itlmt7925::nativeNets(ItlNativeNets *out)
 // the signal is "unknown" (0). The first samples go to the registry (rssi-probe) to pin the layout down.
 int8_t itlmt7925::rxRssi(const uint8_t *p, uint32_t len, uint32_t hdrOff)
 {
+    lastRxv = 0;
     if (len < 36) return 0;
     uint32_t d1 = le32p(p + 4);
     if (rssiProbeN < 4 && ((d1 >> 18) & 1) && hdrOff + 4 <= len) {
@@ -417,32 +418,25 @@ int8_t itlmt7925::rxRssi(const uint8_t *p, uint32_t len, uint32_t hdrOff)
         rssiProbeN++;
         setProperty("rssi-probe", rssiProbe);
     }
-    static const uint8_t g1bit[2] = { 16, 11 }, g2len[2] = { 8, 16 }, dw[2] = { 3, 1 };
-    for (int h = 0; h < 2; h++) {
-        uint32_t b = g1bit[h];
-        bool g1 = (d1 >> b) & 1, g2 = (d1 >> (b + 1)) & 1, g3 = (d1 >> (b + 2)) & 1, g4 = (d1 >> (b + 3)) & 1,
-             g5 = (d1 >> (b + 4)) & 1;
-        if (!g3) continue;
-        for (int L = 0; L < 2; L++) {
-            uint32_t rxv = 32 + (g4 ? 16 : 0) + (g1 ? 16 : 0) + (g2 ? g2len[L] : 0);
-            uint32_t end = rxv + 16 + (g5 ? 96 : 0);
-            if (hdrOff < end || hdrOff > end + 16 || rxv + 16 > len) continue;
-            for (int k = 0; k < 2; k++) {
-                const uint8_t *r = p + rxv + 4 * dw[k];
-                int best = -128, n = 0, lo = 0, hi = -128;
-                for (int c = 0; c < 4; c++) {
-                    if (r[c] == 0 || r[c] == 255) continue;
-                    int dbm = ((int)r[c] - 220) / 2;
-                    if (dbm < -100 || dbm > -5) { n = -1; break; }
-                    if (dbm > best) best = dbm;
-                    if (!n || dbm < lo) lo = dbm;
-                    if (dbm > hi) hi = dbm;
-                    n++;
-                }
-                if (n > 0 && hi - lo <= 25) return (int8_t)best;
-            }
-        }
+    // §10.86: the layout is mt7925_mac_fill_rx's, exactly (connac3: groups at RXD1 bits 16..20). Base 32 bytes, then group 4
+    // (16), group 1 (16), group 2 (16 - not 8: the old loop tried 8 first, which also "fitted" the header gap and read P-RXV
+    // dword 1 instead of 3), group 3 = P-RXV (16), group 5 = C-RXV (96). RCPI0/1 of P-RXV dword 3, max over the two chains
+    // of the 2x2 antenna mask, as status->signal. The old fallbacks (groups at bit 11, dword 1, chains 2/3) are gone.
+    bool g1 = (d1 >> 16) & 1, g2 = (d1 >> 17) & 1, g3 = (d1 >> 18) & 1, g4 = (d1 >> 19) & 1, g5 = (d1 >> 20) & 1;
+    if (!g3) return 0;
+    uint32_t rxv = 32 + (g4 ? 16 : 0) + (g1 ? 16 : 0) + (g2 ? 16 : 0);
+    uint32_t end = rxv + 16 + (g5 ? 96 : 0);
+    if (hdrOff < end || hdrOff > end + 16 || rxv + 16 > len) return 0;
+    lastRxv = le32p(p + rxv + 12);
+    const uint8_t *r = p + rxv + 12;
+    int best = -128;
+    for (int c = 0; c < 2; c++) {
+        if (r[c] == 0 || r[c] == 255) continue;
+        int dbm = ((int)r[c] - 220) / 2;
+        if (dbm >= 0 || dbm < -110) continue;
+        if (dbm > best) best = dbm;
     }
+    if (best > -128) return (int8_t)best;
     return 0;
 }
 

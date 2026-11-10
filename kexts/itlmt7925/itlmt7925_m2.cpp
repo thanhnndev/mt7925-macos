@@ -365,6 +365,19 @@ void itlmt7925::rxParseFrame(const uint8_t *p, uint32_t len)
         // The peer manager needs the signal: it creates a peer only from a frame whose RSSI is non-zero and at or above its
         // edge threshold (docs/ROADMAP-AWDL.md §10.26). Same RX-vector decoder as the beacons; 0 when the layout is not known.
         int8_t afRssi = rxRssi(p, len, off);
+        if ((awdlAfSeen % 40) == 1) {           // §10.86: what the RX vector said for this peer's frame (ring of 8)
+            static const uint32_t kN = 8, kW = 78;
+            uint32_t slot = awdlRssiRawN++ % kN;
+            char e[kW + 1];
+            snprintf(e, sizeof(e), "%02x%02x%02x%02x%02x%02x c%u d1=%08x o%u v3=%08x r%d;", a2[0], a2[1], a2[2], a2[3], a2[4],
+                     a2[5], (unsigned)awdlRocCh, le32(p + 4), off, lastRxv, (int)afRssi);
+            size_t el = strlen(e);
+            memset(awdlRssiRaw + slot * kW, ' ', kW);
+            memcpy(awdlRssiRaw + slot * kW, e, el < kW ? el : kW);
+            awdlRssiRaw[kN * kW] = 0;
+            for (uint32_t i = 0; i < kN * kW; i++) if (!awdlRssiRaw[i]) awdlRssiRaw[i] = ' ';
+            setProperty("awdl-rssi-raw", awdlRssiRaw);
+        }
         {                                    // queued for the peer manager (the AWDL interface drains this ring)
             uint32_t head = awdlRxHead;
             if ((head - __atomic_load_n(&awdlRxTail, __ATOMIC_ACQUIRE)) >= kAwdlRxSlots) awdlRxRingFull++;

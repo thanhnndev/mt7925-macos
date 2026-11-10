@@ -3661,3 +3661,32 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
   - Neither binary contains the string "Resource".
 - **Checked, not a bug:** `awdlRxBuffer` calls `pool->free()` on the losing pool of a creation race. `IO80211DynamicBufferPool` is not an OSObject: `free()` is its own exported destroy method (`io80211_buffer_min.h`). The pool is not in any IOService instance set either.
 - **Open:** which object it was is not known from the panic alone. Candidates are the kexts that react to AC unplug (power-source / ACPI events). Those live in the iGPU/platform session's repository.
+
+### 10.86 AirDrop test 2026-11-10 21:53 (core 2773F995, native A62C12D2): discovery reaches DISCOVER, the TCP connection to the iPhone never opens; the RSSI decoder vs Linux (core 319FC3B2, built, not installed)
+
+AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
+
+**What worked:**
+- mDNS over awdl0: queries were sent, and responses from the iPhone arrived.
+- sharingd: "Endpoints discovered", DiscoveredPairable updated, then "Sending DISCOVER request".
+
+**What failed:**
+- Every DISCOVER timed out after 5 s.
+- `netstat`: `fe80::40bc:…:51838 → fe80::10b4:23ff:fe47:a0dd.8770 SYN_SENT`. The iPhone's AWDL MAC is `12:b4:23:47:a0:dd`.
+- `ndp -an` on awdl0 lists only our own two addresses (`3e:c4:cd:e8:5c:9c`, `42:bc:8d:c8:74:8b`, both "permanent"), and no entry for the iPhone. The Family's peer manager never installed it as a peer, so unicast to it cannot work.
+- Core `awdl txfree`: `uc24=4/9 uc5=2/97` (ok/fail).
+- The iPhone's frames are just below the peer manager's edge: a sample on ch 6 had `rssi=-71`. Native `weak=1537` of 2511 frames are below −70 dBm.
+- At Thanh coffee (§10.80) the same iPhone read −33 dBm, and §10.30 already noted "weak with the iPhone next to the Mac: check the RCPI decode".
+
+**RSSI decoder vs Linux** (`mt7925_mac_fill_rx`, `mt76_connac3_mac.h`):
+- Groups sit at RXD1 bits 16–20.
+- Group 2 is 16 bytes (`rxd += 4`). `rxRssi()` tried 8 bytes first, and with the header-gap tolerance that layout also "fitted". It read P-RXV dword 1 instead of dword 3.
+- On the probe beacons, dword 1 held RCPI-like bytes 1–2 dB lower, so this alone does not explain −71 against −33.
+- The decoder also fell back to the bit-11 group layout and to dword 1, and took chains 2/3 into account.
+- **Fix:** Linux's layout only (rxv[3], RCPI0/1, max over the two chains).
+- **New, for the next test:** `awdl-rssi-raw` on the core is a ring of 8 AWDL action-frame samples (every 40th frame): sender, channel, d1, header offset, P-RXV dword 3, and the decoded value. It shows whether the iPhone's frames really carry RCPI around 0x46, or whether the vector is read from the wrong place.
+
+**Next test:**
+- Keep the iPhone next to the Mac and open AirDrop on both.
+- Read `awdl-rssi-raw` (the iPhone's `12b42347a0dd` rows or its new MAC) and `itlmt-awdl` `weak=`.
+- Check `ndp -an | grep awdl0` for a peer entry, and look for DISCOVER responses.
