@@ -3676,7 +3676,7 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - `ndp -an` on awdl0 lists only our own two addresses (`3e:c4:cd:e8:5c:9c`, `42:bc:8d:c8:74:8b`, both "permanent"), and no entry for the iPhone. The Family's peer manager never installed it as a peer, so unicast to it cannot work.
 - Core `awdl txfree`: `uc24=4/9 uc5=2/97` (ok/fail).
 - The iPhone's frames are just below the peer manager's edge: a sample on ch 6 had `rssi=-71`. Native `weak=1537` of 2511 frames are below −70 dBm.
-- At Thanh coffee (§10.80) the same iPhone read −33 dBm, and §10.30 already noted "weak with the iPhone next to the Mac: check the RCPI decode".
+- At Thanh coffee (§10.80) the same iPhone read −33 dBm, and §10.32 already noted "weak with the iPhone next to the Mac: check the RCPI decode".
 
 **RSSI decoder vs Linux** (`mt7925_mac_fill_rx`, `mt76_connac3_mac.h`):
 - Groups sit at RXD1 bits 16–20.
