@@ -3662,7 +3662,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - **Checked, not a bug:** `awdlRxBuffer` calls `pool->free()` on the losing pool of a creation race. `IO80211DynamicBufferPool` is not an OSObject: `free()` is its own exported destroy method (`io80211_buffer_min.h`). The pool is not in any IOService instance set either.
 - **Open:** which object it was is not known from the panic alone. Candidates are the kexts that react to AC unplug (power-source / ACPI events). Those live in the iGPU/platform session's repository.
 
-### 10.86 AirDrop test 2026-11-10 21:53 (core 2773F995, native A62C12D2): discovery reaches DISCOVER, the TCP connection to the iPhone never opens; the RSSI decoder vs Linux (core 319FC3B2, built, not installed)
+### 10.86 AirDrop test 2026-11-10 21:53 (core 2773F995, native A62C12D2): discovery reaches DISCOVER, the TCP connection to the iPhone never opens; the RSSI decoder vs Linux (core 319FC3B2, installed)
 
 AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 
@@ -3690,3 +3690,4 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - Keep the iPhone next to the Mac and open AirDrop on both.
 - Read `awdl-rssi-raw` (the iPhone's `12b42347a0dd` rows or its new MAC) and `itlmt-awdl` `weak=`.
 - Check `ndp -an | grep awdl0` for a peer entry, and look for DISCOVER responses.
+- **Installed 2026-11-10 22:04** with the owner's OK. Backup of 2773F995: `EFI/OC/Kexts-backup/itlmt7925.kext.20261110-220437`. Native stays A62C12D2.
