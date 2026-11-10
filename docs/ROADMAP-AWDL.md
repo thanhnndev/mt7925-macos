@@ -3648,7 +3648,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - **Next boot:** `wifi-events` has no "firmware not answering" line; `m3-log` has no `sniffer cfg rc=-110`. Then run the AirDrop test with the sheet open on both devices.
 - **Native A62C12D2 installed 2026-11-09 09:58** (§10.83) by the iGPU session, with the owner's OK. Backup of 25F33563: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261109-095805`. Next boot also check: `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
 
-### 10.85 Panic 2026-11-09 10:06 (CloudflareWARP, IOService::getMatchingServices): native/core lifecycle audit (native 2B…, see commit; not installed)
+### 10.85 Panic 2026-11-09 10:06 (CloudflareWARP, IOService::getMatchingServices): native/core lifecycle audit (no code change)
 
 - **Panic:** the boot of 10:03 (core 2773F995, native A62C12D2) panicked 163 s in, after the AC was unplugged.
   - Path: `OSMetaClass::applyToInstances` ← `IOService::copyExistingServices` ← `getMatchingServices`, process CloudflareWARP.
@@ -3659,5 +3659,5 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
   - Neither kext has power-state or AC code.
   - Our subclasses of Family classes are allocated with the size the KC's metaclasses report: the §10.81 gate says `ok: 10 classes`. So no object of ours is under-allocated.
   - Neither binary contains the string "Resource".
-- **One fix:** `awdlRxBuffer` called `pool->free()` on the losing pool of a creation race, which bypasses the reference count. It is now `release()`. The pool is an `IO80211DynamicBufferPool` (OSObject), not in any IOService instance set, so it cannot be this panic.
+- **Checked, not a bug:** `awdlRxBuffer` calls `pool->free()` on the losing pool of a creation race. `IO80211DynamicBufferPool` is not an OSObject: `free()` is its own exported destroy method (`io80211_buffer_min.h`). The pool is not in any IOService instance set either.
 - **Open:** which object it was is not known from the panic alone. Candidates are the kexts that react to AC unplug (power-source / ACPI events). Those live in the iGPU/platform session's repository.
