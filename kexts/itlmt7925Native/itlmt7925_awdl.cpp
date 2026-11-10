@@ -1671,7 +1671,7 @@ IO80211Buffer *itlmt7925AwdlInterface::awdlRxBuffer(const uint8_t *body, uint32_
             return nullptr;
         }
         if (!OSCompareAndSwapPtr(nullptr, pool, (void * volatile *)&gAwdlRxPool)) {
-            pool->free();                              // another interface won the race; use its pool
+            pool->release();                           // another interface won the race; use its pool (§10.85: was free())
             pool = gAwdlRxPool;
         } else {
             itlmtTrace(getController(), "awdl:rx buffer pool ready (%u x %u)", (unsigned)kAwdlRxPoolCount,
