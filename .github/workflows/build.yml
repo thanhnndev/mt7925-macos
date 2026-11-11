@@ -1,6 +1,6 @@
 name: build
 
-# Host tests + the four kexts (Wi-Fi: itlmt7925 core, itlmt7925Native front end; Bluetooth: MtkBtFw, BtLeDlFix) + the ItlWiFi menu bar app, on every push and PR.
+# Host tests + the four kexts (Wi-Fi: itlmt7925 core, itlmt7925Native front end; Bluetooth: MtkBtFw, BtLeDlFix), on every push and PR.
 # Kexts are built with EMPTY Wi-Fi credentials; credentials are only ever injected locally.
 # A tag "v*" (for example v2.0-beta.1) also publishes a GitHub release with the zipped kexts, the app and SHA256SUMS.txt.
 # Tags with a "-" (v2.0-beta.1, v2.0-rc.1) are published as pre-releases.
@@ -39,7 +39,7 @@ jobs:
           PY
 
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -61,14 +61,10 @@ jobs:
       - name: Build kexts
         run: bash scripts/build.sh itlmt7925 itlmt7925Native MtkBtFw BtLeDlFix
 
-      - name: Build ItlWiFi.app
-        run: bash scripts/build-itlwifi.sh
-
       - name: Package
         run: |
           mkdir -p dist
           for k in itlmt7925 itlmt7925Native MtkBtFw BtLeDlFix; do ditto -c -k --keepParent "build/$k.kext" "dist/$k.kext.zip"; done
-          ditto -c -k --keepParent build/ItlWiFi.app dist/ItlWiFi.app.zip
           cp fw/LICENCE.mediatek LICENSE dist/
           (cd dist && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
