@@ -273,12 +273,16 @@ IOReturn itlmt7925::nativeScanReq(uint32_t *started)
 IOReturn itlmt7925::nativeJoin(const ItlNativeJoin *j)
 {
     if (!m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
-    if (!j || j->version != 1 || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    if (!j || (j->version != 1 && j->version != 2) || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    bool open = j->version >= 2 && j->open;
     IOLockLock(cmdLock);
     bzero(&reqNet, sizeof(reqNet));
     memcpy(reqNet.ssid, j->ssid, j->ssidLen);
-    memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
-    reqNet.hasPmk = true;
+    if (open) reqNet.open = true;
+    else {
+        memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
+        reqNet.hasPmk = true;
+    }
     reqNet.native = true;
     njFail = 0;
     njState = ITL_NATIVE_CONNECTING;
@@ -304,6 +308,7 @@ static uint32_t failCode(const char *stage)
     if (!strncmp(stage, "auth-fail", 9)) return 4;
     if (!strncmp(stage, "assoc-fail", 10)) return 5;
     if (!strncmp(stage, "hs-fail", 7)) return 6;
+    if (!strncmp(stage, "sec-mismatch", 12)) return 8;
     return 7;
 }
 
@@ -528,9 +533,13 @@ int itlmt7925::loadPlistNets(Net *out, int max)
         snprintf(kp, sizeof(kp), i == 1 ? "itl_psk" : "itl_psk%d", i);
         OSString *s = OSDynamicCast(OSString, getProperty(ks));
         OSString *k = OSDynamicCast(OSString, getProperty(kp));
-        if (!s || !k || !s->getLength() || s->getLength() > 32 || k->getLength() < 8 || k->getLength() > 63) continue;
+        // an empty itl_psk is an open network; otherwise a WPA2 passphrase (8..63 characters)
+        if (!s || !k || !s->getLength() || s->getLength() > 32 || (k->getLength() && k->getLength() < 8) || k->getLength() > 63)
+            continue;
+        bzero(&out[n], sizeof(out[n]));                      // the caller's array is not initialised (hasPmk / native / open)
         strlcpy(out[n].ssid, s->getCStringNoCopy(), sizeof(out[n].ssid));
         strlcpy(out[n].psk, k->getCStringNoCopy(), sizeof(out[n].psk));
+        out[n].open = k->getLength() == 0;
         n++;
     }
     return n;
@@ -544,6 +553,7 @@ static const char *failText(const char *stage)
     if (!strncmp(stage, "auth-fail", 9)) return "the access point refused authentication";
     if (!strncmp(stage, "assoc-fail", 10)) return "the access point refused association";
     if (!strncmp(stage, "hs-fail", 7)) return "key handshake failed";
+    if (!strncmp(stage, "sec-mismatch", 12)) return "the network's security does not match the join request";
     return "connection failed";
 }
 

@@ -297,6 +297,7 @@ private:
     uint8_t rocTok = 0, rocStatus = 0xff;
     uint32_t rocEvIgnored = 0;                   // ROC events that were not the grant of the request in flight (§10.52)
     uint8_t m3cipher = 0;                    // 0 = open, 4 = CCMP (BSS_INFO sec TLV)
+    bool m3open = false;                     // the selected network is open: no RSN, no handshake, data unprotected
     uint8_t apSupp = 0, apBasic = 0;         // OFDM rate bitmaps (6,9,12,18,24,36,48,54 -> bit 0..7)
     uint8_t apCck = 0, apBasicCck = 0;       // 2.4 GHz CCK rate bitmaps (1,2,5.5,11 -> bit 0..3)
     uint8_t apRsn[64] = {0};
@@ -567,7 +568,8 @@ private:
     // ---- runtime control: command mailbox, supervisor loop, status for the menu bar app (itlmt7925_uc.cpp) ----
     enum { CMD_SCAN = 1, CMD_JOIN = 2, CMD_DISCONNECT = 4, CMD_AWDL_SYNC = 8 };
     // hasPmk: `pmk` is the ready pairwise master key (native Wi-Fi: userland's supplicant derived it), psk is empty then
-    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; uint8_t pmk[32]; };
+    // open: no key at all (open network: no RSN in the association, no 4-way handshake, data in the clear)
+    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; bool open; uint8_t pmk[32]; };
     IOLock *cmdLock = nullptr;
     volatile uint32_t cmdBits = 0;
     Net reqNet = {};                         // the network of the last join command (under cmdLock)

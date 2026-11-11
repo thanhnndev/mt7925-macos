@@ -1184,13 +1184,16 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     memcpy(&cipher, b + 0x48, 4);
     itlmtTrace(ctl, "assoc:request ssidLen=%u cipher=%u keyLen=%u", ssidLen, cipher, keyLen);
     if (ssidLen == 0 || ssidLen > 32) return kIOReturnBadArgument;
-    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // open / SAE / enterprise: not implemented
+    // cipher 0 with no key: an open network. A PMK (6 / 9, 32 bytes): WPA2-PSK. SAE / enterprise: not implemented.
+    bool open = cipher == 0 && keyLen == 0;
+    if (!open && !((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;
     ItlNativeJoin j;
     bzero(&j, sizeof(j));
-    j.version = 1;
+    j.version = open ? 2 : 1;
     j.ssidLen = (uint8_t)ssidLen;
     memcpy(j.ssid, b + 0x20, ssidLen);
-    memcpy(j.pmk, b + 0x50, 32);
+    if (open) j.open = 1;
+    else memcpy(j.pmk, b + 0x50, 32);
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_JOIN, false, &j, nullptr, nullptr, nullptr);
     bzero(&j, sizeof(j));
     if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); return r; }

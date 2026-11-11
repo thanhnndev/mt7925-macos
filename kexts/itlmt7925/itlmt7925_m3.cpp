@@ -1688,7 +1688,9 @@ int itlmt7925::m3Assoc()
     // 2.4 GHz: advertise the CCK rates the AP's basic set usually contains also on the legacy path (an AP whose basic rates are
     // 1/2/5.5/11 refuses a station that offers OFDM only)
     bool g2 = tgtCh <= 14;
-    put16(p, g2 ? 0x0431 : 0x0411); p += 2;                     // ESS | PRIVACY | short slot (| short preamble on 2.4 GHz)
+    uint16_t capInfo = g2 ? 0x0431 : 0x0411;                    // ESS | PRIVACY | short slot (| short preamble on 2.4 GHz)
+    if (m3open) capInfo &= (uint16_t)~0x0010;                    // open network: no PRIVACY
+    put16(p, capInfo); p += 2;
     put16(p, 10); p += 2;                                        // listen interval
     uint8_t sl = (uint8_t)strlen(m3ssid);
     *p++ = 0; *p++ = sl; memcpy(p, m3ssid, sl); p += sl;
@@ -1697,8 +1699,10 @@ int itlmt7925::m3Assoc()
     static const uint8_t ext2g[4] = {0x30, 0x48, 0x60, 0x6c};                               // 24, 36, 48, 54
     *p++ = 1; *p++ = 8; memcpy(p, g2 ? rates2g : rates, 8); p += 8;
     if (g2) { *p++ = 50; *p++ = 4; memcpy(p, ext2g, 4); p += 4; }
-    m3RsnIe(p, apGroupCipher, apPairCipher);
-    p += 22;
+    if (!m3open) {                                               // an open network gets no RSN element
+        m3RsnIe(p, apGroupCipher, apPairCipher);
+        p += 22;
+    }
     if (fastActive) {
         p += itl_caps_build_ht(p);
         if (apCaps.vht) p += itl_caps_build_vht(p, fastAllow160);
@@ -1743,7 +1747,8 @@ int itlmt7925::m3Run1()
     }
     m3log("credentials: %d network(s)", nn);
     for (int i = 0; i < nn; i++)
-        m3log("net%d ssid len=%u psk len=%u", i + 1, (unsigned)strlen(nets[i].ssid), (unsigned)strlen(nets[i].psk));
+        m3log("net%d ssid len=%u psk len=%u%s", i + 1, (unsigned)strlen(nets[i].ssid), (unsigned)strlen(nets[i].psk),
+              nets[i].open ? " open" : "");
 
     // The scan already ran (M2). m3Capture only keeps beacons of the SSID in m3ssid, so look for each configured network in turn
     // (directed probe request) until one is seen; a network that the wildcard scan already listed goes first.
@@ -1783,17 +1788,29 @@ int itlmt7925::m3Run1()
         lvl = fastLevel;
     }
 
-    // PMK now (4096 PBKDF2 iterations), kept for the 4-way handshake; native Wi-Fi hands over the key its supplicant derived
-    uint8_t pmk[32];
-    if (nets[sel].hasPmk) memcpy(pmk, nets[sel].pmk, sizeof(pmk));
-    else itl_wpa_pmk(m3psk, (const uint8_t *)m3ssid, strlen(m3ssid), pmk);
-    memcpy(m3pmk, pmk, sizeof(m3pmk));
-    bzero(pmk, sizeof(pmk));
-    m3log("pmk ready");
-    m3Publish("pmk");
+    // PMK now (4096 PBKDF2 iterations), kept for the 4-way handshake; native Wi-Fi hands over the key its supplicant derived.
+    // An open network has none.
+    m3open = nets[sel].open;
+    if (m3open) {
+        bzero(m3pmk, sizeof(m3pmk));
+        m3log("open network: no pmk");
+    } else {
+        uint8_t pmk[32];
+        if (nets[sel].hasPmk) memcpy(pmk, nets[sel].pmk, sizeof(pmk));
+        else itl_wpa_pmk(m3psk, (const uint8_t *)m3ssid, strlen(m3ssid), pmk);
+        memcpy(m3pmk, pmk, sizeof(m3pmk));
+        bzero(pmk, sizeof(pmk));
+        m3log("pmk ready");
+        m3Publish("pmk");
+    }
 
     // step 2: firmware / hardware prep, BSS + STA records in the "not associated" state, ROC on the AP's channel
     m3ParseAp();
+    // Security of the beacon against what was asked for: an open join to a protected BSS (or the other way round) cannot work,
+    // the AP refuses it at association or never starts the handshake. Say so instead of timing out.
+    bool apPrivacy = (tgtCap & 0x10) != 0;
+    if (m3open && (apPrivacy || apRsnLen)) { m3log("open join, but the AP is protected (cap=%04x rsn=%u)", tgtCap, apRsnLen); m3Publish("sec-mismatch"); return ITL_EIO; }
+    if (!m3open && !apPrivacy) { m3log("WPA2 join, but the AP is open (cap=%04x)", tgtCap); m3Publish("sec-mismatch"); return ITL_EIO; }
     int prepRc = m3HwPrep();
     if (prepRc) { m3Publish("hw-prep-fail"); return prepRc; }
     m3Bss(M3_BSS_ADD);
@@ -1818,9 +1835,17 @@ int itlmt7925::m3Run1()
         m3Bss(M3_BSS_ASSOC);
         m3Sta(2, false, m3aid);
         if (grpWcid19) m3StaBss();                           // mt76 parity: wcid 19 in the firmware table before any group TX
-        rc = m3Handshake();
-        m3wantEapol = false;
-        m3Publish(rc ? "hs-fail" : "hs-ok");
+        if (m3open) {
+            // open network: no keys. BSS_INFO already went out with the open SEC TLV (m3cipher 0); data flows in the clear.
+            m3cipher = 0;
+            m3dataOn = true;
+            m3log("open network: no handshake");
+            m3Publish("hs-ok");
+        } else {
+            rc = m3Handshake();
+            m3wantEapol = false;
+            m3Publish(rc ? "hs-fail" : "hs-ok");
+        }
     }
     m3Roc(false);
     bzero(m3pmk, sizeof(m3pmk));
@@ -2239,7 +2264,7 @@ int itlmt7925::ethTx(const uint8_t *e, uint32_t len)
 {
     if (!m3linkUp || len < 14) return -1;
     bool full = false;
-    bool ok = m3TxData(e, be16p(e + 12), e + 14, len - 14, true, &full);
+    bool ok = m3TxData(e, be16p(e + 12), e + 14, len - 14, m3cipher != 0, &full);   // open network: in the clear
     if (full) return 1;
     if (isBigEcho(e, len, 8)) icmpReqTx++;
     if (ok) stTx++; else stTxFail++;
