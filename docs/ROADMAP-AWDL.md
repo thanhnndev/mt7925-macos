@@ -3736,3 +3736,31 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - Measure where the PIN phase spends its time: per-window frames sent, ring depth, TCP retransmits (`netstat -s -p tcp` before and after).
 - Compare the data TX path with how Linux sends to a peer on the same channel (normal data queue, rate control).
 - Check the TXFREE classification.
+
+### 10.89 The slow PIN phase: AWDL data drains only inside windows → on-channel data goes out between windows too (core B9E6878A, built, not installed)
+
+**Cause of §10.88's 64 s PIN phase and 8 s ASK:**
+- The AWDL data TX ring (16 slots) is drained only by `awdlDwell()`, inside a window. Frames go on ALTX0 at the fixed OFDM 6 Mb/s rate and stop 10 ms before the end of the window.
+- On 2026-11-11 the core ran ~1.8 windows/s: `awdl stat try=1300` in ~11 min, `posted=1071` of `eaws=4225` on the native side.
+- So at most ~30 data frames/s left the Mac. The stack hit a full ring 327 times, and each TLS round trip of the PIN exchange waited for the next window.
+- Yet the schedule was entirely on the AP channel. Self TLV4 is 149 in 15 of 16 slots; the peer is 149 in 15 of 16 slots, 6 in one. The radio was already on the peer's channel between windows.
+
+**Fix:**
+- The link loop (`m3 link` `for (;;)`) also drains the ring when all of these hold:
+  - the link is up;
+  - a window on `tgtCh` ran in the last 500 ms (`awdlLastOnChWinMs`, set by the window code when `ch == tgtCh`);
+  - no ROC is held on another channel.
+- This runs on the link thread between windows, so `awdlTxBuf2`, the MIF staging buffer used by `awdlDataFlush`, is not in use.
+- Counter: `awdl lead … ontx=<flush calls>/<frames>`.
+- Boot-arg `itlmt_awdl_onchtx=0` restores windows-only.
+
+**TXS vs TXFREE (open):**
+- Our TXFREE parse matches `mt7925_mac_tx_free`: header BIT(30), count 27:24, stat 29:28.
+- Our TXS ACK test matches `MT_TXS0_ACK_ERROR_MASK` (18:16).
+- Still, on 2026-11-11 TXS reported 329 of 329 unicast frames acknowledged, while TXFREE reported every AWDL frame as stat≠0 with about 16 tries (`tries=12795` for 794 frames).
+- The AWDL data frames use the AP's wcid (1) on ALTX0. Check whether the TXFREE header that precedes them is the AP wcid's, not theirs.
+- The transfer itself succeeded, so TXS is the one that matches what happened on the air.
+
+**Next test:**
+- AirDrop Mac → Mac again. Compare the PIN/ASK durations with 64 s / 8 s.
+- Read `ontx=` and `dtx` full-ring counts (`dtx=in/queued/full/...`).

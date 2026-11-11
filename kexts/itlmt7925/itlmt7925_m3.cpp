@@ -1006,6 +1006,7 @@ void itlmt7925::awdlSyncTx()
     awdlRocCh = ch;
     awdlRocActive = 1;
     { uint32_t t = nowMs(); awdlLastWinMs = t ? t : 1; }
+    if (m3linkUp && ch == tgtCh) { uint32_t t = nowMs(); awdlLastOnChWinMs = t ? t : 1; }   // §10.89
     // The sniffer has to be on for the WHOLE window. In station mode the firmware only hands the host its own BSS, so the
     // promiscuous mode is what makes a peer's PSF/MIF arrive at all; and a peer's frame shows up at an arbitrary point inside
     // its availability window. Leaving the sniffer on only for the few milliseconds between the ROC grant and our own
@@ -1268,10 +1269,10 @@ void itlmt7925::awdlSyncTx()
               awdlRocLat[3], awdlRocLat[4]);
         m3log("awdl band: af=%u/%u win=%u/%u never=%u/%u dfs=%u (2.4/5 GHz)", awdlAfBand[0], awdlAfBand[1], awdlWinBand[0],
               awdlWinBand[1], awdlNeverBand[0], awdlNeverBand[1], awdlDfsSkip);
-        m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus onlate=%u/%uus stale=%u wait=%ums on=%u onch=%u apch=%u", awdlLeadUs,
+        m3log("awdl lead: lead=%uus early=%u late=%u avglate=%uus onlate=%u/%uus stale=%u wait=%ums on=%u onch=%u apch=%u ontx=%u/%u", awdlLeadUs,
               awdlLeadEarly, awdlLeadLateN, awdlLeadLateN ? (uint32_t)(awdlLeadLateUs / awdlLeadLateN) : 0, awdlLateOnN,
               awdlLateOnN ? (uint32_t)(awdlLateOnUs / awdlLateOnN) : 0, awdlLeadStale,
-              awdlLeadWaitMs, awdlLeadOn, awdlOnChWin, tgtCh);
+              awdlLeadWaitMs, awdlLeadOn, awdlOnChWin, tgtCh, awdlOnChTxCalls, awdlOnChTxFrames);
         m3log("awdl chain: held=%u break=%u timeout=%u chainms=%u clip=%u lateabort=%u soffslow=%u cc=%s clc=%s",
               awdlChainN, awdlChainBreak, awdlChainTimeout, awdlChainMs, awdlRocClip, awdlRocLateAbort, awdlSoffSlow, regCc, clcCc[0] ? clcCc : "-");
         if (awdlPhN) {
@@ -2642,6 +2643,23 @@ void itlmt7925::m3Link()
     for (;;) {
         int act = m3PumpOnce();
         if (m3eapolTail != m3eapolHead) m3EapolOnLink();
+        // §10.89: AWDL data on the AP's own channel goes out between windows too. The ring used to drain only inside a window's
+        // dwell (~1.8 windows/s, 16 frames each, at 6 Mb/s), so on 2026-11-11 the AirDrop PIN exchange - a few small TLS round
+        // trips - took 64 s, with the ring full 327 times. When the schedule is on the AP channel (a window there in the last
+        // 500 ms, no ROC held elsewhere) the radio already is where the peer is: send now. itlmt_awdl_onchtx=0: windows only.
+        if (awdlOnChTxOn < 0) {
+            uint32_t v = 1;
+            PE_parse_boot_argn("itlmt_awdl_onchtx", &v, sizeof(v));
+            awdlOnChTxOn = v ? 1 : 0;
+        }
+        if (awdlOnChTxOn && awdlDataTxTail != awdlDataTxHead && awdlLastOnChWinMs && nowMs() - awdlLastOnChWinMs < 500 &&
+            (!awdlHeldCh || awdlHeldCh == tgtCh)) {
+            uint32_t before = awdlDataTxSent;
+            awdlDataFlush();
+            awdlOnChTxCalls++;
+            awdlOnChTxFrames += awdlDataTxSent - before;
+            act = 1;
+        }
         uint32_t now = nowMs();
         if (now - lastPulse >= 5000) {                       // heartbeat: RX liveness (beacons, data, group frames the AP relayed back)
             lastPulse = now;
