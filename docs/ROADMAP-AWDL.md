@@ -3706,3 +3706,33 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
   - "Adding discovered endpoint", "Endpoint discovered".
   - One earlier attempt still ended in "failed discovery".
 - **Next:** send a file Mac → Mac and the other way. Watch `dtx`/`drx`, `awdl lead`/late windows and throughput, and any stalls like §10.79.
+
+### 10.88 First completed AirDrop transfer, Mac → Mac (2026-11-11 18:58–18:59, same boot as §10.87)
+
+**sharingd send state machine** (`AirDrop.6F1730A9`):
+- `START` 18:58:25.
+- `Pin Pairing START` 18:58:25; PIN stored and received 18:58:34; `Pin Pairing END` 18:59:29 (**64 s**).
+- `ASK START` 18:59:29 → `ASK END` 18:59:37 (8 s).
+- `UPLOAD START` 18:59:37 → `UPLOAD END` 18:59:38 (small file).
+- `END` 18:59:38.
+- The owner saw the sheet stuck on "loading" after the PIN, and then the send went through.
+
+**awdl0:** 1319 packets / 1.04 MB out, 929 packets / 273 KB in since boot.
+
+**Driver while it ran:**
+- Native: `dtx=1566/1239/327/0/1239/0`. 327 times the core's AWDL TX ring was full; those packets waited in the stack.
+- Core `awdl txs`: `uc=224/0 uc5=329/0` (TXS: unicast acknowledged, 0 failed).
+- Core `awdl txfree`: `uc=0/203 ucheard=0/591 uc5=0/794` (every TXFREE counted as a failure).
+  - The two counters contradict each other. TXS (the hardware's ACK status) says the unicast frames went through. The TXFREE ok/fail classification is probably wrong and needs checking against `mt7925_mac_tx_free`.
+- Windows: all on the AP channel 149 (`slots=149+multi`; self TLV4 is 149 in 15 of 16 slots, the peer is 149 in all but one slot, which is on 6). `aponly=1/149/25667`.
+- `awdl lead`: `late=1301` of 1308 on-channel windows, `avglate=4687us`.
+- `awdl txs guard=247 drain=145/3993ms`.
+
+**What is slow:**
+1. The 64 s PIN phase and the 8 s ASK. Both are small TLS exchanges. They wait on the core's TX ring, which only drains inside windows: data goes on ALTX0 at a fixed rate, with no rate adaptation and no BA. The 10 ms guard and 25 ms drain cut each window short.
+2. Almost every on-channel window starts about 4.7 ms late.
+
+**Next:**
+- Measure where the PIN phase spends its time: per-window frames sent, ring depth, TCP retransmits (`netstat -s -p tcp` before and after).
+- Compare the data TX path with how Linux sends to a peer on the same channel (normal data queue, rate control).
+- Check the TXFREE classification.
