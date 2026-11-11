@@ -3691,3 +3691,18 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - Read `awdl-rssi-raw` (the iPhone's `12b42347a0dd` rows or its new MAC) and `itlmt-awdl` `weak=`.
 - Check `ndp -an | grep awdl0` for a peer entry, and look for DISCOVER responses.
 - **Installed 2026-11-10 22:04** with the owner's OK. Backup of 2773F995: `EFI/OC/Kexts-backup/itlmt7925.kext.20261110-220437`. Native stays A62C12D2.
+
+### 10.87 Boot 2026-11-11 18:49, Mac ↔ Mac at "Ariyana Convention Centre" (open network, ch 149 VHT80): first DISCOVER response over awdl0
+
+- **Build:** the owner's build of `dev/open-wifi` (core 5E4A1B60, native 52A0E786). It contains §10.84 (sniffer width), §10.86 (Linux RXD layout, `awdl-rssi-raw`) and the open-network join (bc2b07b). `dev/awdl` was fast-forwarded to it (31c65e1).
+- **RSSI:** `awdl-rssi-raw` decodes cleanly: chains 2/3 = 0xff, RCPI0/1 present, for example `v3=ffff7e70` → −47 dBm. The peers read −44…−47 dBm on 149. `weak=90` of 1482 frames.
+- **Peers:** the peer manager installed them. `ndp -an` on awdl0 has `0a:9d:cd:86:be:5e` (the other Mac) and `3a:62:64:31:60:2e` as permanent entries; on 2026-11-10 only our own addresses were there.
+- **Data:**
+  - A TCP connection to `fe80::89d:cdff:fe86:be5e.8770` was in SYN_SENT at 18:55:51 and ESTABLISHED by 18:56:15 (two connections).
+  - awdl0 counters: 152 packets in, 152 out.
+  - Native `dtx` went 15 → 117 and `drx` went to 1550 (in) / 128 (up).
+- **sharingd:**
+  - "Sending DISCOVER request" at 18:56:16, then "Got DISCOVER response … Finished DISCOVER" at 18:56:20.
+  - "Adding discovered endpoint", "Endpoint discovered".
+  - One earlier attempt still ended in "failed discovery".
+- **Next:** send a file Mac → Mac and the other way. Watch `dtx`/`drx`, `awdl lead`/late windows and throughput, and any stalls like §10.79.
