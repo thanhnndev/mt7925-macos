@@ -3737,7 +3737,7 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - Compare the data TX path with how Linux sends to a peer on the same channel (normal data queue, rate control).
 - Check the TXFREE classification.
 
-### 10.89 The slow PIN phase: AWDL data drains only inside windows → on-channel data goes out between windows too (core B9E6878A, built, not installed)
+### 10.89 The slow PIN phase: AWDL data drains only inside windows → on-channel data goes out between windows too (core B9E6878A, installed)
 
 **Cause of §10.88's 64 s PIN phase and 8 s ASK:**
 - The AWDL data TX ring (16 slots) is drained only by `awdlDwell()`, inside a window. Frames go on ALTX0 at the fixed OFDM 6 Mb/s rate and stop 10 ms before the end of the window.
@@ -3764,3 +3764,4 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 **Next test:**
 - AirDrop Mac → Mac again. Compare the PIN/ASK durations with 64 s / 8 s.
 - Read `ontx=` and `dtx` full-ring counts (`dtx=in/queued/full/...`).
+- **Installed 2026-11-11 19:03** with the owner's OK. Backup of 5E4A1B60: `EFI/OC/Kexts-backup/itlmt7925.kext.20261111-190331`. The build includes the open-network join. Native stays 52A0E786.
