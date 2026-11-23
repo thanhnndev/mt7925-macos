@@ -3897,3 +3897,5 @@ The `awdl txfree` line prints `bcm=`. With this, A and B can be compared in one 
    - or keep the sniffer up longer on the AP channel.
 
    The BCM fix stays, because Linux sets it.
+
+- **Installed 2026-11-23 14:51** with the owner's OK. Backup of 61F8DB1B: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-145106`. The last build before BCM (B9E6878A) stays at `Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
