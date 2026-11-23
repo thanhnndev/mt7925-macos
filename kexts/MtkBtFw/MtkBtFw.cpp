@@ -22,23 +22,40 @@
 // timeout") and loads the whole firmware again, once. A dead firmware is also detected up front (WDT status, stalled register
 // read) so the reset comes first.
 //
-// 0.3.0: the service is kept busy (adjustBusy) while the firmware loads, at most BUSY_CAP_MS. bluetoothd calls
-// IOKitWaitQuiet (240 s timeout) before it picks a transport and scans for USB dongles once; without the busy hold the
-// registry went quiet 1.4-2.6 s into the 5.2 s download, bluetoothd met an exclusively opened interface, fell back to the
-// MacBookPro16,2 UART (/dev/cu.BLTH), faulted after 15 s and was relaunched (9 of 10 boots, 2026-11-18..23). Off switch:
-// boot-arg mtkbtbusy=0.
-// 0.3.1: no thread_call_cancel_wait (com.apple.kpi.private): the armed cap holds a retain instead. Busy is held only when
-// the cap could be allocated. If the loader thread cannot start, the cap, the busy hold and the worker's retain are dropped.
+// 0.3.0/0.3.1 held IOKit busy during the load so that bluetoothd's IOKitWaitQuiet waited for it. That worked, but the busy
+// count propagates to the registry root, and WindowServer and loginwindow wait for root quiet too: the login window came
+// up as late as the firmware load (boot 2026-11-23 14:33, 9.7 s with a reset). 0.4.0 removes the hold (and mtkbtbusy).
+//
+// 0.4.0, device-level load. The driver matches the IOUSBHostDevice (0489:e11e) instead of interface 0, so it is the
+// device's driver in place of AppleUSBHostCompositeDevice. It opens the device (one non-interface session: bluetoothd's
+// device user client cannot open it or set a configuration meanwhile), selects configuration 1 without registering the
+// interfaces, loads the firmware through interface 0 and only then registers the interfaces (what the composite driver
+// does in one step). bluetoothd sees either no usable controller yet or a loaded one, never a half-loaded one.
+// The device has only the Bluetooth interfaces 0-2 (ACL, SCO, ISO); Wi-Fi is the PCIe function (itlmt7925). USB port
+// mapping (USBToolBox, HS03) is at the controller and is not touched.
+//
+// bluetoothd picks USB or UART once at start. On this board-id (Mac-5F9802EFE386AA28, MacBookPro16,2) it picks UART and
+// scans for USB dongles once, so a load still running at that moment cost the controller for the whole boot. Before the
+// board-id table it asks IOKit for a service named "Bluetooth USB Host Controller" (Apple's own USB controllers) and picks
+// USB if there is one (bluetoothd 25G332, the transport getter's dispatch_once block). This driver registers itself under
+// that name, so bluetoothd takes the USB transport, whose device scan retries every second for 15 s. Off switch:
+// boot-arg mtkbtname=0 (the driver keeps its class name and bluetoothd picks by board-id again).
+//
+// Warm restart: the chip keeps its firmware. If WMT does not answer the very first PATCH_DWNLD query (no event, nothing
+// written yet) while the register reads and the watchdog status look healthy, the running firmware is probed over HCI:
+// HCI Reset must complete with status 0 and Read Local Version must complete with status 0 and manufacturer 0x0046
+// (MediaTek). Only then is the download skipped. Anything else (no event, other status, wrong manufacturer) takes the
+// subsystem reset and full reload as before. A cold chip answers WMT, so it is never probed.
 //
 // IOLog of these kexts does not reach dmesg or the unified log on this machine: the result is in the registry,
 //   ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-log"'
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 #include <kern/thread.h>
-#include <kern/thread_call.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
@@ -64,7 +81,8 @@ enum { WMT_PATCH_DWNLD = 0x1, WMT_FUNC_CTRL = 0x6 };
 #define REG_WDT_STATUS    0x740003A0
 #define REG_UDMA_INT_STA  0x74000024
 #define REG_UDMA_INT_STA1 0x74000308
-#define BUSY_CAP_MS       30000          // normal load 5.2 s, reset + full reload about twice that
+#define MTK_CONFIG        1
+#define MTK_USB_NAME      "Bluetooth USB Host Controller"   // bluetoothd: IOServiceNameMatching -> USB transport
 
 static bool startThread(void (*fn)(void *), void *arg)
 {
@@ -81,25 +99,30 @@ class MtkBtFw : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    bool willTerminate(IOService *provider, IOOptionBits options) override;
     void free() override;
 private:
-    IOUSBHostInterface *intf = nullptr;
+    IOUSBHostDevice *dev = nullptr;
+    IOUSBHostInterface *intf = nullptr;                // interface 0, open only while the firmware loads
+    volatile bool gone = false;                         // the device is being terminated: stop talking to it
     IOUSBHostPipe *intrPipe = nullptr;
     IOBufferMemoryDescriptor *intrBuf = nullptr;
     volatile bool intrStop = false, intrBusy = false;
     uint32_t intrPackets = 0;
-    volatile UInt32 busyHeld = 0;                   // 1 while this service holds one busy count (adjustBusy)
-    thread_call_t busyCap = nullptr;                 // drops the busy hold after BUSY_CAP_MS if the load hangs
-    volatile int hciResetStatus = -1;                // status byte of the HCI Reset Command Complete, -1 = none seen
+    volatile uint32_t ccSeq = 0;                     // bumped by intrDone for every HCI Command Complete
+    volatile uint16_t ccOp = 0;                      // opcode of the last Command Complete
+    uint8_t ccData[16] = {0};                        // its return parameters (status first)
+    volatile uint8_t ccLen = 0;
+    bool wmtSilent = false;                          // the first PATCH_DWNLD query got no event and nothing was written
     uint8_t *cmd = nullptr, *ev = nullptr;          // control transfer buffers (wired)
     char log[1200] = {0};
     size_t loglen = 0;
 
     static void worker(void *arg);
-    static void busyCapFired(thread_call_param_t me, thread_call_param_t);
-    void busyCapCancel();
-    void busyDrop(const char *why);
     void run();
+    bool load();
+    IOUSBHostInterface *findInterface0();
+    void registerInterfaces();
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void state(const char *s) { setProperty("bt-state", s); }
     IOReturn ctrl(uint8_t type, uint8_t req, uint16_t value, uint16_t index, void *buf, uint16_t len, uint32_t *done);
@@ -107,7 +130,9 @@ private:
     bool uhwWrite(uint32_t reg, uint32_t val);
     bool uhwRead(uint32_t reg, uint32_t *val);
     bool subsysReset();
+    bool hciCmd(uint16_t op, uint8_t *ret, uint8_t *retLen);
     bool hciReset();
+    bool probeRunning();
     bool bringUp();
     int wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, uint8_t *evFlag);
     bool download();
@@ -190,7 +215,7 @@ bool MtkBtFw::subsysReset()
     if (!uhwWrite(REG_UDMA_INT_STA1, 0xff) || !uhwRead(REG_UDMA_INT_STA1, &v)) return false;
     IOSleep(100);
     bool done = false;
-    for (int i = 0; i < 50 && !done; i++) {                        // readx_poll_timeout(20 ms, 1 s)
+    for (int i = 0; i < 50 && !done && !gone; i++) {                        // readx_poll_timeout(20 ms, 1 s)
         if (uhwRead(REG_BT_MISC, &v) && (v & BT_RST_DONE)) done = true;
         else IOSleep(20);
     }
@@ -200,18 +225,52 @@ bool MtkBtFw::subsysReset()
     return done && idOk;
 }
 
-// HCI Reset as bluetoothd will send it; the Command Complete arrives on the interrupt endpoint (intrDone).
+// One HCI command (no parameters) on the control endpoint; its Command Complete arrives on the interrupt endpoint (intrDone).
+// Returns false when no Command Complete for this opcode came within 2 s.
+bool MtkBtFw::hciCmd(uint16_t op, uint8_t *ret, uint8_t *retLen)
+{
+    uint32_t seq = ccSeq;
+    cmd[0] = (uint8_t)op; cmd[1] = (uint8_t)(op >> 8); cmd[2] = 0x00;
+    IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, 3, nullptr);
+    if (r != kIOReturnSuccess) { say("HCI %04x send failed %08x", op, r); return false; }
+    for (int i = 0; i < 200 && !gone; i++) {
+        if (ccSeq != seq) {
+            seq = ccSeq;
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (ccOp == op) {
+                uint8_t n = ccLen;
+                if (ret) memcpy(ret, ccData, n);
+                if (retLen) *retLen = n;
+                return true;
+            }
+        }
+        IOSleep(10);
+    }
+    say("HCI %04x: no Command Complete in 2 s", op);
+    return false;
+}
+
+// HCI Reset as bluetoothd will send it.
 bool MtkBtFw::hciReset()
 {
     if (!intrPipe) { say("no interrupt pipe, HCI check skipped"); return true; }
-    hciResetStatus = -1;
-    cmd[0] = 0x03; cmd[1] = 0x0c; cmd[2] = 0x00;
-    IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, 3, nullptr);
-    if (r != kIOReturnSuccess) { say("HCI Reset send failed %08x", r); return false; }
-    for (int i = 0; i < 200 && hciResetStatus < 0; i++) IOSleep(10);
-    if (hciResetStatus < 0) { say("HCI Reset: no Command Complete in 2 s"); return false; }
-    say("HCI Reset complete, status %d", hciResetStatus);
-    return hciResetStatus == 0;
+    uint8_t rp[16], n = 0;
+    if (!hciCmd(0x0c03, rp, &n) || n < 1) return false;
+    say("HCI Reset complete, status %u", rp[0]);
+    return rp[0] == 0;
+}
+
+// Strict check that the firmware left running by the previous session works: HCI Reset status 0, then Read Local Version
+// status 0 from a MediaTek controller (manufacturer 0x0046). Needs the interrupt pipe to see the answers.
+bool MtkBtFw::probeRunning()
+{
+    if (!intrPipe) { say("probe: no interrupt pipe"); return false; }
+    uint8_t rp[16], n = 0;
+    if (!hciCmd(0x0c03, rp, &n) || n < 1 || rp[0] != 0) { say("probe: HCI Reset failed (n=%u status %u)", n, n ? rp[0] : 0xff); return false; }
+    if (!hciCmd(0x1001, rp, &n) || n < 9 || rp[0] != 0) { say("probe: Read Local Version failed (n=%u)", n); return false; }
+    uint16_t manuf = (uint16_t)(rp[5] | rp[6] << 8), sub = (uint16_t)(rp[7] | rp[8] << 8);
+    say("probe: HCI %u rev %04x LMP %u manufacturer %04x subversion %04x", rp[1], (unsigned)(rp[2] | rp[3] << 8), rp[4], manuf, sub);
+    return manuf == 0x0046;
 }
 
 // Download, endpoint reset option, FUNC_CTRL 1, HCI check.
@@ -234,7 +293,7 @@ int MtkBtFw::wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, u
     if (dlen) memcpy(cmd + 8, data, dlen);
     IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, (uint16_t)(3 + hlen), nullptr);
     if (r != kIOReturnSuccess) { say("wmt op %u send failed %08x", op, r); return -1; }
-    for (int i = 0; i < 4000; i++) {                                // ~2 s at 0.5 ms per empty poll
+    for (int i = 0; i < 4000 && !gone; i++) {                       // ~2 s at 0.5 ms per empty poll
         uint32_t n = 0;
         r = ctrl(0xc0, 0x01, 0x30, 0, ev, 64, &n);
         if (r == kIOReturnSuccess && n >= 7) {
@@ -258,6 +317,8 @@ bool MtkBtFw::download()
     memcpy(date, fw, 16);
     say("firmware %s, %u sections, %lu bytes", date, nsec, (unsigned long)fwlen);
     if (nsec > 16 || FW_HDR_SIZE + FW_GD_SIZE + (size_t)FW_SEC_MAP_SIZE * nsec > fwlen) { say("bad section count"); return false; }
+    bool firstQuery = true;
+    wmtSilent = false;
     for (uint32_t i = 0; i < nsec; i++) {
         const uint8_t *map = fw + FW_HDR_SIZE + FW_GD_SIZE + FW_SEC_MAP_SIZE * i;
         uint32_t off = le32(map + 4), dl = le32(map + 12 + 4);    // secoffset, bin_info_spec.dlsize
@@ -269,7 +330,11 @@ bool MtkBtFw::download()
         uint8_t f = 0;
         int tries = 20;
         for (; tries > 0; tries--) {
-            if (wmt(WMT_PATCH_DWNLD, 0, q, sizeof(q), &f) < 0) return false;
+            if (wmt(WMT_PATCH_DWNLD, 0, q, sizeof(q), &f) < 0) {
+                if (firstQuery) wmtSilent = true;                  // nothing written yet: the running firmware may answer HCI
+                return false;
+            }
+            firstQuery = false;
             if (f == 1) { IOSleep(100); continue; }                // in progress
             break;
         }
@@ -302,9 +367,18 @@ void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t bytes)
     if (status == kIOReturnSuccess) {
         me->intrPackets++;
         const uint8_t *e = (const uint8_t *)me->intrBuf->getBytesNoCopy();
-        if (bytes >= 6 && e[0] == 0x0e && e[3] == 0x03 && e[4] == 0x0c) me->hciResetStatus = e[5];
+        if (bytes >= 6 && e[0] == 0x0e && e[1] >= 4) {                 // Command Complete: len, ncmd, opcode, return params
+            uint32_t n = bytes - 5;
+            if (n > e[1] - 3u) n = e[1] - 3u;
+            if (n > sizeof(me->ccData)) n = sizeof(me->ccData);
+            memcpy(me->ccData, e + 5, n);
+            me->ccLen = (uint8_t)n;
+            me->ccOp = (uint16_t)(e[3] | e[4] << 8);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            me->ccSeq++;
+        }
     }
-    if (!me->intrStop && status != kIOReturnAborted && status != kIOReturnNotOpen) me->intrArm();
+    if (!me->intrStop && !me->gone && status != kIOReturnAborted && status != kIOReturnNotOpen) me->intrArm();
 }
 
 // HCI events the chip also queues on the interrupt endpoint during setup are read and dropped (Linux has its interrupt URB
@@ -317,35 +391,40 @@ void MtkBtFw::intrArm()
     if (intrPipe->io(intrBuf, (uint32_t)intrBuf->getLength(), &c, 0) != kIOReturnSuccess) intrBusy = false;
 }
 
-void MtkBtFw::busyDrop(const char *why)
-{
-    if (!OSCompareAndSwap(1, 0, &busyHeld)) return;
-    adjustBusy(-1);
-    setProperty("bt-busy", why ? why : "released after the load");   // not say(): the cap runs beside the worker's log
-}
-
-// The armed cap holds a retain of the object (taken in start). It drops that retain when it fires; whoever dequeues it
-// with thread_call_cancel drops it instead. thread_call_free in free() is safe even while this callback is returning:
-// an allocated thread call is reference counted by xnu while it runs.
-void MtkBtFw::busyCapFired(thread_call_param_t p, thread_call_param_t)
-{
-    MtkBtFw *me = (MtkBtFw *)p;
-    me->busyDrop("dropped by the 30 s cap, load still running");
-    me->release();
-}
-
-void MtkBtFw::busyCapCancel()
-{
-    if (busyCap && thread_call_cancel(busyCap)) release();         // dequeued before it fired: its retain is ours
-}
-
 void MtkBtFw::worker(void *arg)
 {
     MtkBtFw *me = (MtkBtFw *)arg;
     me->run();
-    me->busyCapCancel();
-    me->busyDrop(nullptr);                                          // the interface is closed: IOKit may go quiet now
     me->release();
+}
+
+// The child interface 0 of the configured device (created by setConfiguration, registered or not).
+IOUSBHostInterface *MtkBtFw::findInterface0()
+{
+    IOUSBHostInterface *found = nullptr;
+    OSIterator *it = dev->getChildIterator(gIOServicePlane);
+    if (!it) return nullptr;
+    while (OSObject *o = it->getNextObject()) {
+        IOUSBHostInterface *i = OSDynamicCast(IOUSBHostInterface, o);
+        const StandardUSB::InterfaceDescriptor *d = i ? i->getInterfaceDescriptor() : nullptr;
+        if (d && d->bInterfaceNumber == 0) { found = i; found->retain(); break; }
+    }
+    it->release();
+    return found;
+}
+
+// What AppleUSBHostCompositeDevice does right after setConfiguration(cfg, true): let the interfaces match.
+void MtkBtFw::registerInterfaces()
+{
+    OSIterator *it = dev->getChildIterator(gIOServicePlane);
+    if (!it) return;
+    uint32_t n = 0;
+    while (OSObject *o = it->getNextObject()) {
+        IOUSBHostInterface *i = OSDynamicCast(IOUSBHostInterface, o);
+        if (i && !i->isInactive() && !(i->getState() & kIOServiceRegisteredState)) { i->registerService(); n++; }
+    }
+    it->release();
+    say("%u interfaces registered", n);
 }
 
 void MtkBtFw::run()
@@ -353,7 +432,38 @@ void MtkBtFw::run()
     uint64_t t0 = 0, t1 = 0;
     clock_get_uptime(&t0);
     state("loading");
-    if (!intf->open(this)) { say("interface busy (open failed)"); state("error"); return; }
+    // One session on the device for the whole load: bluetoothd's device user client cannot open it (and cannot select a
+    // configuration, which would tear down the interface we load through) until we close it.
+    if (!dev->open(this)) { say("device busy (open failed), leaving it alone"); state("error"); return; }
+    bool ok = false;
+    bool configured = dev->getConfigurationDescriptor() != nullptr;
+    if (!configured) {
+        IOReturn r = dev->setConfiguration(MTK_CONFIG, false);    // interfaces created, not registered for matching
+        if (r != kIOReturnSuccess) say("set configuration %u failed %08x", MTK_CONFIG, r);
+        else configured = true;
+    } else say("device already configured");
+    if (configured && !gone) {
+        intf = findInterface0();
+        if (!intf) say("no interface 0");
+        else if (!intf->open(this)) say("interface 0 busy (open failed)");
+        else {
+            ok = load();
+            intf->close(this);
+        }
+        if (intf) { intf->release(); intf = nullptr; }
+        if (!gone) registerInterfaces();                            // also after a failed load: bluetoothd decides then
+    }
+    dev->close(this);
+    clock_get_uptime(&t1);
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(t1 - t0, &ns);
+    say("%s in %llu ms, %u interrupt packets dropped", gone ? "device gone" : ok ? "ready" : "failed", ns / 1000000ull, intrPackets);
+    state(gone ? "gone" : ok ? "ready" : "error");
+}
+
+// Firmware load through the open interface 0. Returns true when the controller answers HCI.
+bool MtkBtFw::load()
+{
 
     // the interrupt IN endpoint of this interface, from the raw configuration descriptor (bLength / bDescriptorType walk)
     const uint8_t *cfg = (const uint8_t *)intf->getConfigurationDescriptor();
@@ -387,8 +497,12 @@ void MtkBtFw::run()
     else if (ok) {
         if (!fwAlive) { say("firmware of the previous session is dead, resetting"); ok = subsysReset(); }
         if (ok && !bringUp()) {
-            say("bring-up failed, subsystem reset and full reload");
-            ok = subsysReset() && bringUp();
+            if (fwAlive && wmtSilent && !gone && probeRunning()) say("WMT silent, running firmware answers HCI: download skipped");
+            else if (gone) ok = false;
+            else {
+                say("bring-up failed, subsystem reset and full reload");
+                ok = subsysReset() && bringUp();
+            }
         }
     }
     intrStop = true;
@@ -398,50 +512,45 @@ void MtkBtFw::run()
         intrPipe->release();
         intrPipe = nullptr;
     }
-    intf->close(this);
-    clock_get_uptime(&t1);
-    uint64_t ns = 0;
-    absolutetime_to_nanoseconds(t1 - t0, &ns);
-    say("%s in %llu ms, %u interrupt packets dropped", ok ? "ready" : "failed", ns / 1000000ull, intrPackets);
-    state(ok ? "ready" : "error");
+    return ok && !gone;
 }
 
 bool MtkBtFw::start(IOService *provider)
 {
     if (!IOService::start(provider)) return false;
-    intf = OSDynamicCast(IOUSBHostInterface, provider);
-    if (!intf) return false;
+    dev = OSDynamicCast(IOUSBHostDevice, provider);
+    if (!dev) return false;
     cmd = (uint8_t *)IOMalloc(512);
     ev = (uint8_t *)IOMalloc(64);
     if (!cmd || !ev) return false;
     state("starting");
-    // hold IOKit busy until the interface is closed again, so that bluetoothd's IOKitWaitQuiet returns only after the load
-    uint32_t busyArg = 1;
-    if (PE_parse_boot_argn("mtkbtbusy", &busyArg, sizeof busyArg) && busyArg == 0) setProperty("bt-busy", "off (mtkbtbusy=0)");
+    uint32_t nameArg = 1;
+    if (PE_parse_boot_argn("mtkbtname", &nameArg, sizeof nameArg) && nameArg == 0) setProperty("bt-transport", "board-id (mtkbtname=0)");
     else {
-        // hold busy only with a working cap, so the hold can never outlive BUSY_CAP_MS
-        busyCap = thread_call_allocate(busyCapFired, this);
-        if (!busyCap) setProperty("bt-busy", "off (no thread call)");
-        else {
-            busyHeld = 1;
-            adjustBusy(1);
-            setProperty("bt-busy", "held");
-            uint64_t dl;
-            clock_interval_to_deadline(BUSY_CAP_MS, kMillisecondScale, &dl);
-            retain();                                               // held by the armed cap (see busyCapFired)
-            thread_call_enter_delayed(busyCap, dl);
-        }
+        setName(MTK_USB_NAME);                                      // before registerService: bluetoothd looks it up by name
+        setProperty("bt-transport", "usb (named " MTK_USB_NAME ")");
     }
     registerService();
     retain();                                                       // released by the worker
     if (!startThread(worker, this)) {
         say("could not start the loader thread");
         state("error");
-        busyCapCancel();
-        busyDrop("released: loader thread did not start");
+        if (!dev->getConfigurationDescriptor() && dev->open(this)) {   // still hand the interfaces to bluetoothd
+            if (dev->setConfiguration(MTK_CONFIG, true) != kIOReturnSuccess) say("set configuration failed");
+            dev->close(this);
+        }
         release();
     }
     return true;
+}
+
+// Unplug, or the device re-enumerates: everything in flight fails from here on; the worker sees `gone`, stops early and
+// closes the interface and the device, which lets the termination finish.
+bool MtkBtFw::willTerminate(IOService *provider, IOOptionBits options)
+{
+    gone = true;
+    intrStop = true;
+    return IOService::willTerminate(provider, options);
 }
 
 void MtkBtFw::stop(IOService *provider)
@@ -452,7 +561,6 @@ void MtkBtFw::stop(IOService *provider)
 
 void MtkBtFw::free()
 {
-    if (busyCap) thread_call_free(busyCap);      // not armed here: an armed cap holds a retain, so free() could not run
     if (intrBuf) intrBuf->release();
     if (cmd) IOFree(cmd, 512);
     if (ev) IOFree(ev, 64);

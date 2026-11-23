@@ -452,6 +452,95 @@ Read: `LoginwindowUIShown` minus T0 (T0 = kern.boottime - `machdep.tsc.nanotime.
 
 **Undo:** the 0.2.0 kext from `EFI/OC/Kexts-backup`, or boot once with `mtkbtbusy=0`.
 
+**0.3.x regression (boot 2026-11-23 14:33).** The busy count propagates to the registry root. WindowServer and loginwindow
+also wait for root quiet, so the login window came up only after the firmware load (9.7 s that boot: warm restart, WMT
+silent, subsystem reset and full reload). The hold is the wrong tool; 0.4.0 removes it.
+
+## MtkBtFw 0.4.0: device-level load, USB transport by name, strict warm-restart probe (2026-11-23, not installed yet)
+
+**(b) Device-level load.** The personality matches the `IOUSBHostDevice` 0489:e11e (idVendor + idProduct, USB match score
+90000) instead of interface 0. AppleUSBHostCompositeDevice matches this device by class EF/02/01 (score 60000, seen in
+ioreg) and so no longer runs; MtkBtFw does its job:
+1. `dev->open(this)`: the one non-interface session on the device. bluetoothd's `AppleUSBHostDeviceUserClient` cannot open
+   the device, and cannot select a configuration (which would tear down the interface being loaded), until we close it.
+2. `setConfiguration(1, false)`: interfaces 0-2 are created but not registered for matching.
+3. Open interface 0 and run the load (unchanged from 0.3.1, plus the probe below). Close interface 0.
+4. `registerService()` on each interface (also after a failed load), then `dev->close(this)`.
+
+No busy count at any point, so IOKit goes quiet as soon as the rest of the boot does. The `mtkbtbusy` boot-arg is gone.
+
+**USB transport by name.** bluetoothd 25G332 picks its transport once, in the dispatch_once block of the transport getter
+(0x10014c80c). In order:
+- the device-tree property `transport-encoding` on a service named `marconi-bt` or `bluetooth` (none here);
+- otherwise `IOServiceNameMatching("Bluetooth USB Host Controller")`: if a service by that name exists, USB (0);
+- `BLTH` or `USB-Serial (0001)`: UART (3); `AppleBluetoothModule`: PCIe (7); else `FindTransportType` (board-id table:
+  UART on Mac-5F9802EFE386AA28);
+- finally the boot-arg `bt-transport-override=N` (N < 12) overrides any of these.
+
+MtkBtFw calls `setName("Bluetooth USB Host Controller")` before `registerService()` in `start()`, so bluetoothd takes USB
+with no patch and no boot-arg. MtkBtFw is a plain IOService, not an IOUSBHostDevice. The two other places that use that
+string compare names of `IOUSBHostDevice`s (the dongle lists at 0x1000e9a6a / 0x1000ee338), so they do not see it. USB mode
+also differs from UART mode where the load is concerned: its device thread retries every second for 15 s
+(`[bm3_usb][IOThreadFunc] ... Still cannot find USB Bluetooth Controller after 15 seconds`) instead of one scan, so a load
+that is still running when bluetoothd starts is waited for. The load takes 1.7 s (warm, sections already there), 5.2 s
+(cold) or 9.7 s (reset + reload). Off switch: boot-arg `mtkbtname=0`: the driver keeps its class name and bluetoothd picks
+by board-id again. Property `bt-transport`: `usb (named Bluetooth USB Host Controller)` or `board-id (mtkbtname=0)`.
+`mtkbtname` and `bt-transport-override` were checked against every kext on the ESP and in /Library/Extensions: unused.
+
+Fallbacks, not built: `bt-transport-override=0` in boot-args (Apple's own switch, same effect, no kext change); or a
+BtLeDlFix byte patch of the UART return in `FindTransportType`. Masked pattern, unique in the 25G332 x86_64 slice at file
+offset 0x14cd98, page offset 0xd98:
+`31 DB 31 C0 E8 ?? ?? ?? ?? EB ?? 48 8D 3D ?? ?? ?? ?? 31 C0 E8 ?? ?? ?? ?? BB 03 00 00 00 48 8B 05` (USB return `xor ebx,ebx`,
+then the UART return `mov ebx, 3`; patch `03` to `00`). Contract of the value: 44 calls of the getter 0x10014c7ef. The
+callers compare against 7, 8, 9, 10 and 11, `cmp 3` (UART-only branches), `test eax,eax` (USB), and one 12-entry jump table
+(0x100085622) that maps 0 to the USB report value and 3 to the UART one. 0 is the value all 14 USB board-ids get.
+
+**(c) Warm-restart probe.** The chip keeps its firmware across a warm restart. On 14:33 WMT did not answer the first
+PATCH_DWNLD query and MtkBtFw did a subsystem reset and full reload (9.7 s). On 10-12 it answered "already loaded"
+(1.7 s). 0.4.0 probes over HCI only when all of these hold:
+- the very first PATCH_DWNLD query got no event and nothing was written;
+- the register reads worked and the WDT status was 0.
+
+The probe passes only if HCI Reset completes with status 0, then Read Local Version (0x1001) completes with status 0 and
+manufacturer 0x0046. Only then is the download skipped (`WMT silent, running firmware answers HCI: download skipped`). A
+missing Command Complete (2 s each), any other status, a short answer or another manufacturer takes the subsystem reset and
+full reload, as before. A cold chip answers WMT, so it is never probed. The interrupt endpoint now records every Command
+Complete (opcode, return parameters) instead of only HCI Reset's.
+
+**Re-enumeration.**
+- Sleep/wake without a re-enumeration: nothing happens (no PM code in MtkBtFw, like the composite driver).
+- A re-enumeration (wake with the port powered off, or the device dropping off the bus) terminates the old nub. `willTerminate`
+  sets `gone`, the WMT/HCI/reset polls stop, the worker closes the interface and the device, and termination completes. The
+  new nub gets a new MtkBtFw. That instance probes: a chip that kept its firmware answers WMT "already loaded", or answers
+  HCI, so it skips the download.
+- The subsystem reset does not drop the device off the bus: on 14:33 the download continued on the same session right after
+  `subsys reset: done, dev id 00007925`.
+
+**Wi-Fi and the rest of the device.** 0489:e11e has one configuration with the Bluetooth interfaces only (BT_ACL_If 0,
+BT_SCO_If 1, BT_ISO_If 2). Wi-Fi is the PCIe function (itlmt7925), not on this USB device. USBToolBox/UTBMap map ports at
+the XHCI controller (HS03 = this device); a driver on the device is below that and does not change it.
+
+**First boot, check (read-only):**
+```
+ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-transport"|"bt-log"'   # ready / usb (named ...) / "3 interfaces registered;ready in N ms"
+ioreg -p IOService -n Wireless_Device -r -d1 | grep -E 'o (Bluetooth USB Host Controller|AppleUSBHostComposite|BT_)'   # ours, no Composite, 3 interfaces registered
+B=$(sysctl kern.boottime | awk -F'[ ,]+' '{for(i=1;i<=NF;i++) if($i=="sec") print $(i+2)}'); S=$(date -r $B '+%Y-%m-%d %H:%M:%S'); E=$(date -r $((B+60)) '+%Y-%m-%d %H:%M:%S')
+/usr/bin/log show --start "$S" --end "$E" --style compact --predicate '(process == "loginwindow" AND eventMessage CONTAINS "LoginwindowUIShown") OR category == "InterfaceNamer" OR (process == "bluetoothd" AND (eventMessage CONTAINS "IOKitWaitQuiet" OR eventMessage CONTAINS "Transport" OR eventMessage CONTAINS "bm3_usb" OR eventMessage CONTAINS "failed to appear"))'
+ls /Library/Logs/DiagnosticReports | grep ExcUserFault_bluetoothd   # no new report for this boot
+```
+Expected:
+- `IOKitWaitQuiet` returns at about the 0.2.0 time, no longer tied to the load, and `*QUIET*` moves back with it.
+- `LoginwindowUIShown` is back near the 14.4 s baseline.
+- bluetoothd logs USB from the first PID (no `FindTransportType -- UART`), then `[bm3_usb] ... Matching services found
+  after N seconds` with N covering the rest of the load.
+- No `failed to appear`, no ExcUserFault.
+
+On a warm restart, `bt-log` shows either `already loaded` or `probe: ... manufacturer 0046` + `download skipped`, or the
+probe failure line followed by the reset and reload.
+
+**Undo:** the 0.3.1 kext (or 0.2.0) from `EFI/OC/Kexts-backup`. To keep 0.4.0 with bluetoothd back on board-id UART, boot
+with `mtkbtname=0`.
+
 ## Pieces
 
 | Piece | What it does |

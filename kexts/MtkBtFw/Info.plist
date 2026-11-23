@@ -8,19 +8,17 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>MtkBtFw</string>
 	<key>CFBundlePackageType</key><string>KEXT</string>
-	<key>CFBundleShortVersionString</key><string>0.3.1</string>
-	<key>CFBundleVersion</key><string>0.3.1</string>
+	<key>CFBundleShortVersionString</key><string>0.4.0</string>
+	<key>CFBundleVersion</key><string>0.4.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MtkBtFw</key>
 		<dict>
 			<key>CFBundleIdentifier</key><string>com.itlmt7925.mtkbtfw</string>
 			<key>IOClass</key><string>MtkBtFw</string>
-			<key>IOProviderClass</key><string>IOUSBHostInterface</string>
+			<key>IOProviderClass</key><string>IOUSBHostDevice</string>
 			<key>idVendor</key><integer>1161</integer>
 			<key>idProduct</key><integer>57630</integer>
-			<key>bConfigurationValue</key><integer>1</integer>
-			<key>bInterfaceNumber</key><integer>0</integer>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>
