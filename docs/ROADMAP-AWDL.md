@@ -3765,3 +3765,23 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - AirDrop Mac → Mac again. Compare the PIN/ASK durations with 64 s / 8 s.
 - Read `ontx=` and `dtx` full-ring counts (`dtx=in/queued/full/...`).
 - **Installed 2026-11-11 19:03** with the owner's OK. Backup of 5E4A1B60: `EFI/OC/Kexts-backup/itlmt7925.kext.20261111-190331`. The build includes the open-network join. Native stays 52A0E786.
+
+### 10.90 Boot 2026-11-23 13:15 (core B9E6878A, native 52A0E786), "laon" ch 36 VHT80: AirDrop Mac → a nearby MacBook (a known contact)
+
+- **Discovery:** AirDrop window opened at 13:40:17; "Endpoints discovered / Adding discovered endpoint" at 13:40:22 (5 s). The peer `72:9d:5e:a9:bf:87` became a permanent ndp entry, and the Finder window showed the contact by name.
+- **Send** (`AirDrop.36DAA487`, a 1-line text file):
+  - `START` 13:42:31.459.
+  - No PIN phase: the receiver is a contact.
+  - `ASK START` 13:42:31.483 → `ASK END` 13:42:47.119 (15.6 s). This includes the receiver clicking Accept, so it is not a pure network time.
+  - `UPLOAD START` → `UPLOAD END` 13:42:47.119 → 13:42:48.132 (1.0 s).
+  - `END` 13:42:48.140.
+- **awdl0 during the send:** 97 packets / 34 KB in, 126 packets / 47 KB out.
+- **TCP:** no retransmits (0 data packets retransmitted, 0 retransmit timeouts).
+- **Driver:**
+  - Native `dtx=214/214/0/…`: the core's AWDL TX ring was **never full**; on 2026-11-11 it was full 327 times.
+  - `awdl lead … ontx=44/54`: §10.89's between-window drain ran 44 times and sent 54 frames.
+  - On-channel windows still start late: `onlate=2355/2083us`.
+  - TXFREE still counts every AWDL unicast frame as failed (`uc5=0/148`), while the transfer and TCP show no loss: the open question of §10.89.
+- **Not yet measured:**
+  - A PIN-paired transfer (non-contact) to compare with §10.88's 64 s.
+  - A larger file, for throughput.
