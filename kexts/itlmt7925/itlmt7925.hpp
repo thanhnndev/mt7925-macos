@@ -154,6 +154,7 @@ private:
     void ctlPoll();                          // link loop: take run-time control requests (setProperties)
     enum M3BssOp { M3_BSS_ADD, M3_BSS_ASSOC, M3_BSS_REMOVE };
     int  m3Bss(M3BssOp op);
+    uint8_t awdlBcm = 3;                     // itl_awdlbcm (§10.91): MT_TXD3_BCM for group-addressed addr1. bit 0 = management (PSF/MIF), bit 1 = data
     uint8_t awdlOmac1 = 1;                   // itl_awdlomac: 1 = AWDL data goes out with TXD1.OWN_MAC = 1 (the AWDL address, once programmed), 0 = OMAC 0
     // TX status records (PKT_TYPE_TXS, docs/ROADMAP-AWDL.md §10.53), by PID: [0] host frames (3), [1] AWDL unicast data (4),
     // [2] AWDL group data (5), [3] other. ok = TXS0 ACK_ERROR_MASK clear; err[] by which of its bits was set (queue / RTS / ACK).

@@ -3842,3 +3842,58 @@ The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 4
 
 - **Installed 2026-11-23 13:53** with the owner's OK. Backup of B9E6878A: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
 - **Undo:** `cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad91 && mv Kexts-backup/itlmt7925.kext.20261123-135320 Kexts/itlmt7925.kext`
+
+### 10.92 Boot 2026-11-23 14:3x (core 61F8DB1B): group frames go out once, but the nearby MacBook flickers and the PIN never shows → runtime A/B switch `itl_awdlbcm` (core D2CAADD0, not installed)
+
+**The fix itself works.** `awdl txfree: grp=31/0 tries=31`, later `grp=56/0`: each group frame now goes out once and is reported ok. Before the fix it was about 15 attempts and fail.
+
+**But AirDrop got worse.**
+- The owner saw the MacBook appear and disappear in the AirDrop window, even with "Everyone" set.
+- A send waited a long time and the PIN prompt never appeared.
+- Log `build/ask-1091.txt`: the Family posts `Peer Presence` for `52:08:0C:19:04:CB`, then `Peer Absence` 7–20 s later, again and again:
+
+  | Presence | Absence |
+  |---|---|
+  | 46:21.45 | 46:42.0 |
+  | 46:47.59 | 46:57.0 |
+  | 47:00.16 | 47:07.0 |
+  | 47:09.07 | 47:16.0 |
+  | 47:18.50 | … |
+
+  Each re-add starts from `SUI 0 → 1185`, so the peer entry is recreated each time. mDNSResponder follows it with `D2DServiceLost` / `D2DServicePeerLost`.
+- `runElection` keeps us as our own master every ~3 s (`New P:DA:FB:F4:DE:22:64`, our awdl0 address).
+
+**Counters, this boot vs §10.90:**
+
+| Counter | §10.90 | This boot |
+|---|---|---|
+| `rx` (action frames) | 3855 in ~26 min, `weak=12` | 616 in ~13 min, `weak=518` |
+| `pm` (peers naming us master) | `us=451` | `pm=470/10/136`: `us=10`, `other=136` |
+| `syncs` | — | 0 |
+
+- The MacBook's own frames (RSSI −54) reach us far less often than before.
+- The peers mostly follow another master, and we never take that master's timeline (`syncs=0`).
+- This boot also has more Apple devices around: `a6:00:5b:…` (2.4 GHz only) and `02:78:b7:…`. So the effect of the fix and the change in the room cannot be told apart from this boot.
+
+**Hypothesis to test, not a conclusion.** With BCM, our PSF/MIF goes out once per window instead of up to 16 times over tens of ms. A peer that is not yet synced to us is less likely to catch one, so it follows another master. Its windows then drift away from ours, and we miss its frames.
+
+**Round (core D2CAADD0):** `itl_awdlbcm` (itlctl, run time) selects which group frames carry `MT_TXD3_BCM`:
+
+| Value | Meaning |
+|---|---|
+| 3 | default: all, as Linux |
+| 1 | management only (PSF/MIF) |
+| 2 | data only |
+| 0 | none: the old behaviour |
+
+The `awdl txfree` line prints `bcm=`. With this, A and B can be compared in one boot, with the same devices in the room.
+
+**Plan:**
+1. In one boot, alternate `sudo itlctl itl_awdlbcm=3` and `=2`, about 2 minutes each with AirDrop open.
+2. Each time, count `Peer Presence` / `Absence` for the MacBook and read the `pm=` and `rx` deltas.
+3. Send a file in each setting.
+4. If `=2` holds the peer and `=3` does not, the real fix is presence or sync, not retrying broadcasts. Our windows must line up with the tree the peers actually follow:
+   - adopt the other master's timeline (`syncs`);
+   - or keep the sniffer up longer on the AP channel.
+
+   The BCM fix stays, because Linux sets it.

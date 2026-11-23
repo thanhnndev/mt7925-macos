@@ -1295,9 +1295,9 @@ void itlmt7925::awdlSyncTx()
               txsPkts, txsN, txsOk[3], txsFail[3], txsOk[4], txsFail[4], txsOk[6], txsFail[6], txsOk[5], txsFail[5], oo, of,
               txsErr[0], txsErr[1], txsErr[2], txsLate, txsUcBand[0][0], txsUcBand[0][1], txsUcBand[1][0], txsUcBand[1][1],
               awdlTxGuardHeld, awdlDrainTimeout, awdlDrainWaitMs, awdlDataRxUc, awdlDataRxUcMine, awdlOwnRc, awdlOmac1);
-        m3log("awdl txfree: uc=%u/%u ucheard=%u/%u grp=%u/%u tries=%u late=%u uc24=%u/%u uc5=%u/%u pool=%u (ok/fail)",
+        m3log("awdl txfree: uc=%u/%u ucheard=%u/%u grp=%u/%u tries=%u late=%u uc24=%u/%u uc5=%u/%u pool=%u bcm=%u (ok/fail)",
               tfOk[0], tfFail[0], tfOk[2], tfFail[2], tfOk[1], tfFail[1], tfTries, tfLate, tfBand[0][0], tfBand[0][1],
-              tfBand[1][0], tfBand[1][1], txPool ? 1 : 0);
+              tfBand[1][0], tfBand[1][1], txPool ? 1 : 0, awdlBcm);
     }
 }
 
@@ -1576,7 +1576,7 @@ bool itlmt7925::m3Tx(const uint8_t *frame, uint32_t len, uint8_t type, uint8_t s
     // AWDL multicast data (mDNS) to 33:33:... in addr1. Without BCM the MAC waited for an ACK that a group frame never gets
     // and sent each one REM_TX_COUNT (15) more times with growing backoff (§10.91: TXFREE grp fail with ~15 tries each),
     // holding ALTX0 and the window's airtime while the AWDL unicast queued behind it.
-    bool raGrp = len >= 10 && (frame[4] & 1);
+    bool raGrp = len >= 10 && (frame[4] & 1) && (awdlBcm & (type == 2 ? 2 : 1));   // itl_awdlbcm: A/B per frame class
     bool grp = type == 2 && len >= 18 && (frame[16] & 1);
     uint16_t wcid = (grp && grpWcid19) ? M3_BMC_WCID : M3_AP_WCID;
     put32(w + 0, (len + 32) | (0u << 23) | ((uint32_t)o.qidx << 25));         // TX_BYTES | PKT_FMT=CT | Q_IDX

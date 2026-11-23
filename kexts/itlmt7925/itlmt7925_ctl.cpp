@@ -64,6 +64,10 @@ IOReturn itlmt7925::setProperties(OSObject *props)
         grpWcid19 = v ? 1 : 0;                               // 0: group TX on the AP wcid (default, proven); 1: mt76's BSS wcid 19 (+ its records at the next reconnect)
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "grp19=%u ", grpWcid19);
     }
+    if (ctlNum(d, "itl_awdlbcm", &v)) {
+        awdlBcm = (uint8_t)(v & 3);                          // §10.91 A/B: which group frames go out with MT_TXD3_BCM
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlbcm=%u ", awdlBcm);
+    }
     if (ctlNum(d, "itl_awdlomac", &v)) {
         awdlOmac1 = v ? 1 : 0;                               // AWDL data TX from OMAC 1 (the AWDL address) or OMAC 0
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlomac=%u ", awdlOmac1);
