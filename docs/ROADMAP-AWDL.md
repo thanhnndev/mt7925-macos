@@ -3839,3 +3839,6 @@ The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 4
 |---|---|---|
 | core | `61F8DB1B-6FE5-39A4-BD49-2728E6E90C73` | `B9E6878A` |
 | native | unchanged `52A0E786` | — |
+
+- **Installed 2026-11-23 13:53** with the owner's OK. Backup of B9E6878A: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
+- **Undo:** `cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad91 && mv Kexts-backup/itlmt7925.kext.20261123-135320 Kexts/itlmt7925.kext`
