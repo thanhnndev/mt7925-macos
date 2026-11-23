@@ -22,6 +22,12 @@
 // timeout") and loads the whole firmware again, once. A dead firmware is also detected up front (WDT status, stalled register
 // read) so the reset comes first.
 //
+// 0.3.0: the service is kept busy (adjustBusy) while the firmware loads, at most BUSY_CAP_MS. bluetoothd calls
+// IOKitWaitQuiet (240 s timeout) before it picks a transport and scans for USB dongles once; without the busy hold the
+// registry went quiet 1.4-2.6 s into the 5.2 s download, bluetoothd met an exclusively opened interface, fell back to the
+// MacBookPro16,2 UART (/dev/cu.BLTH), faulted after 15 s and was relaunched (9 of 10 boots, 2026-11-18..23). Off switch:
+// boot-arg mtkbtbusy=0.
+//
 // IOLog of these kexts does not reach dmesg or the unified log on this machine: the result is in the registry,
 //   ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-log"'
 #include <IOKit/IOService.h>
@@ -30,6 +36,8 @@
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -54,6 +62,7 @@ enum { WMT_PATCH_DWNLD = 0x1, WMT_FUNC_CTRL = 0x6 };
 #define REG_WDT_STATUS    0x740003A0
 #define REG_UDMA_INT_STA  0x74000024
 #define REG_UDMA_INT_STA1 0x74000308
+#define BUSY_CAP_MS       30000          // normal load 5.2 s, reset + full reload about twice that
 
 static void startThread(void (*fn)(void *), void *arg)
 {
@@ -75,12 +84,16 @@ private:
     IOBufferMemoryDescriptor *intrBuf = nullptr;
     volatile bool intrStop = false, intrBusy = false;
     uint32_t intrPackets = 0;
+    volatile UInt32 busyHeld = 0;                   // 1 while this service holds one busy count (adjustBusy)
+    thread_call_t busyCap = nullptr;                 // drops the busy hold after BUSY_CAP_MS if the load hangs
     volatile int hciResetStatus = -1;                // status byte of the HCI Reset Command Complete, -1 = none seen
     uint8_t *cmd = nullptr, *ev = nullptr;          // control transfer buffers (wired)
     char log[1200] = {0};
     size_t loglen = 0;
 
     static void worker(void *arg);
+    static void busyCapFired(thread_call_param_t me, thread_call_param_t);
+    void busyDrop(const char *why);
     void run();
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void state(const char *s) { setProperty("bt-state", s); }
@@ -299,10 +312,24 @@ void MtkBtFw::intrArm()
     if (intrPipe->io(intrBuf, (uint32_t)intrBuf->getLength(), &c, 0) != kIOReturnSuccess) intrBusy = false;
 }
 
+void MtkBtFw::busyDrop(const char *why)
+{
+    if (!OSCompareAndSwap(1, 0, &busyHeld)) return;
+    adjustBusy(-1);
+    setProperty("bt-busy", why ? why : "released after the load");   // not say(): the cap runs beside the worker's log
+}
+
+void MtkBtFw::busyCapFired(thread_call_param_t me, thread_call_param_t)
+{
+    ((MtkBtFw *)me)->busyDrop("dropped by the 30 s cap, load still running");
+}
+
 void MtkBtFw::worker(void *arg)
 {
     MtkBtFw *me = (MtkBtFw *)arg;
     me->run();
+    if (me->busyCap) thread_call_cancel_wait(me->busyCap);
+    me->busyDrop(nullptr);                                          // the interface is closed: IOKit may go quiet now
     me->release();
 }
 
@@ -373,6 +400,20 @@ bool MtkBtFw::start(IOService *provider)
     ev = (uint8_t *)IOMalloc(64);
     if (!cmd || !ev) return false;
     state("starting");
+    // hold IOKit busy until the interface is closed again, so that bluetoothd's IOKitWaitQuiet returns only after the load
+    uint32_t busyArg = 1;
+    if (PE_parse_boot_argn("mtkbtbusy", &busyArg, sizeof busyArg) && busyArg == 0) setProperty("bt-busy", "off (mtkbtbusy=0)");
+    else {
+        busyCap = thread_call_allocate(busyCapFired, this);
+        busyHeld = 1;
+        adjustBusy(1);
+        setProperty("bt-busy", "held");
+        if (busyCap) {
+            uint64_t dl;
+            clock_interval_to_deadline(BUSY_CAP_MS, kMillisecondScale, &dl);
+            thread_call_enter_delayed(busyCap, dl);
+        }
+    }
     registerService();
     retain();                                                       // released by the worker
     startThread(worker, this);
@@ -387,6 +428,7 @@ void MtkBtFw::stop(IOService *provider)
 
 void MtkBtFw::free()
 {
+    if (busyCap) { thread_call_cancel_wait(busyCap); thread_call_free(busyCap); }
     if (intrBuf) intrBuf->release();
     if (cmd) IOFree(cmd, 512);
     if (ev) IOFree(ev, 64);
