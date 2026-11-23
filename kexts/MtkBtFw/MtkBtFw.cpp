@@ -27,6 +27,8 @@
 // registry went quiet 1.4-2.6 s into the 5.2 s download, bluetoothd met an exclusively opened interface, fell back to the
 // MacBookPro16,2 UART (/dev/cu.BLTH), faulted after 15 s and was relaunched (9 of 10 boots, 2026-11-18..23). Off switch:
 // boot-arg mtkbtbusy=0.
+// 0.3.1: no thread_call_cancel_wait (com.apple.kpi.private): the armed cap holds a retain instead. Busy is held only when
+// the cap could be allocated. If the loader thread cannot start, the cap, the busy hold and the worker's retain are dropped.
 //
 // IOLog of these kexts does not reach dmesg or the unified log on this machine: the result is in the registry,
 //   ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-log"'
@@ -64,10 +66,12 @@ enum { WMT_PATCH_DWNLD = 0x1, WMT_FUNC_CTRL = 0x6 };
 #define REG_UDMA_INT_STA1 0x74000308
 #define BUSY_CAP_MS       30000          // normal load 5.2 s, reset + full reload about twice that
 
-static void startThread(void (*fn)(void *), void *arg)
+static bool startThread(void (*fn)(void *), void *arg)
 {
     thread_t th = nullptr;
-    if (kernel_thread_start((thread_continue_t)fn, arg, &th) == KERN_SUCCESS) thread_deallocate(th);
+    if (kernel_thread_start((thread_continue_t)fn, arg, &th) != KERN_SUCCESS) return false;
+    thread_deallocate(th);
+    return true;
 }
 
 static inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -93,6 +97,7 @@ private:
 
     static void worker(void *arg);
     static void busyCapFired(thread_call_param_t me, thread_call_param_t);
+    void busyCapCancel();
     void busyDrop(const char *why);
     void run();
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -319,16 +324,26 @@ void MtkBtFw::busyDrop(const char *why)
     setProperty("bt-busy", why ? why : "released after the load");   // not say(): the cap runs beside the worker's log
 }
 
-void MtkBtFw::busyCapFired(thread_call_param_t me, thread_call_param_t)
+// The armed cap holds a retain of the object (taken in start). It drops that retain when it fires; whoever dequeues it
+// with thread_call_cancel drops it instead. thread_call_free in free() is safe even while this callback is returning:
+// an allocated thread call is reference counted by xnu while it runs.
+void MtkBtFw::busyCapFired(thread_call_param_t p, thread_call_param_t)
 {
-    ((MtkBtFw *)me)->busyDrop("dropped by the 30 s cap, load still running");
+    MtkBtFw *me = (MtkBtFw *)p;
+    me->busyDrop("dropped by the 30 s cap, load still running");
+    me->release();
+}
+
+void MtkBtFw::busyCapCancel()
+{
+    if (busyCap && thread_call_cancel(busyCap)) release();         // dequeued before it fired: its retain is ours
 }
 
 void MtkBtFw::worker(void *arg)
 {
     MtkBtFw *me = (MtkBtFw *)arg;
     me->run();
-    if (me->busyCap) thread_call_cancel_wait(me->busyCap);
+    me->busyCapCancel();
     me->busyDrop(nullptr);                                          // the interface is closed: IOKit may go quiet now
     me->release();
 }
@@ -404,19 +419,28 @@ bool MtkBtFw::start(IOService *provider)
     uint32_t busyArg = 1;
     if (PE_parse_boot_argn("mtkbtbusy", &busyArg, sizeof busyArg) && busyArg == 0) setProperty("bt-busy", "off (mtkbtbusy=0)");
     else {
+        // hold busy only with a working cap, so the hold can never outlive BUSY_CAP_MS
         busyCap = thread_call_allocate(busyCapFired, this);
-        busyHeld = 1;
-        adjustBusy(1);
-        setProperty("bt-busy", "held");
-        if (busyCap) {
+        if (!busyCap) setProperty("bt-busy", "off (no thread call)");
+        else {
+            busyHeld = 1;
+            adjustBusy(1);
+            setProperty("bt-busy", "held");
             uint64_t dl;
             clock_interval_to_deadline(BUSY_CAP_MS, kMillisecondScale, &dl);
+            retain();                                               // held by the armed cap (see busyCapFired)
             thread_call_enter_delayed(busyCap, dl);
         }
     }
     registerService();
     retain();                                                       // released by the worker
-    startThread(worker, this);
+    if (!startThread(worker, this)) {
+        say("could not start the loader thread");
+        state("error");
+        busyCapCancel();
+        busyDrop("released: loader thread did not start");
+        release();
+    }
     return true;
 }
 
@@ -428,7 +452,7 @@ void MtkBtFw::stop(IOService *provider)
 
 void MtkBtFw::free()
 {
-    if (busyCap) { thread_call_cancel_wait(busyCap); thread_call_free(busyCap); }
+    if (busyCap) thread_call_free(busyCap);      // not armed here: an armed cap holds a retain, so free() could not run
     if (intrBuf) intrBuf->release();
     if (cmd) IOFree(cmd, 512);
     if (ev) IOFree(ev, 64);

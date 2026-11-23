@@ -439,6 +439,17 @@ Expected: "Done waiting for IOKitWaitQuiet()" after MtkBtFw's load (about 5 s af
 `HCI Transport is set to USB` from the first bluetoothd PID, no `failed to open BT_ACL_If`, no UART timeout. Cost: anything
 else that waits for IOKit quiet in that window waits up to about 5 s longer (bounded at 30 s).
 
+**Side effect to measure.** configd's InterfaceNamer also waits for IOKit quiet: on the 11-23 13:15 boot it logged
+`*QUIET*` at 13:15:27.070, the same instant bluetoothd's wait ended. en0 (RMNE) and en1 (Wi-Fi) are named before that
+(23.23 / 23.34) and are not delayed; `*QUIET&NAMED*` moves with the busy hold, about +3.7 s (5.2 s load minus the
+1.4-2.4 s it used to take to go quiet). Commands for the first boot (60 s window from kern.boottime, compact output):
+```
+B=$(sysctl kern.boottime | awk -F'[ ,]+' '{for(i=1;i<=NF;i++) if($i=="sec") print $(i+2)}'); S=$(date -r $B '+%Y-%m-%d %H:%M:%S'); E=$(date -r $((B+60)) '+%Y-%m-%d %H:%M:%S')
+/usr/bin/log show --start "$S" --end "$E" --style compact --predicate '(process == "loginwindow" AND eventMessage CONTAINS "LoginwindowUIShown") OR category == "InterfaceNamer" OR (process == "bluetoothd" AND (eventMessage CONTAINS "IOKitWaitQuiet" OR eventMessage CONTAINS "Transport is set" OR eventMessage CONTAINS "failed to appear")) OR (process == "kernel" AND eventMessage CONTAINS "BT_ACL")'
+```
+Read: `LoginwindowUIShown` minus T0 (T0 = kern.boottime - `machdep.tsc.nanotime.tsc_base` / `machdep.tsc.frequency`; baseline
+14.4 s), `addTimestamp: en0` / `en1` (naming), `*QUIET*` and `*QUIET&NAMED*` (should now follow MtkBtFw's load).
+
 **Undo:** the 0.2.0 kext from `EFI/OC/Kexts-backup`, or boot once with `mtkbtbusy=0`.
 
 ## Pieces
