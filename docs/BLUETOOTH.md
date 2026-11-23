@@ -458,6 +458,10 @@ silent, subsystem reset and full reload). The hold is the wrong tool; 0.4.0 remo
 
 ## MtkBtFw 0.4.0: device-level load, USB transport by name, strict warm-restart probe (2026-11-23, not installed yet)
 
+**Parked (2026-11-23).** The owner accepts the 0.3.1 login cost ("booting 15 s slower is no problem"). 0.3.1 stays
+installed with the busy hold on. 0.4.0 is kept on this branch, built but never run, in case the login delay or the
+bluetoothd race matters again.
+
 **(b) Device-level load.** The personality matches the `IOUSBHostDevice` 0489:e11e (idVendor + idProduct, USB match score
 90000) instead of interface 0. AppleUSBHostCompositeDevice matches this device by class EF/02/01 (score 60000, seen in
 ioreg) and so no longer runs; MtkBtFw does its job:
