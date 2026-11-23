@@ -3785,3 +3785,57 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 - **Not yet measured:**
   - A PIN-paired transfer (non-contact) to compare with §10.88's 64 s.
   - A larger file, for throughput.
+
+### 10.91 The 15.6 s ASK of §10.90 is not the receiver: AWDL group frames went out without `MT_TXD3_BCM` (core 61F8DB1B, not installed)
+
+The owner corrected §10.90: the receiver accepted as soon as the prompt appeared, so the 15.6 s ASK is a network bottleneck.
+
+**ASK timeline (`build/ask-1342.txt`, sharingd + mDNSResponder + IO80211Family):**
+
+| Time | Event | Gap |
+|---|---|---|
+| 31.483 | `ASK START`; `C1` app_svc resolution (`com.apple.sharingd.AirDrop`) | |
+| 34.178 | resolver `dns_stall @2.0 s`, then `start_bonjour @2.68 s` | 2.7 s |
+| 34.179 | `Starting blocking AWDL trigger browser` `_asquic._udp.local`; Family `updateLocalRequests: Adding PTR` | |
+| 34.250 / 34.351 | our mDNS queries out on awdl0 (36 B, 288 B) | |
+| 34.4 – 40.98 | **no multicast received on awdl0 at all** | |
+| 40.990 / 41.091 | our queries again | |
+| 41.990 | `AWDL trigger browse found endpoint` | **7.8 s** |
+| 42.013 | QUIC + TLS to the peer over awdl0 | |
+| 47.119 | `ASK END` | 5.1 s |
+
+The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 41.990–41.995, and pairs at 42.587 and 43.104.
+
+**Driver counters (same boot, `m3-log` / `itlmt-awdl`):**
+- `awdl txfree: grp=10/58 tries=5656`. AWDL multicast data is reported failed, and AWDL frames average about 15 attempts each.
+- `drx=1471/280/0/0/1191`: 81 % of the data frames the peer sent us were 802.11 retries of a frame already delivered.
+- `rxstat … full=0`: the core's AWDL RX ring never overflowed. The native side drains it every 5 ms, so the bursts are not created on our receive path.
+
+**Cause (from the code, checked against Linux `mt7925_mac_write_txwi_80211`).**
+- Linux sets `MT_TXD3_BCM` (TXD3 bit 4) whenever addr1 is group-addressed:
+  `txwi[3] |= FIELD_PREP(MT_TXD3_BCM, multicast)` with `multicast = is_multicast_ether_addr(hdr->addr1)`.
+- `m3Tx` never set it. Its comment assumed every group frame is a station ToDS frame (RA = BSSID, group DA in addr3). That holds for infrastructure, not for AWDL. In AWDL:
+  - every PSF and MIF is an action frame to `ff:ff:ff:ff:ff:ff`;
+  - mDNS and other multicast data carry `33:33:…` in addr1.
+- So the MAC waited for an ACK that a group frame never gets. It sent each of these frames up to `REM_TX_COUNT` (15) more times at 6 Mb/s, with the backoff doubling each time.
+- All of them go out on ALTX0, the same queue as AWDL unicast data. Each window therefore opened with our own PSF/MIF retrying for tens of ms. The mDNS queries and the QUIC/TLS unicast waited behind them, and often for the next window.
+- Peers also received every PSF/MIF up to 16 times.
+
+**Fix (core):** `m3Tx` raises `MT_TXD3_BCM` when addr1 is group-addressed, as Linux does.
+- Infrastructure frames are unchanged: their addr1 is the BSSID.
+- Broadcast management frames (PSF, MIF, deauth) and AWDL multicast data now go out once.
+
+**Open:** the 81 % RX retries (the peer gets no ACK from us for its unicast) are a separate question.
+- §10.39 had brought them down to about 30 % with OMAC 1.
+- Linux binds a second OMAC with `BSS_INFO_UPDATE` basic after `DEV_INFO` (`mt76_connac_mcu_uni_add_dev`). We send only the `DEV_INFO`.
+- Check this after the BCM fix, because the retries may also be the peer's frames colliding with our retry bursts.
+
+**Check after install:**
+1. `awdl txfree: grp=` is mostly ok, and `tries` per frame is about 1 for group frames.
+2. `drx` dup share.
+3. Send AirDrop to the nearby MacBook again and measure `ASK START` → `ASK END`, the trigger-browse wait (`Blocking resolve` → `found endpoint`), and `UPLOAD`.
+
+| Kext | UUID | Replaces |
+|---|---|---|
+| core | `61F8DB1B-6FE5-39A4-BD49-2728E6E90C73` | `B9E6878A` |
+| native | unchanged `52A0E786` | — |

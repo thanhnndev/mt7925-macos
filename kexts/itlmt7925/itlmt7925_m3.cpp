@@ -1571,8 +1571,12 @@ bool itlmt7925::m3Tx(const uint8_t *frame, uint32_t len, uint8_t type, uint8_t s
     // Group-addressed data: default goes out on the AP wcid (1) - the path that has worked on hardware, where the
     // hardware evidently picks the BSS group key for the frame anyway. itl_grp19=1 switches to mt76's choice (the BSS
     // wcid 19, mvif->sta.deflink.wcid, the wcid the group key is installed on) together with its STA_REC records.
-    // MT_TXD3_BCM stays clear either way: mt7925_mac_write_txwi_80211 raises it only when addr1 (the RA) is group
-    // addressed, which never happens for these ToDS frames (RA = AP BSSID, DA = addr3).
+    // MT_TXD3_BCM follows mt7925_mac_write_txwi_80211: set when addr1 (the RA) is group addressed. Station ToDS frames
+    // never have it (RA = AP BSSID, DA = addr3), but AWDL frames do: the PSF/MIF action frames go to ff:ff:ff:ff:ff:ff and
+    // AWDL multicast data (mDNS) to 33:33:... in addr1. Without BCM the MAC waited for an ACK that a group frame never gets
+    // and sent each one REM_TX_COUNT (15) more times with growing backoff (§10.91: TXFREE grp fail with ~15 tries each),
+    // holding ALTX0 and the window's airtime while the AWDL unicast queued behind it.
+    bool raGrp = len >= 10 && (frame[4] & 1);
     bool grp = type == 2 && len >= 18 && (frame[16] & 1);
     uint16_t wcid = (grp && grpWcid19) ? M3_BMC_WCID : M3_AP_WCID;
     put32(w + 0, (len + 32) | (0u << 23) | ((uint32_t)o.qidx << 25));         // TX_BYTES | PKT_FMT=CT | Q_IDX
@@ -1582,7 +1586,7 @@ bool itlmt7925::m3Tx(const uint8_t *frame, uint32_t len, uint8_t type, uint8_t s
                      (o.rateAdapt ? 0u : (1u << 31)));
     put32(w + 8, ((uint32_t)type << 4) | subtype);
     // REM_TX_COUNT=15, BA_DISABLE unless this frame may be aggregated, PROTECT_FRAME, SN_VALID + SEQ for a host-chosen sequence number
-    put32(w + 12, (15u << 11) | (o.aggr ? 0u : (1u << 28)) | (o.protect ? 2u : 0) |
+    put32(w + 12, (15u << 11) | (o.aggr ? 0u : (1u << 28)) | (o.protect ? 2u : 0) | (raGrp ? (1u << 4) : 0u) |   // BCM
                       (o.sn >= 0 ? ((1u << 31) | ((uint32_t)(o.sn & 0xfff) << 16)) : 0u));
     if (grp && stGrpTx < 6) { stGrpTx++; m3log("tx grp len=%u wc=%u", len, wcid); }
     put32(w + 20, o.rateAdapt ? 0u : (o.pid | (1u << 10)));      // PID (3 = MT_PACKET_ID_FIRST), TX_STATUS_HOST: report completion (none for rate-adapted data)
