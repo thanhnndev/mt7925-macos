@@ -68,3 +68,15 @@ class IO80211VirtualInterface;
 void IO80211VirtualInterface_bpfTapInput(IO80211VirtualInterface *self, IO80211Buffer *buf, unsigned int type, void *hdr,
                                          unsigned long hdrLen)
     __asm__("__ZN23IO80211VirtualInterface11bpfTapInputEP13IO80211BufferjPvm");
+
+// §10.95: the two exported, non-virtual setters behind IO80211PeerManager::getLastUnicastRx/TxLinkActivity() (25G332
+// 0xffffff8002256d6a / 0xffffff8002264862). The Family moves these timestamps itself only for data that enters through
+// IO80211VirtualInterface::inputPacket (RX) or that the driver reports with logSkywalkTxReqPacket(..., true) (TX); our
+// AWDL data path uses the Skywalk queues directly, so without these calls the Family sees awdl0 idle for its whole life
+// ("AWDL on for more than 30 seconds with no TX (...) or RX (...)", monitorAWDLState's 2 s idle test). Argument:
+// mach_absolute_time(). Only these two members are declared; the object is the AWDL peer manager the Family owns.
+class IO80211PeerManager {
+public:
+    void setLastUnicastRxLinkActivity(unsigned long long t);
+    void setLastUnicastTxLinkActivity(unsigned long long t);
+};

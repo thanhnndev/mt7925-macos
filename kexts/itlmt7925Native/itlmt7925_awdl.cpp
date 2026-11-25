@@ -85,6 +85,16 @@ static uint32_t awdlApOnly()
     }
     return v;
 }
+// §10.95: report unicast link activity to the peer manager (boot-arg itlmt_awdl_act=0 turns it off).
+static uint32_t awdlActOn()
+{
+    static uint32_t v = 0xffffffff;
+    if (v == 0xffffffff) {
+        uint32_t b = 1;
+        v = PE_parse_boot_argn("itlmt_awdl_act", &b, sizeof(b)) ? (b ? 1 : 0) : 1;
+    }
+    return v;
+}
 static const uint32_t kAwdlEawWinMs = 64;                 // a whole EAW (4 x 16 TU = 65.5 ms) less 1.5 ms of margin
 // §10.65: consecutive present EAWs on one channel are one window (one ROC acquire, one abort), at most this many. Back-to-back
 // windows of one EAW each could not be met (the setup takes ~35 ms, the gap between them is 1.5 ms: avg 39 ms late), and
@@ -478,6 +488,8 @@ private:
     uint8_t awdlLsnCh = 0, awdlLsnSlot = 0, awdlLsnRun = 1;   // awdlLsnRun: EAWs the armed window covers (§10.65)
     uint8_t awdlApCh = 0;                         // §10.80: the station's channel while linked (0 = not linked), cached
     uint32_t awdlApChMs = 0, awdlApOnlyHits = 0;
+    uint32_t awdlActRx = 0, awdlActTx = 0;          // §10.95: unicast link activity reported to the peer manager
+    void awdlLinkActivity(bool tx);
     uint8_t awdlApChannel();
     uint8_t awdlLsnNextCh = 0;                    // §10.79: channel of the present EAW right after the run (0 = none / same)
     uint32_t awdlLsnCut = 0;                      // §10.79: windows shortened so the next one can be set up in time
@@ -1064,7 +1076,7 @@ void itlmt7925AwdlInterface::awdlPublishState()
     char b[900];
     snprintf(b, sizeof(b),
              "role=%u chg=%u master=%02x%02x%02x%02x%02x%02x top=%02x%02x%02x%02x%02x%02x eaws=%u posted=%u fail=%u end=%u/%u late=%u syncs=%u adj=%d psf=%u/%u mif=%u/%u oob=a%u/o%u/s%u/x%u "
-             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d cut=%u/%u aponly=%u/%u/%u",
+             "tlv4=%u/%u peer4=%u rx=%u norssi=%u weak=%u slots=%u%s ver=%u lsn=%u/%u/%u ch=%u ptl=%u align=%u/%u dp=%u dtx=%u/%u/%u/%u/%u/%u drx=%u/%u/%u/%u/%u pm=%u/%u/%u last=%02x%02x%02x%02x%02x%02x@%u band=%u/%u rssi24=%d..%d rssi5=%d..%d cut=%u/%u aponly=%u/%u/%u act=%u/%u",
              (unsigned)awdlRole, (unsigned)awdlRoleChanges, awdlMasterAddr[0], awdlMasterAddr[1], awdlMasterAddr[2],
              awdlMasterAddr[3], awdlMasterAddr[4], awdlMasterAddr[5], awdlTopMaster[0], awdlTopMaster[1], awdlTopMaster[2],
              awdlTopMaster[3], awdlTopMaster[4], awdlTopMaster[5], (unsigned)awdlTlEaws, (unsigned)awdlTlPosted, (unsigned)awdlTlPostFail, (unsigned)awdlTlEndPosted,
@@ -1080,7 +1092,8 @@ void itlmt7925AwdlInterface::awdlPublishState()
              (unsigned)awdlDrxNotUs, (unsigned)awdlDrxFail, (unsigned)awdlDrxDup, (unsigned)awdlPmSelf, (unsigned)awdlPmUs, (unsigned)awdlPmOther,
              awdlPmLast[0], awdlPmLast[1], awdlPmLast[2], awdlPmLast[3], awdlPmLast[4], awdlPmLast[5], (unsigned)awdlPmSeq,
              (unsigned)awdlRxBand[0], (unsigned)awdlRxBand[1], (int)awdlRxRssiMin[0], (int)awdlRxRssiMax[0],
-             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1], (unsigned)awdlLsnCut, (unsigned)awdlGapMs(), (unsigned)awdlApOnly(), (unsigned)awdlApCh, (unsigned)awdlApOnlyHits);
+             (int)awdlRxRssiMin[1], (int)awdlRxRssiMax[1], (unsigned)awdlLsnCut, (unsigned)awdlGapMs(), (unsigned)awdlApOnly(), (unsigned)awdlApCh, (unsigned)awdlApOnlyHits,
+             (unsigned)awdlActRx, (unsigned)awdlActTx);
     setProperty("itlmt-awdl", b);
 }
 
@@ -2070,7 +2083,7 @@ uint32_t itlmt7925AwdlInterface::awdlSubmitData(IOSkywalkPacket *const *packets,
             awdlDataSeq++;
             ItlNativeAwdlDataTx tx = { 1, f, 40 + (len - 14) };
             IOReturn r = coreDev->callPlatformFunction(ITL_NATIVE_AWDL_DATA_TX, false, &tx, nullptr, nullptr, nullptr);
-            if (r == kIOReturnSuccess) { sent = true; awdlDtxQueued++; }
+            if (r == kIOReturnSuccess) { sent = true; awdlDtxQueued++; if (!(e[0] & 1)) awdlLinkActivity(true); }
             else if (r == kIOReturnNoResources) { full = true; awdlDtxFull++; }
             else if (r == kIOReturnNotReady) awdlDtxStale++;    // no AWDL window on the air: dropped, not retried (§10.36)
             else awdlDtxBad++;
@@ -2085,6 +2098,19 @@ uint32_t itlmt7925AwdlInterface::awdlSubmitData(IOSkywalkPacket *const *packets,
         awdlTxPending[awdlTxPendingN++] = p;
     }
     return used;
+}
+
+// §10.95: the timestamps the Family's getLastUnicastRx/TxLinkActivity() return (see io80211_buffer_min.h). The peer manager
+// is [[this+0x120]+0x28], as in awdlDeliverRx().
+void itlmt7925AwdlInterface::awdlLinkActivity(bool tx)
+{
+    if (!awdlActOn()) return;
+    void *pm = *(void **)((uint8_t *)this + 0x120);
+    if (pm) pm = *(void **)((uint8_t *)pm + 0x28);
+    if (!pm) return;
+    uint64_t now = mach_absolute_time();
+    if (tx) { ((IO80211PeerManager *)pm)->setLastUnicastTxLinkActivity(now); awdlActTx++; }
+    else { ((IO80211PeerManager *)pm)->setLastUnicastRxLinkActivity(now); awdlActRx++; }
 }
 
 // Air -> stack. The 802.11 data frame becomes an Ethernet frame (DA = addr1, SA = addr2, ethertype from the AWDL data header).
@@ -2143,6 +2169,7 @@ void itlmt7925AwdlInterface::awdlDeliverData(const uint8_t *frame, uint32_t len)
         return;
     }
     awdlDrxUp++;
+    if (!(da[0] & 1)) awdlLinkActivity(false);
     if (awdlDrxUp <= 4)
         itlmtTrace(getController(), "awdl:drx up len=%u sa=%02x:%02x:%02x:%02x:%02x:%02x et=%02x%02x", elen, sa[0], sa[1], sa[2],
                    sa[3], sa[4], sa[5], d[12], d[13]);

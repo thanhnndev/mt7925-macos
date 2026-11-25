@@ -3949,3 +3949,78 @@ The retries are not the fix. The fix is to be in the same tree: we must take the
    - why a −85 dBm master is not adopted, when the devices next to us do adopt it.
 2. Which driver report feeds the "no TX / no RX" timestamps. If it is our data path's statistics, the Family may hold a low-power schedule for that reason.
 3. RSSI level check: the MacBook read −45 at "laon" (§10.90) but −54..−77 on later boots. Compare our RCPI decode on the AWDL path with the station path for the same AP.
+
+### 10.95 IO80211Family (25G332) election and link-activity rules; the Family never saw awdl0 traffic → unicast activity reported (native 149441A4, not installed)
+
+Source: disassembly of the IO80211Family fileset entry from this Mac's `BootKernelExtensions.kc` (25G332, original vmaddrs, read-only). REA's decompilers were unavailable, so `objdump` was used with the symbol table.
+
+**Link activity (the "no TX / no RX" of §10.94).**
+- `AWDLStateDump` (0x…222fe28) logs the idle message from `IO80211PeerManager::getLastUnicastTxLinkActivity` / `…RxLinkActivity` (0x…22647da / 0x…2264208). Both return `mach_absolute_time` stamps held in the manager.
+- Writers of the **RX** stamp:
+  - `IO80211PeerManager::skywalkInputPacket`, reached only through `IO80211VirtualInterface::inputPacket`;
+  - `setLastUnicastRxLinkActivity(u64)`.
+- Writers of the **TX** stamp:
+  - `IO80211VirtualInterface::logSkywalkTxReqPacket(…, true)` (vtable 0xb60), which the driver must call;
+  - `setUnicastTxQueueTimestamp()`;
+  - `setLastUnicastTxLinkActivity(u64)`.
+- Nothing inside the Family calls the TX ones.
+- Our AWDL data goes straight through the Skywalk queues, so both stamps stayed at the AWDL enable time.
+- `monitorAWDLState` treats > 2000 ms (mgr+0x9144) without TX and RX as idle. It then:
+  - drops the AirDrop NAN override;
+  - leaves real time with "Transitioning back to InfraAssist mode".
+
+  So during an AirDrop transfer the Family could treat awdl0 as idle.
+
+**Election (`runElection` 0x…21e9064, `runParentElection` 0x…21f12cc).**
+- **TLV 0x18 body:**
+
+  | Offset | Field |
+  |---|---|
+  | +0 | root |
+  | +6 | parent |
+  | +0xc | RLFC (master counter) |
+  | +0x10 | HC |
+  | +0x14 | RMet |
+  | +0x18 | SMet |
+  | +0x1c | election ID (must be equal, 0 by default) |
+  | +0x24 | self counter |
+
+  Ours and the remote's both carry ID 0. The "75935" of §10.94 is the remote's RLFC and self counter; neither is ever compared with ourselves.
+- **Candidate choice:**
+  - between different roots: the higher RMet wins, then the larger root MAC;
+  - against ourselves: our SMet > best RMet means "I am Root Node".
+
+  With 529 against 510, we are the correct root. The nearby peers should adopt us, but only if we qualify at their end.
+- **`isPeerQualifiedForElection` (0x…21efea8):**
+  1. An action frame from the peer within the last **3000 ms**.
+  2. Equal election ID.
+  3. Reachability:
+     - ROUTABLE qualifies;
+     - OBSERVED needs RSSI ≥ −65 (dual-band, 5 GHz) or ≥ −45 (2.4 GHz only);
+     - anything else does not qualify.
+- **`isPeerSafeForElection`:**
+  - version ≥ 0x33;
+  - RLFC ≠ 0;
+  - no loop through us;
+  - AW parameters 16/16/16;
+  - a stale-root blacklist with a 9999 ms grace.
+- **Reachability (`isPeerRoutable`):**
+  - 2.4 GHz only and below −45 dBm: "outside bubble".
+  - OBSERVED → ROUTABLE: ≥ 2 action frames, then either RSSI ≥ −55, or the per-type threshold (−60/−55/−65) held for 1 s.
+  - NO ROUTE → ROUTABLE: ≥ −62.
+- **Peer expiry (`shouldRemovePeerFromNDP`):** a ROUTABLE peer goes after **6000 ms** without action frames. "No Action frames for" is logged past 2000 ms.
+
+**What this explains.**
+- The flicker of §10.92–§10.94 is the 6 s expiry on our side and the 3 s qualification window on theirs.
+- We and the nearby devices run on different timelines, so frames meet only by chance. Our PSF/MIF went out up to 16 times before §10.91, and that raised the chance (§10.93).
+- The proper outcome under these rules is that the nearby devices adopt us. That needs our action frames to reach them at least every 3 s and enough of them to make us ROUTABLE, on the channels and at the times they listen.
+
+**Change (native 149441A4).**
+- Unicast awdl0 data in either direction calls `IO80211PeerManager::setLastUnicastRxLinkActivity` / `setLastUnicastTxLinkActivity(mach_absolute_time())` on the AWDL peer manager (`[[this+0x120]+0x28]`).
+- Both are exported, non-virtual and resolved against this Mac's KC (`tools/check_kext_links.py`).
+- Boot-arg `itlmt_awdl_act=0` turns it off.
+- `itlmt-awdl` gains `act=<rx>/<tx>`.
+
+**Check after install:** during an AirDrop send, `act=` grows, and `AWDL on for more than 30 seconds with no TX … or RX …` no longer appears. The time from ASK to transfer should not get worse.
+
+**Open (the flicker itself):** our presence on the peers' timelines. Find where our PSF/MIF actually go out (channel and time) against the nearby peers' sequences; the next instrument is a per-window TX log. `itl_awdlbcm=2` stays available as a run-time fallback.
