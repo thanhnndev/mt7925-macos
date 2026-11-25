@@ -84,3 +84,17 @@ the binary that ran in two bytes: the build date in Lilu's version string (`2026
   vit9696, BSD 3-Clause). Its condition 2 asks a binary redistribution to reproduce Lilu's copyright notice, conditions
   and disclaimer: that is `LICENSE.Lilu.txt`. Lilu's name may not be used to endorse this project.
 - Third-party details: `NOTICE.md`.
+
+## Credits
+
+| Project | What it gave this one |
+|---|---|
+| MediaTek firmware from [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek/mt7925) | The Bluetooth firmware embedded in `MtkBtFw.kext`, under `fw/LICENCE.mediatek` (not the Clear BSD License) |
+| Linux `btmtk` / `btusb` (`drivers/bluetooth`) | The Bluetooth firmware download procedure that `MtkBtFw` follows (re-written, not copied) |
+| [acidanthera/Lilu](https://github.com/acidanthera/Lilu) (vit9696 and contributors, BSD-3-Clause) | `BtLeDlFix` is a Lilu plugin: built against Lilu's headers and its `plugin_start.cpp`; needs `Lilu.kext` at run time |
+| [acidanthera/BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM) (`BlueToolFixup.kext`) | Needed next to the Bluetooth kexts on macOS 12 and later; `BtLeDlFix` uses the same kind of hook. Not included |
+| [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) | Kernel headers and libraries at build time; not redistributed |
+| [OpenCore](https://github.com/acidanthera/OpenCorePkg) (acidanthera) | The boot loader that injects the kexts |
+| [Claude](https://claude.com/claude-code) (Anthropic) | Wrote most of the code and documentation, directed and tested by thanhnndev |
+
+Not used: no code from `itlwm`, `AirportItlwm` or OpenIntelWireless.

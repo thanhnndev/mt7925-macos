@@ -95,4 +95,5 @@ rồi tách sang đây. Phần Wi-Fi được giữ nguyên lịch sử commit; 
 
 Code: [Clear BSD](LICENSE). Lớp phần cứng MT7925 được viết lại dựa theo driver Linux `mt76` (© MediaTek, BSD-3-Clause-Clear).
 Firmware trong `fw/` theo giấy phép riêng của MediaTek. Dự án clean-room: không dùng code từ itlwm, AirportItlwm, OWL hay
-OpenDrop (GPL). Xem [NOTICE.md](NOTICE.md).
+OpenDrop (GPL). Xem [NOTICE.md](NOTICE.md) và phần [Credits](README.md#credits) trong bản tiếng Anh (mt76 và firmware của MediaTek,
+Lilu, BrcmPatchRAM, MacKernelSDK, OpenCore, các bài báo AWDL của Seemoo Lab, và Claude của Anthropic, tác giả phần lớn mã nguồn).

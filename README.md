@@ -112,9 +112,24 @@ This driver was developed inside [thanhnndev/ga403wm-hackintosh](https://github.
 2026-10-26. The Wi-Fi part was moved here with its full commit history; the Bluetooth part was added on 2026-11-02 (its earlier
 history stays in that repository). Older links and issues live there.
 
-## License and credits
+## Credits
 
-Code: [Clear BSD License](LICENSE). The MT7925 hardware layer is re-implemented from the Linux `mt76` driver (© MediaTek,
-BSD-3-Clause-Clear). The Bluetooth download procedure follows the Linux `btmtk` driver. The firmware in `fw/` (Wi-Fi and Bluetooth) is under MediaTek's own license (`fw/LICENCE.mediatek`). The project is clean-room:
-no code from `itlwm`, `AirportItlwm`, OWL or OpenDrop (all GPL). Apple-side layouts come from read-only inspection of
-macOS binaries. Details: [NOTICE.md](NOTICE.md).
+| Project | What it gave this one |
+|---|---|
+| Linux [`mt76`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/wireless/mediatek/mt76) driver (`mt7925`, `mt76_connac`, `mt792x`), Copyright (C) MediaTek Inc. and the mt76 contributors, BSD-3-Clause-Clear | The MT7925 hardware layer is re-implemented from it: register map, DMA rings, MCU / UNI commands, firmware download, TXD / RXD layouts, the connect path. Parts are line-by-line ports and carry MediaTek's copyright |
+| MediaTek firmware from [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek/mt7925) | The Wi-Fi and Bluetooth firmware embedded in `itlmt7925.kext` and `MtkBtFw.kext`, under `fw/LICENCE.mediatek` (not the Clear BSD License) |
+| Linux `btmtk` / `btusb` (`drivers/bluetooth`) | The Bluetooth firmware download procedure that `MtkBtFw` follows (re-written, not copied) |
+| [acidanthera/Lilu](https://github.com/acidanthera/Lilu) (vit9696 and contributors, BSD-3-Clause) | `BtLeDlFix` is a Lilu plugin: built against Lilu's headers and its `plugin_start.cpp`; needs `Lilu.kext` at run time |
+| [acidanthera/BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM) (`BlueToolFixup.kext`) | Needed next to the Bluetooth kexts on macOS 12 and later; `BtLeDlFix` uses the same kind of hook. Not included |
+| [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) | Kernel headers and libraries at build time; not redistributed |
+| [OpenCore](https://github.com/acidanthera/OpenCorePkg) (acidanthera) | The boot loader that injects the kexts |
+| Seemoo Lab's AWDL papers ("One Billion Apples' Secret Sauce", MobiCom 2018; "A Billion Open Interfaces for Eve and Mallory", USENIX Security 2019) and the open AWDL implementations [OWL](https://github.com/seemoo-lab/owl) and [OpenDrop](https://github.com/seemoo-lab/opendrop), and `t4t5/owly` for the frame layout | Protocol facts for the AWDL / AirDrop work (frame formats, election, timing). Read for facts only; no code copied |
+| [Claude](https://claude.com/claude-code) (Anthropic) | Wrote most of the code and documentation, directed and tested by thanhnndev |
+
+Not used: no code from `itlwm`, `AirportItlwm` or OpenIntelWireless. Apple-side class layouts come from read-only
+inspection of macOS binaries. File-by-file origins and licences: [NOTICE.md](NOTICE.md).
+
+## License
+
+Code: [Clear BSD License](LICENSE). The firmware in `fw/` (Wi-Fi and Bluetooth) is under MediaTek's own license
+(`fw/LICENCE.mediatek`). Details: [NOTICE.md](NOTICE.md).
