@@ -4024,3 +4024,6 @@ Source: disassembly of the IO80211Family fileset entry from this Mac's `BootKern
 **Check after install:** during an AirDrop send, `act=` grows, and `AWDL on for more than 30 seconds with no TX … or RX …` no longer appears. The time from ASK to transfer should not get worse.
 
 **Open (the flicker itself):** our presence on the peers' timelines. Find where our PSF/MIF actually go out (channel and time) against the nearby peers' sequences; the next instrument is a per-window TX log. `itl_awdlbcm=2` stays available as a run-time fallback.
+
+- **Installed 2026-11-25 11:23** with the owner's OK. Backup of native 52A0E786: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261125-112355`. Core stays D2CAADD0.
+- **Undo:** `cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad95 && mv Kexts-backup/itlmt7925Native.kext.20261125-112355 Kexts/itlmt7925Native.kext`
