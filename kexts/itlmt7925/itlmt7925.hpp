@@ -27,6 +27,8 @@ struct M3TxOpt {
     int sn = -1;              // >= 0: sequence number chosen by the host (TXD3.SN_VALID)
     bool aggr = false;        // leave BA_DISABLE clear: the frame may be sent in an A-MPDU
     bool *full = nullptr;     // set: no staging slot / descriptor free, the caller keeps the frame (Ethernet output queue)
+    uint8_t pid = 3;          // TXD5.PID echoed in the TX status (TXS) record: 3 host frames, 4/5 AWDL unicast/group data
+    uint8_t omac = 0;         // TXD1.OWN_MAC: 0 the station address, 1 the AWDL address (awdlOwnMacApply)
 };
 
 struct itl_dma_buf {
@@ -110,12 +112,13 @@ private:
     // M2 (boot-arg itlmt_m2=1): UNI commands, interface setup, scan, beacon parsing
     bool m2On = false;
     int  uniSend(uint8_t cid, const void *payload, size_t plen, bool query, uint8_t *evOut, size_t evMax,
-                 uint32_t *evLen, uint32_t timeoutMs);
+                 uint32_t *evLen, uint32_t timeoutMs, bool noWait = false);
     bool ringPeek(itl_ring &r, const uint8_t **data, uint32_t *len, int *bi);
     void ringRelease(itl_ring &r, int bi);
     void rxDataPoll();
     void rxParseFrame(const uint8_t *p, uint32_t len);
     void rxFrameDump(const uint8_t *p, uint32_t len);
+    bool awdlRxData(const uint8_t *p, uint32_t len);    // AWDL data frame heard in an AWDL window (§10.33)
     void m2log(const char *fmt, ...);
     void m2State(const char *tag);
     uint32_t fwLogCnt = 0;
@@ -146,11 +149,31 @@ private:
     void m3Publish(const char *stage);
     int  m3Run();
     void m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch);
-    int  m3Cmd(uint8_t cid, const void *payload, size_t plen, const char *name);
+    int  m3Cmd(uint8_t cid, const void *payload, size_t plen, const char *name, bool noWait = false);
     int  m3HwPrep();
     void ctlPoll();                          // link loop: take run-time control requests (setProperties)
     enum M3BssOp { M3_BSS_ADD, M3_BSS_ASSOC, M3_BSS_REMOVE };
     int  m3Bss(M3BssOp op);
+    uint8_t awdlBcm = 3;                     // itl_awdlbcm (§10.91): MT_TXD3_BCM for group-addressed addr1. bit 0 = management (PSF/MIF), bit 1 = data
+    uint8_t awdlOmac1 = 1;                   // itl_awdlomac: 1 = AWDL data goes out with TXD1.OWN_MAC = 1 (the AWDL address, once programmed), 0 = OMAC 0
+    // TX status records (PKT_TYPE_TXS, docs/ROADMAP-AWDL.md §10.53), by PID: [0] host frames (3), [1] AWDL unicast data (4),
+    // [2] AWDL group data (5), [3] other. ok = TXS0 ACK_ERROR_MASK clear; err[] by which of its bits was set (queue / RTS / ACK).
+    // Indexed by PID & 7: 3 host frames, 4 AWDL unicast to a peer not heard in this window, 5 AWDL group, 6 AWDL unicast to a
+    // peer heard in this window. late = a TXS for AWDL data that arrived after its window had ended (sent on the wrong channel).
+    uint32_t txsOk[8] = {}, txsFail[8] = {}, txsErr[3] = {}, txsN = 0, txsLogged = 0, txsPkts = 0, txsLate = 0;
+    uint32_t txsUcBand[2][2] = {};
+    // AWDL data results from TXFREE (data frames get no TXS record on this chip; mt7925_mac_tx_free reads the header word's
+    // STAT (29:28, non-zero = failed) and COUNT (27:24, attempts) for the MSDUs that follow it). By PID 4..6 (index - 4).
+    uint32_t tfOk[3] = {}, tfFail[3] = {}, tfTries = 0, tfLate = 0, tfBand[2][2] = {}, tfLogged = 0;               // AWDL unicast TXS by band (0 = 2.4, 1 = 5 GHz) and result (0 ok, 1 fail)
+    uint32_t awdlDataInFlight = 0;               // AWDL data frames handed to the hardware whose TXS has not come back
+    uint32_t awdlWinSeq = 0;                     // granted AWDL windows so far (a peer "heard in this window" carries this value)
+    uint32_t awdlTxGuardHeld = 0, awdlDrainWaitMs = 0, awdlDrainTimeout = 0;
+    struct AwdlPeerSeen { uint8_t mac[6]; uint8_t ch; uint32_t win; };
+    AwdlPeerSeen awdlPeers[4] = {};
+    void awdlPeerHeard(const uint8_t *sa);
+    bool awdlPeerInWindow(const uint8_t *da) const;
+    uint32_t awdlDataRxUc = 0, awdlDataRxUcMine = 0;   // AWDL data heard with a unicast DA / with DA = our AWDL address
+    void m3Txs(const uint8_t *p, uint32_t len);
     uint8_t grpWcid19 = 0;                   // itl_grp19: 0 = group TX on the AP wcid (the proven path), 1 = the mt76 BSS wcid 19 + its STA_REC records
     int  m3Clc(const char *cc, uint8_t env);   // CLC power tables from the RAM firmware for country cc
     int  clcSend(const uint8_t *clc, const char *cc, uint8_t env, uint8_t idx);
@@ -161,13 +184,124 @@ private:
     int  m3Edca();                           // per-AC contention parameters from the AP's WMM element (after every BSS_INFO)
     int  m3Sta(uint8_t state, bool newly, uint16_t aid);
     int  m3StaBss();                         // STA_REC_UPDATE for the BSS wcid (19): what mt76 sends on BSS_CHANGED_ASSOC
-    int  m3Roc(bool acquire);
+    // reqtype: 0 JOIN (association, the default), 1 ROC (a timed remain-on-channel, what an AWDL window is); durMs = maxinterval
+    int  m3Roc(bool acquire, int channel = -1, uint8_t reqtype = 0, uint32_t durMs = 5000);
+    // AWDL PSF sync frame handoff (docs/ROADMAP-AWDL.md phase 3): awdlSubmit() copies one frame from the native interface's
+    // setAWDL_SYNC_FRAME_TEMPLATE into this mailbox and awdlSyncTx() runs on the link thread, pushing it out during a ROC
+    // window on the AWDL channel (the firmware has no AWDL channel sequencing of its own).
+    int  awdlSubmit(const uint8_t *frame, uint32_t len, uint8_t channel, uint32_t dwellMs, uint64_t awBaseUs = 0,
+                    uint16_t awBaseSeq = 0, uint32_t awPeriodUs = 0, uint16_t awFlags = 0, const uint8_t *frame2 = nullptr,
+                    uint32_t len2 = 0, uint64_t startUs = 0);
+    struct AwdlTimeline { uint64_t baseUs; uint16_t baseSeq; uint16_t flags; uint32_t periodUs; };
+    bool awdlStampSync(uint8_t *frame, uint32_t len, const AwdlTimeline &tl);   // the sync TLV at the real TX time (§10.28)
+    void awdlSyncTx();
+    int  awdlRxFetch(uint8_t *out, uint32_t cap, uint32_t *outLen, uint32_t *outCh, int8_t *outRssi, uint32_t *outUs);
+    void m3RxFilter(uint32_t fif);
+    void m3Sniffer(bool on, uint8_t ch);
+    void m3SnifferEnable(bool on);
+    void m3SnifferConfig(uint8_t ch);
+    uint32_t awdlRocFrames = 0, awdlBcn = 0;      // frames / beacons heard while the radio was parked on the social channel
+    uint32_t awdlRocOnCh = 0;                     // of those, the ones whose RXD channel really is the parked channel
+    uint32_t awdlRxFc[5] = {};                    // heard during a ROC window: beacons / probe / action / other mgmt / data
+    uint32_t awdlRxDumped = 0;                    // trace budget for the RX descriptor dump (verifies the group layout)
+    // Forensics counters (docs/ROADMAP-AWDL.md §10.22): what the firmware actually hands the host while the radio is parked on
+    // the social channel. awdlOuiHits counts buffers that carry Apple's OUI anywhere, awdlSigHits the ones that carry the AWDL
+    // action header (7f 00 17 f2 08) and awdlBssidHits the ones that carry AWDL's BSSID (00:25:00:ff:94:73). Together they
+    // answer "does the firmware deliver AWDL at all, and where in the buffer does it sit" without guessing an offset.
+    uint32_t awdlOuiHits = 0, awdlSigHits = 0, awdlBssidHits = 0;
+    uint32_t awdlNearMiss = 0;                    // fc == 0xd0 frames whose action header is not AWDL's
+    uint32_t awdlForensics = 0;                   // trace budget for the buffer forensics dump
+    uint8_t awdlQuiet = 0;                        // suppress the per-command ROC/sniffer logging (it evicts the diagnostics)
+    volatile uint8_t awdlRocActive = 0;           // set while a ROC window is open (see awdlSyncTx / rxParseFrame)
+    volatile uint8_t awdlRocCh = 0;               // channel that window is parked on (attribution in the AF log)
+    uint8_t awdlRxFilterDone = 0;                 // the "pass other BSS" RX filter is programmed once per link
+    // 1600 bytes: the PSF with the driver-built sync TLV and the master indication frame with its service TLVs do not fit in
+    // 256 (docs/ROADMAP-AWDL.md §10.29). awdlFrame2 is the MIF sent right after the PSF in the same window (0 = none).
+    uint8_t awdlFrame[1600] = {};
+    volatile uint32_t awdlFrameLen = 0;
+    uint8_t awdlFrame2[1600] = {};
+    volatile uint32_t awdlFrame2Len = 0;
+    uint8_t awdlTxBuf[1600] = {};                 // link-thread snapshots of the two frames (too big for the kernel stack)
+    uint8_t awdlTxBuf2[1600] = {};
+    uint32_t awdlTx2Try = 0, awdlTx2Ok = 0;       // second frame (MIF) transmissions
+    uint32_t awdlAfSeq = 0;                                  // seq_ctrl counter of the AWDL action frames this driver sends
+    volatile uint32_t awdlFrameSeq = 0, awdlFrameDone = 0;
+    uint8_t awdlChannel = 6;
+    uint64_t awdlAwBaseUs = 0;                    // AWDL timeline from the interface (ItlNativeAwdlSync v2): window awdlAwBaseSeq
+    uint16_t awdlAwBaseSeq = 0;                   // starts at host uptime awdlAwBaseUs and windows are awdlAwPeriodUs long
+    uint32_t awdlAwPeriodUs = 0;                  // 0 = no timeline (v1 submission): the frame goes out as handed over
+    uint16_t awdlAwFlags = 0;                     // ItlNativeAwdlSync.flags
+    uint32_t awdlStamped = 0, awdlStampMiss = 0;  // frames whose sync TLV was stamped / frames without one
+    uint32_t awdlDwellMs = 60;
+    // v5 window start (docs/ROADMAP-AWDL.md §10.56): host uptime (us) at which the window's AW begins, 0 = "now". The core
+    // begins the setup (AP null, filter, sniffer, ROC) awdlLeadUs before it - the measured setup-to-grant time - so the radio
+    // is on the channel when the AW opens instead of 10-40 ms into it.
+    uint64_t awdlStartUs = 0;
+    uint32_t awdlLeadUs = 30000, awdlLeadEarly = 0, awdlLeadLateN = 0, awdlLeadStale = 0, awdlLeadWaitMs = 0;
+    uint64_t awdlLeadLateUs = 0;
+    uint32_t awdlLateOnN = 0; uint64_t awdlLateOnUs = 0;   // §10.79: late windows on the AP's channel
+    uint32_t awdlOnChWin = 0;
+    uint64_t awdlPhUs[9] = {};                    // per-phase time of ROC windows (§10.59)
+    uint32_t awdlPhN = 0;                     // windows run on the AP's own channel: no ROC, no AP cost (§10.58)
+    // §10.61: one ROC held across consecutive windows on the same channel (one firmware channel switch for several AWs)
+    uint32_t awdlChainMs = 0;                     // itl_awdlchain: extra off-channel time a held ROC may add (0 = off; §10.63: off by default)
+    uint32_t awdlHoldLog = 0;
+    uint32_t awdlRocClip = 0, awdlRocLateAbort = 0, awdlSoffSlow = 0;
+    // §10.71: idle AWDL duty. awdlPeerLastMs: last AWDL frame from a peer; awdlIdleUntilMs: no off-channel window before this.
+    volatile uint32_t awdlPeerLastMs = 0, awdlIdleUntilMs = 0;
+    uint32_t awdlIdleSkip = 0;
+    uint8_t awdlIdleShare = 9;
+    uint8_t awdlHostPs = 0;
+    volatile uint8_t awdlApPsWake = 0;           // ask the link loop for one PM=0 null to the AP                       // itl_awdlps: 1 = host PM=1/PM=0 null frames around each ROC (before §10.66)
+    uint8_t awdlHeldCh = 0;                       // channel of the ROC kept open for the next window (0 = none)
+    uint32_t awdlHeldOffT0 = 0;                   // nowMs() when the held absence began (duty bookkeeping)
+    uint64_t awdlHeldUntilUs = 0, awdlHeldRocEndUs = 0;
+    uint32_t awdlChainN = 0, awdlChainBreak = 0, awdlChainTimeout = 0;
+    void awdlHeldClose();
+    uint8_t awdlLeadOn = 1;                       // itl_awdllead: 0 = start the setup when the window is due (before §10.56)
+    uint32_t awdlTxTry = 0, awdlTxOk = 0, awdlTxRocFail = 0;
+    uint32_t awdlListenWin = 0;                   // v4 listen-only windows (docs/ROADMAP-AWDL.md §10.32)
+    // Phase 3 RX probe: AWDL action frames heard from other devices during the ROC window (see rxParseFrame). The bytes give
+    // the exact 802.11 wrapper Apple's driver builds around the TLV blob the Family hands over, which is what the transmit
+    // path still has to reproduce.
+    uint32_t awdlAfSeen = 0, awdlAfDumped = 0;
+    // AWDL action frames heard on the social channel, waiting for the AWDL interface to hand them to the peer manager
+    // (phase 3 receive half). Single producer (the RX path) and single consumer (the interface's work loop), so the two
+    // indices are the only shared state.
+    // 1600 bytes: a master indication frame (MIF) carries the service TLVs and is 600-1000+ bytes on the air; 512 cut every
+    // MIF short and the peer manager dropped it as a truncated TLV (docs/ROADMAP-AWDL.md §10.27).
+    struct AwdlRxSlot { uint32_t len; uint32_t ch; int8_t rssi; uint32_t tUs; uint8_t data[1600]; };   // rssi 0 = unknown
+    // 16 slots (§10.33): AWDL data frames share the ring with the action frames, and a TCP exchange arrives in bursts.
+    static const uint32_t kAwdlRxSlots = 16;
+    AwdlRxSlot awdlRxRing[kAwdlRxSlots] = {};
+    uint32_t awdlRxRingFull = 0, awdlDataRx = 0;
+    // AWDL data TX (docs/ROADMAP-AWDL.md §10.33): complete 802.11 AWDL data frames from the AWDL interface, sent by the link
+    // thread inside the next AWDL radio window (listen or PSF), when the radio is on a peer's channel.
+    struct AwdlTxSlot { uint32_t len; uint8_t data[1600]; };
+    static const uint32_t kAwdlTxSlots = 16;
+    AwdlTxSlot awdlDataTxRing[kAwdlTxSlots] = {};
+    volatile uint32_t awdlDataTxHead = 0, awdlDataTxTail = 0;
+    uint32_t awdlDataTxQueued = 0, awdlDataTxSent = 0, awdlDataTxFail = 0, awdlDataTxFull = 0;
+    // Uptime (ms) of the last AWDL radio window; 0 = none yet. A full ring with no window for a second is not backpressure
+    // but "AWDL is not on the air": the frame is refused as stale so the stack drops it instead of retrying (§10.36).
+    uint32_t awdlLastWinMs = 0, awdlDataTxStale = 0;
+    uint32_t awdlLastOnChWinMs = 0;          // §10.89: last window on the AP channel (the AWDL schedule is on it)
+    uint32_t awdlOnChTxCalls = 0, awdlOnChTxFrames = 0;   // §10.89: data flushes from the link loop, outside windows
+    int8_t awdlOnChTxOn = -1;                 // §10.89: boot-arg itlmt_awdl_onchtx (default 1)
+    uint32_t awdlDataRxHdr[3] = {};              // where the AWDL data header sat: 0 rxHdrOff(), 1 elsewhere (sniffer RXV), 2 not 802.11 data
+    int  awdlDataQueue(const uint8_t *frame, uint32_t len);
+    void awdlDataFlush();
+    void awdlDwell(uint32_t dwellMs);
+    volatile uint32_t awdlRxHead = 0, awdlRxTail = 0;
     void m3Pump(uint32_t ms);
     void m3Event(const uint8_t *ev, uint32_t len);
     void m3ParseAp();
     volatile bool rocGrant = false;
+    volatile bool rocWant = false;                  // a ROC grant is expected (set by m3Roc); the event is parsed after link up too
     uint8_t rocTok = 0, rocStatus = 0xff;
+    uint32_t rocEvIgnored = 0;                   // ROC events that were not the grant of the request in flight (§10.52)
     uint8_t m3cipher = 0;                    // 0 = open, 4 = CCMP (BSS_INFO sec TLV)
+    bool m3open = false;                     // the selected network is open: no RSN, no handshake, data unprotected
     uint8_t apSupp = 0, apBasic = 0;         // OFDM rate bitmaps (6,9,12,18,24,36,48,54 -> bit 0..7)
     uint8_t apCck = 0, apBasicCck = 0;       // 2.4 GHz CCK rate bitmaps (1,2,5.5,11 -> bit 0..3)
     uint8_t apRsn[64] = {0};
@@ -191,6 +325,8 @@ private:
     int8_t sarPwr[11];                       // ACPI dynamic SAR limit per mt76 SAR range (0.5 dBm), 127 none; read in m3HwPrep
     uint8_t hwEncap = 0;                     // efuse 0xa71 bits 1:0: selects the CLC tables meant for this module
     char clcCc[3] = {0};                     // country the CLC tables were last sent for
+    char regCc[3] = {'0', '0', 0};           // §10.67: the country in use (the AP's Country IE, else "00" world)
+    void regCountryFromAp();
     // step 4: association complete -> 4-way handshake, keys, Ethernet interface, data path
     bool m3dataOn = false;                   // data frames from the AP are handled (set after association)
     bool m3wantEapol = false;
@@ -205,6 +341,9 @@ private:
     EapolRx m3eapolQueue[kEapolQueue] = {};
     uint32_t m3eapolHead = 0, m3eapolTail = 0, m3eapolDrops = 0;
     bool m3EapolNext();
+    uint8_t m3replay[8] = {0};               // the last EAPOL-Key replay counter accepted from the AP (M3, then group rekeys)
+    uint32_t m3gtkRekey = 0, m3gtkRekeyBad = 0, m3M4Again = 0;
+    void m3EapolOnLink();
     uint8_t m3ptk[48] = {0};                 // KCK(16) KEK(16) TK(16)
     bool m3sleepy = false;                   // m3Pump sleeps instead of spinning once the link is up
     volatile bool m3linkUp = false;
@@ -225,6 +364,34 @@ private:
     FrameRec frRing[kFrRing] = {};
     uint32_t frHead = 0;
     bool recoverWanted = false;
+    // The AWDL interface's own address as a second OMAC (DEV_INFO_UPDATE omac 1), so the MAC hardware ACKs unicast frames
+    // to awdl0: without it every unicast from a peer is retried 7 times and still counted lost (docs/ROADMAP-AWDL.md §10.38).
+    uint8_t awdlOwnAddr[6] = {};
+    bool awdlOwnSent = false;
+    int awdlOwnRc = 1;                            // 1 = not sent yet
+    void awdlOwnMacApply();
+    void awdlOwnMacClear();
+    volatile uint8_t awdlOff = 0, ctlAwdlReq = 0;   // §10.72 itl_awdloff
+    uint8_t regForceWorld = 0;                      // §10.72 itl_ccworld
+    // The last MCU commands (name, rc, uptime ms), dumped when the firmware stops answering (docs/ROADMAP-AWDL.md §10.42).
+    struct McuHist { const char *name; int rc; uint32_t ms; };
+    McuHist mcuHist[24] = {};
+    uint32_t mcuHistN = 0;
+    void mcuHistDump();
+    // AWDL ROC grant latency: <10 / <40 / <80 ms, late (80-300 ms: after the window budget), never granted.
+    uint32_t awdlRocLat[5] = {};
+    // Per band (0 = 2.4 GHz, 1 = 5 GHz): AWDL action frames heard, windows granted, windows never granted. And windows not
+    // opened because their channel is a DFS one (docs/ROADMAP-AWDL.md §10.49).
+    uint32_t awdlAfBand[2] = {}, awdlWinBand[2] = {}, awdlNeverBand[2] = {}, awdlDfsSkip = 0;
+    uint8_t awdlDfsLastCh = 0;
+    uint32_t recoverFailMs = 0;                  // when the last chip recovery failed (0 = none pending): retried while idle
+    uint32_t awdlBackoffUntilMs = 0;             // no AWDL window before this uptime (after a ROC that was never granted)
+    uint32_t awdlNextWinMs = 0;                  // no AWDL window before this uptime: the AP channel gets at least as long as the last absence
+    uint32_t awdlOffMs = 0, awdlOffN = 0;        // measured time off the AP channel (ROC request to the abort returning), windows
+    uint32_t awdlDutySkip = 0;                   // windows not taken because the AP channel had not had its share yet
+    uint32_t awdlPsTx[2] = {};                   // null-data frames to the AP: PM=1 before a window, PM=0 after it
+    void awdlApPs(bool doze);
+    uint32_t m3CmdTimeouts = 0;                   // consecutive MCU command timeouts (2 = the firmware is gone)
     uint32_t recoverCnt = 0;
     void frameNote(char dir, const uint8_t *eth, uint32_t len);
     void m3Postmortem(const char *tag);
@@ -293,6 +460,7 @@ private:
     uint64_t txBusy[kTxSlots / 64] = {0};    // staging slots in flight
     uint32_t txSlotT[kTxSlots] = {0};
     uint8_t txGen[kTxSlots] = {0};
+    uint8_t txPid[kTxSlots] = {0};           // TXD5 PID of the frame in each staging slot (AWDL data: 4..6, read back by TXFREE)
     uint8_t txNext = 0;
     bool txIsBusy(uint32_t s) const { return (txBusy[s >> 6] >> (s & 63)) & 1; }
     void txSetBusy(uint32_t s) { txBusy[s >> 6] |= 1ull << (s & 63); }
@@ -340,6 +508,9 @@ private:
     void tsSample(uint32_t now);
     char rssiProbe[700] = {0};               // RXD layout samples of the first beacons with RX vector, for the signal decoder
     uint8_t rssiProbeN = 0;
+    uint32_t lastRxv = 0;                    // P-RXV dword 3 of the last frame rxRssi() decoded (RCPI0..3)
+    char awdlRssiRaw[640] = {0};             // §10.86: ring of AWDL action-frame samples: sa, ch, d1, hdr offset, RCPI bytes
+    uint32_t awdlRssiRawN = 0;
     // A-MSDU receive (level 4): the hardware splits an A-MSDU into one RX packet per subframe (first / middle / last in RXD4),
     // each with the 802.11 header. The subframes of one MPDU are collected in a bundle and handed to the reorder buffer together.
     struct AmsduAsm { bool active; uint8_t tid; bool reorder; uint16_t sn; uint32_t used, t; uint8_t buf[ITL_BA_SLOT_BYTES]; };
@@ -399,9 +570,10 @@ private:
     void note(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0);
 
     // ---- runtime control: command mailbox, supervisor loop, status for the menu bar app (itlmt7925_uc.cpp) ----
-    enum { CMD_SCAN = 1, CMD_JOIN = 2, CMD_DISCONNECT = 4 };
+    enum { CMD_SCAN = 1, CMD_JOIN = 2, CMD_DISCONNECT = 4, CMD_AWDL_SYNC = 8 };
     // hasPmk: `pmk` is the ready pairwise master key (native Wi-Fi: userland's supplicant derived it), psk is empty then
-    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; uint8_t pmk[32]; };
+    // open: no key at all (open network: no RSN in the association, no 4-way handshake, data in the clear)
+    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; bool open; uint8_t pmk[32]; };
     IOLock *cmdLock = nullptr;
     volatile uint32_t cmdBits = 0;
     Net reqNet = {};                         // the network of the last join command (under cmdLock)

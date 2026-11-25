@@ -13,6 +13,23 @@
 // The interface is opened only for that and closed again, so bluetoothd (with BlueToolFixup) can use the controller. A section
 // that is already loaded (warm reboot from Windows/Linux) is skipped by the chip's answer, as in Linux.
 //
+// A warm reboot does not power-cycle the chip. If the Bluetooth firmware of the previous session hung (its watchdog fired), the
+// chip keeps that state: the control endpoint stalls, or WMT still answers but HCI does not and the firmware streams a coredump
+// on the ACL pipe. bluetoothd then times out on HCI Reset, records the USB controller as failed and falls back to a UART
+// controller that does not exist, restarting every 15 s. So after FUNC_CTRL the loader sends HCI Reset itself and waits for
+// its Command Complete. If that, or any earlier step, fails, it resets the Bluetooth subsystem (Linux btmtk_usb_subsys_reset,
+// MT7925 CONNV3 path; Linux reaches it through btmtk_reset_sync, see commit b3078bb2ee12 "mt7925: trigger reset on WMT
+// timeout") and loads the whole firmware again, once. A dead firmware is also detected up front (WDT status, stalled register
+// read) so the reset comes first.
+//
+// 0.3.0: the service is kept busy (adjustBusy) while the firmware loads, at most BUSY_CAP_MS. bluetoothd calls
+// IOKitWaitQuiet (240 s timeout) before it picks a transport and scans for USB dongles once; without the busy hold the
+// registry went quiet 1.4-2.6 s into the 5.2 s download, bluetoothd met an exclusively opened interface, fell back to the
+// MacBookPro16,2 UART (/dev/cu.BLTH), faulted after 15 s and was relaunched (9 of 10 boots, 2026-11-18..23). Off switch:
+// boot-arg mtkbtbusy=0.
+// 0.3.1: no thread_call_cancel_wait (com.apple.kpi.private): the armed cap holds a retain instead. Busy is held only when
+// the cap could be allocated. If the loader thread cannot start, the cap, the busy hold and the worker's retain are dropped.
+//
 // IOLog of these kexts does not reach dmesg or the unified log on this machine: the result is in the registry,
 //   ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-log"'
 #include <IOKit/IOService.h>
@@ -21,6 +38,8 @@
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -39,11 +58,20 @@ enum { WMT_PATCH_DWNLD = 0x1, WMT_FUNC_CTRL = 0x6 };
 #define REG_FW_VER        0x80021004
 #define REG_EP_RST_OPT    0x74011890
 #define EP_RST_IN_OUT_OPT 0x00010001
+#define REG_BT_MISC       0x70002510
+#define BT_RST_DONE       0x00000100
+#define REG_RESET_CONNV3  0x70028610
+#define REG_WDT_STATUS    0x740003A0
+#define REG_UDMA_INT_STA  0x74000024
+#define REG_UDMA_INT_STA1 0x74000308
+#define BUSY_CAP_MS       30000          // normal load 5.2 s, reset + full reload about twice that
 
-static void startThread(void (*fn)(void *), void *arg)
+static bool startThread(void (*fn)(void *), void *arg)
 {
     thread_t th = nullptr;
-    if (kernel_thread_start((thread_continue_t)fn, arg, &th) == KERN_SUCCESS) thread_deallocate(th);
+    if (kernel_thread_start((thread_continue_t)fn, arg, &th) != KERN_SUCCESS) return false;
+    thread_deallocate(th);
+    return true;
 }
 
 static inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -60,17 +88,27 @@ private:
     IOBufferMemoryDescriptor *intrBuf = nullptr;
     volatile bool intrStop = false, intrBusy = false;
     uint32_t intrPackets = 0;
+    volatile UInt32 busyHeld = 0;                   // 1 while this service holds one busy count (adjustBusy)
+    thread_call_t busyCap = nullptr;                 // drops the busy hold after BUSY_CAP_MS if the load hangs
+    volatile int hciResetStatus = -1;                // status byte of the HCI Reset Command Complete, -1 = none seen
     uint8_t *cmd = nullptr, *ev = nullptr;          // control transfer buffers (wired)
     char log[1200] = {0};
     size_t loglen = 0;
 
     static void worker(void *arg);
+    static void busyCapFired(thread_call_param_t me, thread_call_param_t);
+    void busyCapCancel();
+    void busyDrop(const char *why);
     void run();
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void state(const char *s) { setProperty("bt-state", s); }
     IOReturn ctrl(uint8_t type, uint8_t req, uint16_t value, uint16_t index, void *buf, uint16_t len, uint32_t *done);
     bool regRead(uint32_t reg, uint32_t *val);
     bool uhwWrite(uint32_t reg, uint32_t val);
+    bool uhwRead(uint32_t reg, uint32_t *val);
+    bool subsysReset();
+    bool hciReset();
+    bool bringUp();
     int wmt(uint8_t op, uint8_t flag, const uint8_t *data, uint16_t dlen, uint8_t *evFlag);
     bool download();
     void intrArm();
@@ -127,6 +165,63 @@ bool MtkBtFw::uhwWrite(uint32_t reg, uint32_t val)
     IOReturn r = ctrl(0x5e, 0x02, (uint16_t)(reg >> 16), (uint16_t)(reg & 0xffff), cmd, 4, nullptr);
     if (r != kIOReturnSuccess) { say("uhw %08x write failed %08x", reg, r); return false; }
     return true;
+}
+
+// btmtk_usb_uhw_reg_read: request type 0xde, bRequest 0x01. Answered by the USB hardware, also when the firmware is dead.
+bool MtkBtFw::uhwRead(uint32_t reg, uint32_t *val)
+{
+    uint32_t n = 0;
+    IOReturn r = ctrl(0xde, 0x01, (uint16_t)(reg >> 16), (uint16_t)(reg & 0xffff), ev, 4, &n);
+    if (r != kIOReturnSuccess || n != 4) { say("uhw %08x read failed %08x n=%u", reg, r, n); return false; }
+    *val = le32(ev);
+    return true;
+}
+
+// btmtk_usb_subsys_reset for dev_id 0x7925 (CONNV3), then the RST_DONE poll and the device id check.
+bool MtkBtFw::subsysReset()
+{
+    uint32_t v = 0;
+    if (!uhwRead(REG_RESET_CONNV3, &v) || !uhwWrite(REG_RESET_CONNV3, v | (1u << 5))) return false;
+    if (!uhwRead(REG_RESET_CONNV3, &v)) return false;
+    v = (v & 0xFFFF00FFu) | (1u << 13);
+    if (!uhwWrite(REG_RESET_CONNV3, v) || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
+    if (!uhwRead(REG_RESET_CONNV3, &v) || !uhwWrite(REG_RESET_CONNV3, v | 1u)) return false;
+    if (!uhwWrite(REG_UDMA_INT_STA, 0xff) || !uhwRead(REG_UDMA_INT_STA, &v)) return false;
+    if (!uhwWrite(REG_UDMA_INT_STA1, 0xff) || !uhwRead(REG_UDMA_INT_STA1, &v)) return false;
+    IOSleep(100);
+    bool done = false;
+    for (int i = 0; i < 50 && !done; i++) {                        // readx_poll_timeout(20 ms, 1 s)
+        if (uhwRead(REG_BT_MISC, &v) && (v & BT_RST_DONE)) done = true;
+        else IOSleep(20);
+    }
+    uint32_t id = 0;
+    bool idOk = regRead(REG_DEV_ID, &id) && id;
+    say("subsys reset: %s, dev id %08x", done ? "done" : "timeout", id);
+    return done && idOk;
+}
+
+// HCI Reset as bluetoothd will send it; the Command Complete arrives on the interrupt endpoint (intrDone).
+bool MtkBtFw::hciReset()
+{
+    if (!intrPipe) { say("no interrupt pipe, HCI check skipped"); return true; }
+    hciResetStatus = -1;
+    cmd[0] = 0x03; cmd[1] = 0x0c; cmd[2] = 0x00;
+    IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, 3, nullptr);
+    if (r != kIOReturnSuccess) { say("HCI Reset send failed %08x", r); return false; }
+    for (int i = 0; i < 200 && hciResetStatus < 0; i++) IOSleep(10);
+    if (hciResetStatus < 0) { say("HCI Reset: no Command Complete in 2 s"); return false; }
+    say("HCI Reset complete, status %d", hciResetStatus);
+    return hciResetStatus == 0;
+}
+
+// Download, endpoint reset option, FUNC_CTRL 1, HCI check.
+bool MtkBtFw::bringUp()
+{
+    if (!download() || !uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT)) return false;
+    uint8_t on = 1, f = 0;
+    if (wmt(WMT_FUNC_CTRL, 0, &on, 1, &f) < 0) return false;
+    say("bluetooth function on (flag %u)", f);
+    return hciReset();
 }
 
 // One WMT command and its event. Returns 0 and the event's flag byte, or -1.
@@ -200,11 +295,15 @@ bool MtkBtFw::download()
     return true;
 }
 
-void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t)
+void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t bytes)
 {
     MtkBtFw *me = (MtkBtFw *)owner;
     me->intrBusy = false;
-    if (status == kIOReturnSuccess) me->intrPackets++;
+    if (status == kIOReturnSuccess) {
+        me->intrPackets++;
+        const uint8_t *e = (const uint8_t *)me->intrBuf->getBytesNoCopy();
+        if (bytes >= 6 && e[0] == 0x0e && e[3] == 0x03 && e[4] == 0x0c) me->hciResetStatus = e[5];
+    }
     if (!me->intrStop && status != kIOReturnAborted && status != kIOReturnNotOpen) me->intrArm();
 }
 
@@ -218,10 +317,34 @@ void MtkBtFw::intrArm()
     if (intrPipe->io(intrBuf, (uint32_t)intrBuf->getLength(), &c, 0) != kIOReturnSuccess) intrBusy = false;
 }
 
+void MtkBtFw::busyDrop(const char *why)
+{
+    if (!OSCompareAndSwap(1, 0, &busyHeld)) return;
+    adjustBusy(-1);
+    setProperty("bt-busy", why ? why : "released after the load");   // not say(): the cap runs beside the worker's log
+}
+
+// The armed cap holds a retain of the object (taken in start). It drops that retain when it fires; whoever dequeues it
+// with thread_call_cancel drops it instead. thread_call_free in free() is safe even while this callback is returning:
+// an allocated thread call is reference counted by xnu while it runs.
+void MtkBtFw::busyCapFired(thread_call_param_t p, thread_call_param_t)
+{
+    MtkBtFw *me = (MtkBtFw *)p;
+    me->busyDrop("dropped by the 30 s cap, load still running");
+    me->release();
+}
+
+void MtkBtFw::busyCapCancel()
+{
+    if (busyCap && thread_call_cancel(busyCap)) release();         // dequeued before it fired: its retain is ours
+}
+
 void MtkBtFw::worker(void *arg)
 {
     MtkBtFw *me = (MtkBtFw *)arg;
     me->run();
+    me->busyCapCancel();
+    me->busyDrop(nullptr);                                          // the interface is closed: IOKit may go quiet now
     me->release();
 }
 
@@ -253,16 +376,21 @@ void MtkBtFw::run()
         intrArm();
     }
 
-    uint32_t devId = 0, fwVer = 0;
-    bool ok = regRead(REG_DEV_ID, &devId) && regRead(REG_FW_VER, &fwVer);
-    if (ok) say("chip %04x fw_ver %08x", devId & 0xffff, fwVer);
+    // A stalled register read or a set watchdog status means the firmware of the previous session hung: reset first.
+    uint32_t devId = 0, fwVer = 0, wdt = 0;
+    bool ok = regRead(REG_DEV_ID, &devId);
+    bool fwAlive = ok && regRead(REG_FW_VER, &fwVer);
+    if (uhwRead(REG_WDT_STATUS, &wdt) && wdt) fwAlive = false;
+    if (!ok) { ok = subsysReset() && regRead(REG_DEV_ID, &devId); fwAlive = ok; }
+    if (ok) say("chip %04x fw_ver %08x wdt %u", devId & 0xffff, fwVer, wdt);
     if (ok && (devId & 0xffff) != 0x7925) { say("not an MT7925, leaving it alone"); ok = false; }
-    if (ok) ok = download();
-    if (ok) ok = uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT);
-    uint8_t on = 1, f = 0;
-    if (ok && wmt(WMT_FUNC_CTRL, 0, &on, 1, &f) < 0) ok = false;
-    if (ok) say("bluetooth function on (flag %u)", f);
-
+    else if (ok) {
+        if (!fwAlive) { say("firmware of the previous session is dead, resetting"); ok = subsysReset(); }
+        if (ok && !bringUp()) {
+            say("bring-up failed, subsystem reset and full reload");
+            ok = subsysReset() && bringUp();
+        }
+    }
     intrStop = true;
     if (intrPipe) {
         intrPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
@@ -287,9 +415,32 @@ bool MtkBtFw::start(IOService *provider)
     ev = (uint8_t *)IOMalloc(64);
     if (!cmd || !ev) return false;
     state("starting");
+    // hold IOKit busy until the interface is closed again, so that bluetoothd's IOKitWaitQuiet returns only after the load
+    uint32_t busyArg = 1;
+    if (PE_parse_boot_argn("mtkbtbusy", &busyArg, sizeof busyArg) && busyArg == 0) setProperty("bt-busy", "off (mtkbtbusy=0)");
+    else {
+        // hold busy only with a working cap, so the hold can never outlive BUSY_CAP_MS
+        busyCap = thread_call_allocate(busyCapFired, this);
+        if (!busyCap) setProperty("bt-busy", "off (no thread call)");
+        else {
+            busyHeld = 1;
+            adjustBusy(1);
+            setProperty("bt-busy", "held");
+            uint64_t dl;
+            clock_interval_to_deadline(BUSY_CAP_MS, kMillisecondScale, &dl);
+            retain();                                               // held by the armed cap (see busyCapFired)
+            thread_call_enter_delayed(busyCap, dl);
+        }
+    }
     registerService();
     retain();                                                       // released by the worker
-    startThread(worker, this);
+    if (!startThread(worker, this)) {
+        say("could not start the loader thread");
+        state("error");
+        busyCapCancel();
+        busyDrop("released: loader thread did not start");
+        release();
+    }
     return true;
 }
 
@@ -301,6 +452,7 @@ void MtkBtFw::stop(IOService *provider)
 
 void MtkBtFw::free()
 {
+    if (busyCap) thread_call_free(busyCap);      // not armed here: an armed cap holds a retain, so free() could not run
     if (intrBuf) intrBuf->release();
     if (cmd) IOFree(cmd, 512);
     if (ev) IOFree(ev, 64);

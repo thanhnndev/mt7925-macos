@@ -119,8 +119,9 @@ uint32_t gCallN = 0, gCallOverflow = 0;
 char *gCallText = nullptr;
 IOLock *gCallLock = nullptr;
 
-// Static address of an exported Family function (ABI-2: IO80211WorkQueue::workQueue); runtime minus this = KASLR slide.
-const uint64_t kWorkQueueStatic = 0xffffff8002258fccull;
+// Static address of IO80211WorkQueue::workQueue in 25G241 (ABI-2), for reading old recorder output only. Since §10.81 the
+// recorder stores callers relative to the symbol itself, so nothing depends on this build's address.
+[[maybe_unused]] const uint64_t kWorkQueueStatic = 0xffffff8002258fccull;
 
 }
 
@@ -162,7 +163,9 @@ void itlmtCallers(uint32_t out[3], uintptr_t fp)
 {
     out[0] = out[1] = out[2] = 0;
     if (fp < 0xffffff8000000000ull || (fp & 7)) return;     // kernel stack addresses only
-    uint64_t slide = (uint64_t)(uintptr_t)&IO80211WorkQueue::workQueue - kWorkQueueStatic;
+    // §10.81: return addresses relative to IO80211WorkQueue::workQueue (an exported Family symbol), valid on every build; add
+    // that symbol's static address of the running build to map one into a disassembly (25G241: kWorkQueueStatic).
+    uint64_t slide = (uint64_t)(uintptr_t)&IO80211WorkQueue::workQueue;
     uintptr_t start = fp;
     for (int i = 0; i < 3; i++) {
         uintptr_t *f = (uintptr_t *)fp;
@@ -255,6 +258,42 @@ itlmt7925WifiInterface *itlmt7925WifiInterface::withController(IO80211Controller
         return nullptr;
     }
     return i;
+}
+
+// Keys that claim a sleep offload this driver does not have (see the header). Dropped on every setProperty path.
+static bool itlmtOffloadKey(const char *k)
+{
+    return k && (!strcmp(k, "mDNS_KEY") || !strcmp(k, "mDNS_Keepalive"));
+}
+
+bool itlmt7925WifiInterface::setProperty(const OSSymbol *aKey, OSObject *anObject)
+{
+    if (aKey && itlmtOffloadKey(aKey->getCStringNoCopy())) return true;
+    return IO80211InfraProtocol::setProperty(aKey, anObject);
+}
+
+bool itlmt7925WifiInterface::setProperty(const OSString *aKey, OSObject *anObject)
+{
+    if (aKey && itlmtOffloadKey(aKey->getCStringNoCopy())) return true;
+    return IO80211InfraProtocol::setProperty(aKey, anObject);
+}
+
+bool itlmt7925WifiInterface::setProperty(const char *aKey, OSObject *anObject)
+{
+    if (itlmtOffloadKey(aKey)) return true;
+    return IO80211InfraProtocol::setProperty(aKey, anObject);
+}
+
+bool itlmt7925WifiInterface::setProperty(const char *aKey, const char *aString)
+{
+    if (itlmtOffloadKey(aKey)) return true;
+    return IO80211InfraProtocol::setProperty(aKey, aString);
+}
+
+bool itlmt7925WifiInterface::setProperty(const char *aKey, bool aBoolean)
+{
+    if (itlmtOffloadKey(aKey)) return true;
+    return IO80211InfraProtocol::setProperty(aKey, aBoolean);
 }
 
 bool itlmt7925WifiInterface::init()
@@ -931,6 +970,34 @@ IOReturn itlmt7925WifiInterface::getNSS(apple80211_nss_data *d)
     return kIOReturnSuccess;
 }
 
+// getHT_CAPABILITY (ioctl 0x9a, slot 481): apple80211_ht_capability = { u32 version; 28 bytes of the HT Capabilities element
+// including its 2-byte header }. Apple's AppleBCMWLANCore::getHT_CAPABILITY copies exactly that out of its context, which
+// updateHTAndVHTCapBasedOnHWSupport fills starting from the element 2d 1a 0c 00 19 ff... (25G241). The AWDL peer manager
+// asks for it (IO80211PeerManager::getHtCapabilityIE) to build the enhanced data rate TLV of its MIF/PSF; with the old
+// "unsupported" answer it logged "Invalid _htCapabilityLength 0" and left the TLV out (docs/ROADMAP-AWDL.md §10.27).
+// The values are the MT7925's (2x2, the mt76 mt7925 HT capabilities): LDPC, 20/40 MHz, SM power save off, short GI 20/40,
+// TX STBC + one RX STBC stream, 7935-byte A-MSDU; A-MPDU up to 64 KiB with 8 us spacing (the largest spacing Apple's default
+// uses, which is always safe to ask of a sender); MCS 0-15 on receive, TX MCS set defined. No extended/TxBF/ASEL bits.
+// Answered regardless of link state: these are what the hardware can do, not what the current BSS negotiated.
+IOReturn itlmt7925WifiInterface::getHT_CAPABILITY(apple80211_ht_capability *d)
+{
+    itlmtCall(ctl, 'S', 481);
+    if (!d) return kIOReturnBadArgument;
+    uint8_t *b = (uint8_t *)d;
+    bzero(b + 4, 28);
+    store<uint32_t>(d, 0, 1);                       // version
+    b[4] = 0x2d;                                    // element id: HT Capabilities
+    b[5] = 0x1a;                                    // length 26
+    uint16_t cap = 0x0001 | 0x0002 | 0x000c | 0x0020 | 0x0040 | 0x0080 | 0x0100 | 0x0800;
+    b[6] = (uint8_t)(cap & 0xff);
+    b[7] = (uint8_t)(cap >> 8);
+    b[8] = 0x03 | (6 << 2);                         // A-MPDU: max length exponent 3 (64 KiB), min spacing 6 (8 us)
+    b[9] = 0xff;                                    // RX MCS 0-7
+    b[10] = 0xff;                                   // RX MCS 8-15
+    b[21] = 0x01;                                   // TX MCS set defined (= RX set)
+    return kIOReturnSuccess;
+}
+
 // Apple's handler (0xffffff8001610836) forwards the notification to firmware iovars (asym_mit_ext_usb[_chg]) and returns 0 for
 // chips that do not use them. The MT7925 here is on PCIe; there is nothing to forward, so the notification is accepted.
 IOReturn itlmt7925WifiInterface::setUSB_HOST_NOTIFICATION(apple80211_usb_host_notification_data *d)
@@ -1117,13 +1184,16 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     memcpy(&cipher, b + 0x48, 4);
     itlmtTrace(ctl, "assoc:request ssidLen=%u cipher=%u keyLen=%u", ssidLen, cipher, keyLen);
     if (ssidLen == 0 || ssidLen > 32) return kIOReturnBadArgument;
-    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // open / SAE / enterprise: not implemented
+    // cipher 0 with no key: an open network. A PMK (6 / 9, 32 bytes): WPA2-PSK. SAE / enterprise: not implemented.
+    bool open = cipher == 0 && keyLen == 0;
+    if (!open && !((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;
     ItlNativeJoin j;
     bzero(&j, sizeof(j));
-    j.version = 1;
+    j.version = open ? 2 : 1;
     j.ssidLen = (uint8_t)ssidLen;
     memcpy(j.ssid, b + 0x20, ssidLen);
-    memcpy(j.pmk, b + 0x50, 32);
+    if (open) j.open = 1;
+    else memcpy(j.pmk, b + 0x50, 32);
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_JOIN, false, &j, nullptr, nullptr, nullptr);
     bzero(&j, sizeof(j));
     if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); return r; }

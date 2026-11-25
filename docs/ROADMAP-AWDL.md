@@ -29,6 +29,8 @@ The native Wi-Fi front end is merged into `main` and under test. AWDL is a **sep
 * `awdl0` exists, has an IPv6 link-local address, and `sharingd` browses and serves `_airdrop._tcp` over it.
 * Clean-room: no OWL / OpenDrop / opendrop-awdl source is copied (GPL). Protocol facts come from the published papers and from
   read-only inspection of Apple's 24H32 collection, like the rest of the native driver.
+  Amended 2026-10-26 (project owner): OWL and OpenDrop may be read for protocol facts only; nothing is copied and the facts are
+  restated in our own words with their sources in `docs/AWDL-PROTOCOL-REFERENCE.md`.
 
 ## 2. What AirDrop needs (stack, top to bottom)
 
@@ -338,3 +340,3690 @@ the daemon continues and the interface stays up.
    `setPSF_DWELL` once AirDrop/peer discovery starts).
 2. Phase 3: implement the channel sequence (ROC slicing) and the PSF/action-frame TX those slots need; the LLW companion
    interface (slot 562) afterwards.
+
+### 10.6 Round 2026-10-19 (evening): the AWDL ioctls never left the driver - `ret=58` is this driver's own gate
+
+AirDrop-off trace on the boot with the AWDL protocol class (`./vif_create_test en5`, then the kernel log):
+
+* `(IO80211Family) com.apple.p2p.awdl0:` lines prove the **Family's AWDL peer manager runs for this vif**:
+  `IO80211AWDLPeerManager::updateLocalRequests`, `::interfaceStateChange`, `isScanDisallowedByAwdl`,
+  `IO80211PeerManager::setScanningState` (source ScanManagerFamily / DriverInternalScanDone). So
+  `IO80211VirtualInterface::createPeerManager` (slot 355) did run for role 6.
+* `IO80211AWDLPeerManager::getAwdlChannelSequence[28260] : unable to get AWDL channel sequence ret=58` - the peer
+  manager asks the driver through `apple80211RouteInternal(0xc02869c9, 0x81, iface, out)`, which indexes the Family's
+  route table at `0xffffff800247cea0` (get) / `0xffffff800247e0f0` (set) by `ioctl - 1`; entry 0x81 is
+  `apple80211getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(iface, out)` (0xffffff8002263a45), whose first step is
+  `call [vptr + 0xcc8]` = **slot 411 `IO80211SkywalkInterface::isCommandProhibited(int)`** (0xffffff80022f9bce), which
+  tail-calls the **controller's** `isCommandProhibited`. Returning non-zero there returns that value to the caller -
+  and `ret=58` is exactly `itlmt7925Wifi::isCommandProhibited`'s `kProhibited` (0x3a, itlmt7925_wifi.cpp:127).
+* So the whole AWDL ioctl family (channel sequence, sync params, election, PSF dwell, LLW params, companion create
+  0x125, OS eligibility 0x23f) was refused by this driver's own allowlist before reaching either the Family's handlers
+  or the interface's `IO80211AWDLProtocol` slots. `wifip2pd`'s `Apple80211IOCTLSetWrapper ... return 58/0x0000003a`
+  lines are the same gate.
+* Fix in this round: `commandAllowed()` now lets the AWDL family through when `itlmt_awdl=1` (the ioctl numbers are the
+  route-table indices above: 0x74-0x8b, 0x8f, 0x94-0x97, 0x9b, 0x9e, 0xa2-0xa7, 0xc9-0xe9, 0xf4-0x107, 0x125,
+  0x152-0x158, 0x15f, 0x172, 0x1a0, 0x1a1, 0x1b0, 0x1d3, 0x23f). With the boot-arg absent nothing changes.
+* The AWDL stub trace now goes through `itlmtTrace(getController(), ...)` (the `itlmt_native_trace` ring, mirrored to
+  NVRAM): IOLog from this kext does not reach the unified log on this machine. `nvram -p | grep itlmt-native-trace`
+  after the reboot shows `awdl:proto <slot>` / `awdl:companion action=<n>` - i.e. which protocol slots the peer manager
+  drives once the gate is open.
+
+### 10.7 Round 2026-10-19 late: the gate was the whole AWDL blocker - the peer manager now drives the protocol slots
+
+Reboot with the 10.6 gate fix (`com.itlmt7925.native` UUID `56A5CD9C-0E15-3C07-8C55-BA309D3B9DA4`), AirDrop on,
+`./vif_create_test en5`. The driver's own trace (`nvram -p | grep itlmt-native-trace`) now shows the whole AWDL ioctl
+family **allowed** and the interface's protocol slots being called for the first time:
+
+```
+ioctl:cmd=75 allowed   ioctl:cmd=7d allowed   ioctl:cmd=97 allowed   ioctl:cmd=7e allowed
+ioctl:cmd=a4 allowed   ioctl:cmd=125 allowed  ioctl:cmd=23f allowed  ioctl:cmd=81 allowed
+awdl:vif started; awdl:vif up bsd=awdl0
+awdl:proto getAWDL_SYNC_ENABLED
+awdl:proto setAWDL_BSSID
+awdl:proto setAWDL_SYNC_FRAME_TEMPLATE
+awdl:proto setAWDL_ELECTION_METRIC
+awdl:proto setAWDL_PEER_TRAFFIC_REGISTRATION
+awdl:companion action=1 (unsupported)
+awdl:proto getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE
+```
+
+and wifip2pd brings the interface up on its own (`No AWDL interface found. Creating AWDL interface`, link up, IPv6,
+mDNS agent, `OS Eligibility: 5G/160 = ENABLED`). `setCOMPANION_SKYWALK_IF_CREATE` now answers the stub's
+`kIOReturnUnsupported` instead of the old gate's `0x3a` - proof the ioctl reached the driver.
+
+**The remaining blocker is one slot.** `IO80211AWDLPeerManager`'s enable path (`doEnable` -> `configure`) aborts on the
+first unsupported answer, and the first parameter it hands over is the BSSID:
+
+```
+IO80211AWDLPeerManager::enable: <awdl0> enable 1 ...
+doEnable:2829 Enabling AWDL Interface because of setLinkState... configured = 0
+IO80211AWDLPeerManager::configure Configuring AWDL interface
+IO80211AWDLPeerManager::initParamsToDefaults RTGConcurrency:1 RTScan:1 RTGSteering:1 ...
+IO80211AWDLPeerManager::configure  Unable to set BSSID ret e00002c7
+IO80211AWDLPeerManager::configure configure error!! :(
+doEnable:2839 ERROR: cannot configure AWDL after enabling interface!! ret=e00002c7 _enabling 1
+<awdl0> disable 1 ont 0   -> AWDL DISABLE SET last state 0
+```
+
+So this round accepts the configure handshake: `awdlAccept()` (slot 540 `setAWDL_BSSID`, 541 `setAWDL_ELECTION_METRIC`,
+549 `setAWDL_SYNC_FRAME_TEMPLATE`, 551 `setAWDL_PEER_TRAFFIC_REGISTRATION` and the rest of the parameter setters
+536-569) answers `kIOReturnSuccess` and traces the slot, and the four AWDL structs that are public in
+`IOKit/80211/apple80211_ioctl.h` are stored/printed (`apple80211_awdl_sync_enabled` {version, unk1, enabled},
+`apple80211_awdl_election_metric` {version, metric}, `apple80211_awdl_sync_frame_template` {version, payload_len,
+payload}, `apple80211_awdl_peer_traffic_registration` {version, addr, name_len, name[152], active} packed). The
+out-of-band request slots (548/557/563) and the LLW/companion path (562/564) still answer unsupported - they expect a
+response or a second interface, not just a parameter handshake. No RF work is done by these slots: the point is to let
+`configure()` finish so the next missing piece (the channel sequence, then the PSF/ROC path) shows up in the trace.
+
+### 10.8 Round 2026-10-20: the PSF frame reaches the driver - first AWDL transmit path
+
+With the configure handshake in place the Family's AWDL state machine runs end to end: the trace shows the sync frame
+template being handed to the driver over and over, and the state dump reports AWDL up with no peers because the radio
+never transmits anything:
+
+```
+awdl:set SYNC_FRAME_TEMPLATE len=110
+awdl:accept setAWDL_SYNC_PARAMS / setAWDL_SYNC_STATE / setAWDL_ELECTION_PARAMS
+setSyncFramePeriod::Setting PSF period to 440
+AWDLStateDump: AWDL up time: 29 Secs, DE:56:7B:34:81:D4 peers:0, cached:0(0), rtg(0)
+AWDLStateDump: PSFDwell Support/Active: 1/0 {0ms 0ms}
+IO80211AWDLPeerManager::monitorAWEvents WARNING: Did not get AW start event ...
+```
+
+`netstat -I awdl0` = 0 TX / 0 RX: nothing ever leaves the box, which is why a second Mac/iPhone with AirDrop open cannot
+see it. The firmware has no AWDL channel sequencing of its own, so the driver has to provide the off-channel slot.
+
+What this round adds (phase 3 transmit half):
+
+* `ItlNativeAwdlSync` (`ITL_NATIVE_AWDL_SYNC`, itl_native_bridge.h) - the native interface hands one complete 802.11 frame
+  plus the channel and dwell to the core. `itlmt7925::awdlSubmit()` only copies it into a mailbox under `cmdLock` and sets
+  `CMD_AWDL_SYNC`; nothing blocks on the chip in the caller's context (the Family's work queue).
+* `itlmt7925::awdlSyncTx()` runs on the link thread next to the scan command: `m3Roc(true, channel)` (UNI_ROC on the AWDL
+  channel, bounded to 80 ms of pumping so the AP keeps being serviced), `m3Tx(frame, len, 0, 13, ...)` (management, action,
+  fixed OFDM 6 Mb/s, ALT X0 queue), then `m3Roc(false, channel)` back to the infrastructure channel.
+* ROC grants are now parsed after link up as well (`rocWant`, set by m3Roc and cleared by the grant or the abort). The old
+  early return assumed no ROC event can arrive while associated; off-channel AWDL needs exactly that.
+* `setAWDL_SYNC_FRAME_TEMPLATE` (slot 549) queues the frame the Family builds every PSF period (110 bytes on this build,
+  social channel 6, 60 ms ROC window). The core service pointer is handed to the vif by the vif-create handler
+  (`setNativeCore`).
+
+What to expect on the next boot: `awdl:sync tx queued len=110 rc=0` in the interface trace and `awdl sync: tx ch=6
+len=110 ok=1` in the driver log once the link is up (the AWDL TX only runs while associated - the link thread is what
+services the command). A second AirDrop device should then start seeing this Mac, even though reception (peer table) still
+needs the RX half: routing the AWDL action frames the firmware delivers during the ROC window up to
+`IO80211AWDLPeerManager`, plus the missing "AW start event" the peer manager keeps warning about.
+
+### 10.9 Round 2026-10-20 (same boot): the PSF leaves the radio - ROC works while associated
+
+Test after the 10.8 build (core `b155d936`, native `618de933`), `awdl0` created with `~/vif_create_test en5`, then the
+AirDrop window closed and reopened (the order matters: the vif must exist *before* the AirDrop session asks for AWDL,
+otherwise wifip2pd initialises the interface but never re-runs `doEnable` - the 10:13 boot stalled exactly there, trace
+ending at `getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE` with `set SYNC_ENABLED` never called).
+
+With that order the configure handshake completes and the new transmit path runs:
+
+```
+awdl:set SYNC_FRAME_TEMPLATE len=110
+awdl:sync tx queued len=110 rc=0
+awdl:accept setAWDL_SYNC_PARAMS / setAWDL_SYNC_STATE / setAWDL_ELECTION_PARAMS
+```
+
+and in `m3-log` (the core's own ring, `ioreg -l | grep m3-log`):
+
+```
+roc_acquire rc=0 st=0
+roc event bss=0 tok=10 status=0
+awdl sync: tx ch=6 len=110 ok=1
+roc_abort rc=0 st=0
+```
+
+That answers the 10.8 open question: **the firmware grants UNI_ROC while the station is associated** (tok 10, 11, 12, ...,
+status 0), so the off-channel slot works as implemented - relax-on-`rocWant` was the right change and no infra
+disconnect is needed. Nine frames went out this way.
+
+**The finding: the Family does not hand the template over once per period.** It hands it over when it changes (four
+times in five minutes here), so the 10.8 note "The Family re-issues this template every sync period, so every call is one
+PSF transmission" was wrong: 9 frames in ~5 minutes is nowhere near the 440 ms PSF cadence the peer manager logs
+(`setSyncFramePeriod::Setting PSF period to 440`). The other device never saw the Mac because the sync frames were
+essentially absent, not because they were malformed.
+
+So the interface now owns the cadence: `setAWDL_SYNC_FRAME_TEMPLATE` copies the bytes (`awdlPsfFrame`, the Family's buffer
+is not ours to keep) and `awdlPsfStart()` arms an `IOTimerEventSource` on the interface's work loop; `awdlPsfTick()` hands
+one frame to the core every 440 ms with a 30 ms ROC window, and `setAWDL_SYNC_ENABLED=0` cancels the timer (AWDL off must
+mean nothing leaves the radio). The immediate on-template transmit is gone: the timer's first tick is the transmit.
+
+Still open after this round: the peer manager's `Did not get AW start event` warning (it wants
+`APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START` posted per window; the numeric id has not been confirmed yet - the name table
+in the kernel points at 0x4f3 but the spacing of neighbouring ids makes that unverified), and the receive half - routing
+received AWDL action frames up to `IO80211AWDLPeerManager` so `peers:` leaves 0 and election can run.
+
+### 10.10 Round 2026-10-20 evening: a real root cause - the template is a TLV blob, not a frame
+
+The 10.9 build runs (timer armed, `awdl:psf armed len=110`, ticks reaching the core), but the trace of the template's first
+byte exposed a defect that is worse than the cadence one: the 110 bytes the Family hands over are **not an 802.11 frame**.
+
+```
+awdl:psf armed len=110 type=06 sub=0
+```
+
+`0x06` is not a frame-control byte - an AWDL action frame would start with `0xd0`. The kernel confirms where it comes from:
+`IO80211AWDLPeerManager::updateSyncFrameTemplate` (0xffffff80021dc5b2) builds the buffer with `buildServiceParamTlv`,
+`buildAWDLElectionParamsVer2`, `buildAwdlDataPathStateTlv`, `buildEnhDataRateTlv` ... and `buildServiceParamTlv`
+(0xffffff80022118a6) starts with `mov byte ptr [rsi], 6` - TLV type 6, little-endian length, then the value. So the payload is
+a **TLV blob**, exactly what the Family also feeds into the master indication template (`buildMasterIndicationTemplate`, no
+`0xd0`/OUI anywhere in it). On Apple hardware the firmware wraps it: the driver only hands the bytes to the chip.
+
+This driver's firmware has no AWDL support, so the wrapper has to be built by the host before `m3Tx()` - and it was not: the
+raw TLV blob went out as an MPDU whose first 24 bytes (TLV types/lengths) were interpreted as addresses. That is why nothing
+ever appeared on the other device's AirDrop, while the counters looked healthy (`awdl sync: tx ... ok=1` only means the
+firmware accepted the descriptor).
+
+What this round adds:
+
+* The transmit wrapper is **not** guessed. A capture probe in the RX path (`rxParseFrame`, `itlmt7925_m2.cpp`) now looks for
+  management Action frames (`fc 0xd0`) in the received buffer, notes whether the Apple OUI `00:25:00` sits at +25 (category
+  at +24), and hex-dumps the first 40 bytes of the first four into `m3-log`:
+  `awdl af rx len=.. cat=.. apple=1 <hex>`. The frame is only heard while the radio is on the social channel, i.e. inside the
+  ROC window, so that window grew from 30 ms to 60 ms for these runs.
+* Reading those bytes from a real iPhone/Mac gives the exact header (FC, DA, SA/BSSID, category, OUI, and where the TLV blob
+  begins), which is also the format the receive half has to parse. Both directions need the same layout, so the probe is the
+  cheapest way to obtain it: it either captures a frame (ground truth immediately) or proves the firmware does not forward
+  broadcast action frames at all (then the RX filter, not the parser, is the next suspect).
+
+Once the layout is known the transmit path becomes three lines of wrapping in `awdlSyncTx()` - 802.11 header with the AWDL MAC
+(`de:56:7b:34:81:d4`) and the peer manager's BSSID (`00:25:00:ff:94:73`), category, OUI, then `awdlFrame` - and the same
+parser routes received frames to the peer manager.
+
+First capture attempt (d8a7d57, core `b614d747`, native `b14c06b4`): four dumps arrived, all `apple=0`, and none of them is
+an AWDL frame - the probe accepted any `0xd0` byte inside the received buffer, and data frames (IP payloads, IPv6 multicast
+DA `33:33:00:00:00:fb` in one of them) contain that byte too. It also ran with no `awdl0` at all (the vif is recreated per
+boot and had not been created), i.e. on the infrastructure channel, so nothing was even looking at the social channel.
+
+The probe is now strict: duration 0, DA broadcast or unicast, TA and BSSID unicast and non-zero (any real 802.11 header
+satisfies these, data frames found at a stray `0xd0` almost never do), the dump budget is 10 frames plus every frame that
+carries the Apple OUI at +25, and every 25th hit logs a one-line summary so a long run shows whether anything is arriving at
+all. Core `e756604c`.
+
+### 10.11 The transmit wrapper, from ground truth (not a guess)
+
+Two facts settled the format, and they agree with each other:
+
+1. The kernel. `IO80211AWDLPeerManager::actionFrameHasCorrectOUI` (0xffffff8002210200) compares three bytes of the frame
+   body at fixed offsets: `0x17`, `0xf2`, then `8` - the Apple OUI and the AWDL type, exactly where a vendor-specific action
+   frame puts them. `AppleBCMWLANNetAdapter::sendActionFrame` (0xffffff80015c511a) never writes an 802.11 header at all: it
+   builds a descriptor (`{addr, addr, len, ...}`) and the firmware frames it. So on Apple hardware the host never sees the
+   header, and no amount of kernel reading can produce it.
+2. OWL (the open AWDL implementation) has the wire format: `src/frame.h` / `src/tx.c`. The action frame is
+   `ieee80211_hdr{fc=0x00d0, dur=0, addr1=dst, addr2=src, addr3=AWDL_BSSID 00:25:00:ff:94:73, seq<<4}` followed by
+   `awdl_action{category=0x7f, oui=00:17:f2, type=8, version=0x10 (1.0), subtype=0 (PSF) / 3 (MIF), reserved,
+   phy_tx u32, target_tx u32}` and then the TLV blob. PSF is broadcast (`state->dst = ETHER_BROADCAST`), sent every 440 TU
+   when following a master - the same 440 ms the Family's log reports.
+
+That is now what the driver builds. `setAWDL_SYNC_FRAME_TEMPLATE` sees the Family's bytes for what they are (TLVs, first
+byte a TLV type) and prepends the 40-byte wrapper into `awdlPsfFrame` (broadcast DA, the AWDL interface address as SA, the
+AWDL BSSID - `setAWDL_BSSID`'s value when the Family provides one, the standard `00:25:00:ff:94:73` otherwise). The core
+stamps the per-transmission fields just before `m3Tx()`: `seq_ctrl` at +22 (incrementing, 12 bits) and the two microsecond
+timestamps at +32/+36.
+
+The earlier trace line proves how necessary this was: `awdl:psf armed len=110 type=06` - the first byte was TLV type 6
+(`buildServiceParamTlv`), so the previously transmitted MPDUs began with TLV bytes where the receiver expects addresses.
+`ok=1` only ever meant "the firmware accepted the descriptor". With the wrapper the frame is 153 bytes
+(24 + 16 + 113) and starts with `d0 00 00 00 ff ff ff ff ff ff de 56 7b 34 81 d4 00 25 00 ff 94 73 .. .. 7f 00 17 f2 08 10 00 00`.
+The new `awdl:psf armed` line prints the first bytes of exactly that, and the RX probe now looks for `0x7f / 00:17:f2 / 8`
+instead of the wrong `00:25:00` it checked before (which is the BSSID OUI, not the action OUI).
+
+Also observed in the same run: the Family re-sends `setAWDL_SYNC_FRAME_TEMPLATE` every few seconds with updated TLVs
+(110 -> 112 -> 113 bytes) - i.e. its state machine is alive and the sync parameters are changing (channel sequence, counters),
+so the cadence and the content both come from it.
+
+### 10.12 Receive half: action frames go to the Family's peer manager
+
+The transmit half is now correct (`awdl:psf armed tlv=110 frame=150 fc=d0 cat=7f oui=0017f2 type=08 sa=de567b3481d4`,
+`awdl sync: tx ch=6 len=150 ok=1`, ROC granted every time), and the other device still shows nothing. That is expected once
+the discovery chain is looked at: AirDrop lists a device only after that device's **service** is learned, and services are
+exchanged in AWDL action frames (service request / response, MIF). The Family builds them in `IO80211AWDLPeerManager`
+(`buildServiceResponseTlvs`, `buildMasterIndicationTemplate`) in reply to frames it receives. With no receive path the peer
+list stays empty, so nothing is advertised and nothing shows up - transmit alone can never be enough.
+
+So the frames the radio hears now go where the Family expects them:
+
+* `rxParseFrame` already recognises an AWDL action frame by its header (24-byte 802.11 action frame with `addr3` a unicast
+  BSSID, then `0x7f / 00:17:f2 / 8`). Those frames are copied into a four-entry ring (`awdlRxRing`) - single producer, the RX
+  thread - and nothing else in the RX path changes.
+* The AWDL interface drains the ring once per PSF tick through a new platform function, `itlmt-native-awdl-rx-v1`
+  (`ITL_NATIVE_AWDL_RX`), and hands each frame to `IO80211AWDLPeerManager::actionFrameInput`.
+* Reaching that method needed two offsets from the KernelCollection, and both are checked at run time: the peer manager is
+  `IO80211SkywalkInterface::getPeerManager()`, i.e. `[[this+0x120]+0x28]` (`0xffffff80022f5fa8`), and `actionFrameInput` is
+  **virtual slot 73** - 0x238 bytes into the object's vptr once the two vtable header words are accounted for. Before the
+  first call the driver verifies that slot 74 is `doEnable` by comparing the distance between the two function pointers
+  (`0xffffff80021c5216 - 0xffffff800220e1ae`); a KASLR slide cancels out, and a mismatch means the table is not what this
+  code assumes, in which case the frame is dropped and `awdl:rx slot check failed` is traced instead of calling an unknown
+  pointer.
+
+The trace tells the two possible outcomes apart on the next run:
+
+* `awdl:rx af len=.. n=.. pm=.. fn=.. sub=..` - frames arrive on the social channel, the peer manager is being fed, and the
+  next observable is `IO80211AWDLPeerManager` state in the unified log (peers, election, sync).
+* nothing at all - the firmware is not delivering other-BSS management frames to the host while parked on the social channel.
+  Then the RX filter (chip side), not the parser, is the next thing to change.
+
+### 10.13 Why nothing was ever received: the RX filter only passed our own BSS
+
+The receive half was wired up (10.12) and still nothing arrived - not one `awdl:rx`, not one `awdl af rx` - while the transmit
+half kept running (`psf tick 200 len=153`, `awdl sync: tx ... ok=1`). That rules out the parser and the AWDL channel: the
+frames were never handed to the host in the first place.
+
+The vendor driver programs the station's RX filter explicitly. `mt7925_configure_filter` (mt7925/main.c) maps mac80211's
+filter flags onto `MT7925_FILTER_ENABLE` (BIT(31)), `MT7925_FILTER_OTHER_BSS` (BIT(6)), `MT7925_FILTER_CONTROL` (BIT(5)) and
+sends them with `mt7925_mcu_set_rxfilter()`, i.e. a `MCU_UNI_CMD(BAND_CONFIG)` message whose TLV is
+`UNI_BAND_CONFIG_SET_MAC80211_RX_FILTER` (0x0c), value layout `{mode, rsv[3], fif, bit_map, bit_op, pad[51]}`; `mode = 0`
+replaces the whole filter with `fif`. This driver never sent that message, so the firmware kept its default - our own BSS
+only. Frames from another device (an AWDL action frame carries `addr3 = 00:25:00:ff:94:73`, not our AP's BSSID) were dropped
+in the firmware, on the infrastructure channel as much as inside a ROC window. That is also why the probe saw four *data*
+frames earlier and never a management one.
+
+`awdlSyncTx()` now programs `fif = BIT(31) | BIT(6)` once per link, right before the first ROC window, and the trace gained a
+line that separates the two possible failures from now on:
+
+```
+awdl stat: try=.. tx=.. rocfail=.. rocframes=.. bcn=.. af=..
+```
+
+`rocframes` counts every frame parsed while a ROC window is open and `bcn` the beacons among them. If `rocframes` grows but
+`af` stays 0, the radio is healthy and simply no AWDL peer is on the air; if `rocframes` stays 0, the filter is still not
+letting frames through and the next step is the chip-side promiscuous path, not the AWDL code.
+
+### 10.14 The receive half works - but only on the channel we park on
+
+With the RX filter in place (10.13) the counters finally answer the question that had been open for days:
+
+```
+rx_filter rc=0 st=0
+awdl stat: try=50 tx=49 rocfail=1 rocframes=90 bcn=9 af=0
+```
+
+`rocframes` counts every frame parsed while a ROC window is open, `bcn` the beacons among them. Ninety frames in fifty
+windows of 60 ms prove the radio really is listening off-channel, the RX ring is delivering, and the parser runs. `af = 0`
+then means exactly one thing: **no AWDL action frame was on the air on channel 6** while we were there.
+
+That is not a receive bug. The interface was transmitting (and therefore listening) on channel 6 unconditionally -
+`ItlNativeAwdlSync req = { 1, awdlPsfFrame, awdlPsfLen, 6, kAwdlPsfRocMs }` - while `setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE`
+(slot 542) was answered by `awdlAccept()` and its contents thrown away. Apple's AWDL spreads the sync frame over a channel
+sequence (2.4 GHz social channel 6, 5 GHz 44/149), and the Family's `AppleBCMWLANProximityInterface::buildAWDLChanSequence()`
+builds that sequence from the struct we were ignoring. A peer whose sync tree sits on 44 or 149 is simply inaudible to a
+radio that only ever parks on 6, in both directions.
+
+The setter is now parsed (layout taken from `buildAWDLChanSequence`, 25G241, plus a raw hex trace so a wrong guess is
+visible instead of silently parking the radio somewhere odd): master channel first, then the sequence entries at +0x10
+(12 bytes each, channel in byte 0), then the default social set {6, 44, 149} as a union. The PSF cadence walks that list
+round-robin, one channel per 440 ms period, so every channel is visited about once a second - which is what discovery
+needs until the sync tree we hear tells us where the master actually is. `awdl stat` and the AF log now carry the channel,
+so the next run attributes every frame to the channel it was heard on:
+
+```
+awdl:psf tick 100 len=153 ch=44 rc=0
+awdl stat: try=50 tx=49 rocfail=1 rocframes=90 bcn=9 af=0 ch=149
+```
+
+Still open: `getAWDL_DEVICE_CAPABILITIES` (slot 523) answers unsupported, so the Family may keep building a 2.4 GHz-only
+sequence - the union above is what makes discovery possible in the meantime, and reporting dual-band capabilities properly
+is the clean fix once the struct layout is confirmed.
+
+### 10.15 The channel sequence read-back stopped configure before the sync template
+
+The hop change worked as far as it could - `awdl:set CHANSEQ n=8 master=255 hop=6,44,149,0,0` - but nothing followed it:
+no `SYNC_FRAME_TEMPLATE`, no `SYNC_ENABLED`, no PSF tick. The trace ring held the whole boot (46 lines), and it ended on
+
+```
+awdl:proto getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE
+```
+
+i.e. the Family sets the sequence and then *reads it back*, and `awdlProto()` answered `kIOReturnUnsupported`. That answer
+aborted the configure sequence before the step that hands the driver the sync frame, so the interface had nothing to
+transmit and nothing to listen for - the hop list was never used.
+
+The read-back is not a query the driver may fail: the payloads whose layout is not public are now stored verbatim when the
+Family sets them and echoed back when it reads them (`set/get AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE`, `MASTER_CHANNEL`,
+`SYNC_STATE`), with a valid default sequence (version 1, one entry, 2.4 GHz ch6) when nothing has been set yet. Echoing is
+also the only truthful answer: guessing a layout would hand the caller numbers the radio never used.
+
+The entry layout is confirmed by the raw bytes of that first set - `01 00 00 00 | 00 10 00 03 | 00 ff 00 00 | 01 00 00 00`:
+version 1, count 0x10, master 0xff (none), and entry 0 starting at +0x0c with `version = 1`, i.e. `apple80211_channel`
+entries at +0x0c (channel in the low byte of +4, band flags at +8), exactly what `buildAWDLChanSequence` reads. The parse
+now uses that offset and traces the first three entries with their flags.
+
+### 10.16 What the firmware hands the host inside a ROC window
+
+With the hop in place the trace shows the whole transmit half working on every channel:
+
+```
+awdl:psf tick 1 len=150 ch=6 rc=0
+awdl:psf tick 2 len=150 ch=44 rc=0
+awdl:psf tick 3 len=150 ch=149 rc=0
+awdl sync: tx ch=6 len=150 ok=1 / ch=44 ok=1 / ch=149 ok=1
+awdl stat: try=100 tx=97 rocfail=3 rocframes=86 bcn=7 af=0 ch=6
+```
+
+Still `af = 0`: over 100 periods, ~5 s of listening spread over the three social channels, not one action frame - not
+even a non-AWDL one, which a busy 2.4 GHz band normally supplies (802.11v BSS transition frames are everywhere). Two
+explanations remain, and they need different fixes:
+
+* the firmware only forwards beacons and data to the host in station mode, so management frames from other devices never
+  reach the RX ring at all - the AWDL code cannot fix that, the chip's RX path has to be opened up;
+* the ROC grant is real but the radio never actually leaves the AP's channel, so every "off-channel" window is spent
+  listening to the infrastructure channel.
+
+`awdl stat` now separates them without another guess: `onch` counts the frames whose RXD3 channel field (p[13]) really is
+the parked channel, and `fc` is a class histogram of everything heard inside a window (beacons / probe / action / other
+management / data):
+
+```
+awdl stat: try=100 tx=97 rocfail=3 rocframes=86 onch=.. bcn=.. af=0 ch=.. fc=../../../../..
+```
+
+`onch ≈ rocframes` and `fc` beacons+data only → the radio is switching and the firmware is filtering management frames:
+the next step is the firmware sniffer path (`MCU_UNI_CMD(SNIFFER)` / `UNI_SNIFFER_ENABLE`), the only documented way to make
+an mt7925 hand every frame to the host.
+`onch = 0` → ROC is a no-op on this firmware and the AWDL channel has to be changed the hard way.
+
+### 10.17 Following the reference implementation: the sniffer, not the station RX filter
+
+Everything so far assumed the station path could be made to deliver another device's action frame. It cannot: `10.13` and
+`10.16` show beacons and data arriving inside the ROC window and never a single management frame from a foreign BSS, on
+three different channels. The one public MT7925 AWDL implementation (§4) does not work that way either - it runs the radio
+as a monitor/sniffer, which is exactly why it needs the AP link on a social channel (6/44/149) in its "shared" mode.
+
+The receive half therefore now opens the firmware sniffer for the duration of the ROC window, and only for it:
+
+```
+ROC on the social channel (grant, status 0)
+  MCU_UNI_CMD(SNIFFER) / UNI_SNIFFER_ENABLE  = 1
+  MCU_UNI_CMD(SNIFFER) / UNI_SNIFFER_CONFIG  (band, 20 MHz, control = centre = that channel, drop_err)
+  ...frames arrive, the RX ring is drained, awdlPollRx hands them to the peer manager...
+  MCU_UNI_CMD(SNIFFER) / UNI_SNIFFER_ENABLE  = 0
+ROC back to the AP channel
+```
+
+This keeps the infrastructure link: the radio is already parked off-channel for the window, so nothing is taken away from
+it that the ROC had not already taken, and the station is back on the AP channel 60 ms later. `awdl stat` (`onch`, `fc`,
+`af`) stays as the verdict: if `fc` now shows action frames and `af` moves, the receive path is open and the remaining work
+is the Family's own advertise path; if the histogram does not change, the firmware ignores the sniffer while the interface
+is a station and the next attempt is a real monitor vif.
+
+Second documented blocker that this does not solve: an iPhone only starts AWDL after a BLE advertisement from the sender
+(§2), and this machine's BT scan-filter offload `0x1812` fails. A test against an iPhone therefore measures the BLE wake-up
+path too; two Macs (or an iPad whose AirDrop sheet is open) are the cleaner RX test.
+
+### 10.18 What the Family actually needs from the driver (and what it cannot send itself)
+
+A full symbol scan of IO80211Family settles a question that was still open in `10.12`: the Family never transmits an AWDL
+action frame itself. There is no `outputActionFrame` and no `sendActionFrame` on `IO80211Controller` or on the virtual
+interface - the only transmit-shaped symbol on the AWDL path is `IO80211VirtualInterface::sendToBpfTap`, and the AF thread
+(`IO80211AWDLPeerManager::actionFrameProcessThread`) does nothing but tap the frame to BPF, account for it and release its
+buffer. On Broadcom hardware the service-request / master-indication frames are built *by the firmware* from the parameters
+the Family hands over: `setAWDL_AWDL_ADVERTISERS` (`awdl_peer_advert_add`), `setAWDL_PRESENCE_MODE`,
+`setAWDL_ELECTION_PARAMS`, `setAWDL_AF_TX_MODE`, `setAWDL_SYNC_PARAMS`, `setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE`.
+Those are the frames we still have to build ourselves, and their layouts are exactly what the driver was ignoring with
+`awdlAccept()`.
+
+Confirmed while reading the same vtable: `IO80211VirtualInterface::setAwdlCurrentChannelSequenceIndex` (slot 473) is an
+*empty* function in the base class - a hook the driver is expected to fill. It is the Family telling the driver which entry
+of the synchronisation channel sequence the cluster is on. The interface now follows that index instead of rotating on its
+own, and only free-runs the sequence when the Family never drives one (discovery).
+
+`setAWDL_AWDL_ADVERTISERS`, `setAWDL_PRESENCE_MODE` and `setAWDL_ELECTION_PARAMS` are now traced (first bytes / first four
+words, bounded) instead of silently accepted, so the next AirDrop-open boot yields the layout of the advertise payload that
+the service-request frame has to be built from.
+
+### 10.19 The sniffer works - the frame is not at offset 32
+
+With the sniffer on, the ROC window delivers 1686 frames per 100 periods instead of 86: the receive path is open. But the
+`af` hits it produced were false positives, and the class histogram filled with "other management" (1681 of 1686) - the RX
+buffer layout changed under the parser.
+
+`mt7925_mac_fill_rx()` says why: after the 32 bytes of RXD the firmware appends optional groups depending on RXD1/RXD2, and
+the frame starts after them (`mt76_connac2_mac.h`):
+
+```
+off = 32
+    + 16 if RXD1.GROUP_4 (BIT 14)   fc/seq of the frame
+    + 16 if RXD1.GROUP_1 (BIT 11)   IV
+    + 16 if RXD1.GROUP_2 (BIT 12)   timestamp
+    + 16 if RXD1.GROUP_3 (BIT 13)   P-RXV  (+24 more if GROUP_5, C-RXV)
+    + RXD2.HDR_OFFSET (bits 15:14)
+```
+
+Station-mode frames carry no group, which is why the fixed 32 was right for the data and beacon paths since the first RX
+work - but the sniffer sets GROUP_4, so offset 32 lands on `d0 00 00 00 ...`, the group, not the action frame. The AWDL
+paths (action-frame probe, beacon probe, class histogram) now compute the offset with that formula; the group bits are
+dumped once per boot (`awdl rx hdr off=.. rxd=..`) so the layout can be verified against real traffic instead of assumed.
+
+### 10.20 Regression: the offset formula broke the scan path (and the HDR_OFFSET unit)
+
+The first boot with §10.19 came up with no Wi-Fi at all: `scan:delivered 0 of 0`, no beacons, no association. The cause was
+not the sniffer - it was applying `rxHdrOff()` to the *scan* probe. That probe feeds `rxBeacons`/`m3Capture`/`apSeen`, i.e.
+the live link's scan and associate path, and it had been correct at a fixed offset of 32 since the first RX work.
+
+Two lessons, both now encoded:
+
+1. **`HDR_OFFSET` is in 2-byte units.** `mt7925_mac_fill_rx()` computes
+   `hdr_gap = (u8 *)rxd - skb->data + 2 * remove_pad;` with `remove_pad = FIELD_GET(MT_RXD2_NORMAL_HDR_OFFSET, rxd2)`.
+   Adding the raw field (what §10.19 did) leaves the offset 2-6 bytes short, which is enough to miss every beacon. Group
+   sizes confirmed against the same function: GROUP_4/GROUP_1/GROUP_2/GROUP_3 are 16 bytes each and GROUP_5 is 24.
+2. **Only the AWDL probes may use the computed offset.** The scan/associate path keeps the plain station-mode offset of 32,
+   and the data/control/deauth paths keep it too. A frame missed on the scan path costs the link; a frame missed on the AWDL
+   probe costs a diagnostic counter.
+
+The descriptor dump (`awdl rx hdr off=.. rxd=..`) stays, and its read is bounds-checked.
+
+### 10.21 RX probe: search by signature instead of by offset
+
+The computed offset is still not trusted (the descriptor dump that would pin it down is evicted from the m3-log ring before it can be read), and every narrow window built on it either missed real frames or, worse, counted group words as action frames. The probe now scans 32..160 and requires the full AWDL signature (`0xd0 00` action header, protocol version 0, sane addresses, then `7f 00 17 f2 08` at +24) before anything is counted or queued. Group words and data frames cannot satisfy that, so `af` now means "real AWDL action frames heard" and the peer manager only ever receives genuine frames. The descriptor dump (`awdl rx hdr off=.. rxd=..`) stays for the first three frames of the boot.
+
+### 10.22 The ROC window was 90% dead, and "no AWDL frame" was never proven
+
+Two boot-long mysteries (`af=0`, "the firmware does not deliver AWDL frames") turned out to rest on a measurement bug, and
+the measurement itself was never sound. Both are fixed here.
+
+**1. The sniffer was on for ~8 ms out of every ~110 ms window.** `awdlSyncTx()` enabled the promiscuous mode *after* the
+ROC grant and turned it off again a handful of milliseconds later, right before our own transmission:
+
+```
+m3Roc(true, ch);                    // park on the social channel
+for (i < 80 && !rocGrant) m3Pump(1);// wait for the grant
+m3Sniffer(true, ch);                // <- promiscuous mode starts HERE
+for (i < 8) m3Pump(1);              // <- 8 ms of receiving
+...TX...
+m3Sniffer(false, ch);               // <- and it ends here
+```
+
+In station mode the chip only hands the host its own BSS; the promiscuous mode is the *only* reason a peer's PSF/MIF can
+reach the host at all. A peer's frame arrives at an arbitrary point inside its availability window, so listening for 8 ms
+out of a 440 ms period throws away ~98% of the window - and the "no AWDL frames on the air" conclusion was drawn from it.
+`awdlDwellMs` (the dwell the native interface asks for, currently 100 ms) was stored and never used at all. The sniffer is
+now enabled *before* the ROC and stays on for the whole dwell, which is also the only way the `awdl stat` numbers mean
+anything.
+
+**2. The RX filter was programmed once per link.** `m3RxFilter()` (the "pass frames from other BSS" band-config TLV) ran
+only when the link came up; the firmware resets it when the channel changes, so by the time the radio parked on the next
+social channel it was gone. It is now reprogrammed in every window, with all four bits the chip defines
+(`0x80000064` = ENABLE | OTHER_BSS | CONTROL | FCSFAIL).
+
+**3. The RX classifier could not tell an AWDL frame from a coincidence.** The histogram and the probe matched the first
+byte of the buffer against `0xd0`, which a data payload satisfies easily; the result was a histogram full of phantom
+"action frames" (`1164` other-management frames over 2574 frames is not a real air). Three unambiguous patterns are now
+counted per buffer instead:
+
+| counter | pattern | meaning |
+|---|---|---|
+| `oui`  | `00 17 f2`        | Apple's OUI is in the buffer somewhere |
+| `sig`  | `7f 00 17 f2 08`  | the AWDL action header is in the buffer |
+| `bss`  | `00 25 00 ff 94 73` | AWDL's BSSID is in the buffer |
+
+`sig > 0` means the firmware does deliver AWDL frames and the probe's offset is wrong. `oui > 0, sig == 0` means the frames
+are there but not where the probe looks. `oui == 0` means the firmware delivers no AWDL frame on this interface at all, and
+the next step is a different interface type (the only public mt7925 AWDL implementation listens through a *monitor* vif, not
+through an AWDL one - see the risk below).
+
+The probe now scans the whole buffer (not just the first 160 bytes: the sniffer's RXD groups push the frame further out),
+and a `fc == 0xd0` frame that fails the signature check is dumped as a *near miss* instead of being dropped silently, so a
+frame that is nearly AWDL can be recognised.
+
+**4. The diagnostics were evicted before they could be read.** The ROC fires five logged commands per period; the m3-log
+ring holds ~258 lines, so the descriptor dump was gone within seconds. The ROC/sniffer command logging is now suppressed
+while an AWDL window is open (failures are still reported), and the forensics dump is emitted for the first four frames of
+a window and then every 250th frame.
+
+The reference layout this all follows is the one the public AWDL implementation uses (`t4t5/owly`, `crates/owly-awdl/src/frame.rs`):
+24-byte 802.11 header (`fc = 0x00d0`, broadcast DA, peer SA, BSSID `00:25:00:ff:94:73`) + 16-byte action header
+(`7f` category, `00:17:f2` OUI, type `08`, version `0x10`, subtype `0` = PSF / `3` = MIF, two microsecond timestamps) + TLVs.
+
+**5. The sniffer's channel configuration was sent before the radio moved.** `UNI_SNIFFER_CONFIG` carries the channel the
+promiscuous mode listens on, and the reference implementation updates it when the channel context changes
+(`mt7925_change_chanctx` -> `mt7925_mcu_config_sniffer`), i.e. *after* the radio is on the new channel. The enable and the
+config are now separate commands (`m3SnifferEnable` / `m3SnifferConfig`): the mode is switched on before the ROC, and the
+config is re-sent with the social channel once the ROC grant came in.
+
+For the record, the channel rotation is not the problem it looks like. AWDL's availability window is 16 TU (16.4 ms) and the
+peer sends a PSF in every window, on the channel of the slot it is in; with three social channels that is one AW per
+82.5 ms, which a 100 ms dwell always covers. The phase between our 1320 ms rotation and the peer's 440 ms period is
+therefore harmless: a window is always caught.
+
+### 10.23 The AWDL receive path works - and panics the kernel in the last step
+
+The four panics of 2026-10-22 (10:35, 11:33, 12:20, 12:44) have the same backtrace, and it is the best news in this whole
+project:
+
+```
+0xffffff801693112a com.apple.iokit.IO80211Family : IO80211VirtualInterface::sendToBpfTap(IO80211Buffer*, uint, void*, ulong) + 0x2a
+0xffffff801680e87d com.apple.iokit.IO80211Family : IO80211AWDLPeerManager::actionFrameInput(IO80211Buffer*, uint, void*, ulong) + 0x6cf
+0xffffff8018bcc2de com.itlmt7925.native          : itlmt7925AwdlInterface::awdlDeliverRx(unsigned char const*, unsigned int) + 0xde
+0xffffff8018bcc08e com.itlmt7925.native          : itlmt7925AwdlInterface::awdlPollRx() + 0x8e
+0xffffff8018bcbe7b com.itlmt7925.native          : itlmt7925AwdlInterface::awdlPsfTick() + 0x2b
+```
+
+The driver reached `IO80211AWDLPeerManager::actionFrameInput` with a **real AWDL action frame**. The receive half works: the
+firmware does deliver AWDL frames, the signature probe recognises them and they are queued and handed up. The `af=0` in the
+statistics was read before the first frame arrived.
+
+**The panic was our own fault.** `actionFrameInput` takes an `IO80211Buffer*`, and the driver passed a
+`{const uint8_t *data; uint64_t len;}` pair pretending to be one. The Family calls virtual methods on it:
+
+```c
+// IO80211VirtualInterface::sendToBpfTap, IO80211Family 25G241
+mov      rax, qword ptr [r13]        ; r13 = the "buffer" -> our data pointer
+mov      rdi, r13
+call     qword ptr [rax + 0x130]     ; IO80211Buffer::getLength() - through the frame bytes!
+```
+
+`0x130` is slot 38 of `IO80211Buffer`'s vtable (`getLength`). Calling through the *frame bytes* jumps into garbage: a general
+protection fault, and with it the machine. The same call exists in `IO80211AWDLPeerManager::actionFrameProcessInput` and in
+`isValidAF`, which is where the peer manager reads the frame through `getCursor()`.
+
+**What the peer manager actually wants** (all of this read out of IO80211Family 25G241):
+
+| argument | what it is |
+|---|---|
+| 1. `IO80211Buffer*` | the **AWDL action body**: category `0x7f`, Apple's OUI `00:17:f2`, type `8`, version, subtype, the two timestamps and the TLVs - i.e. the frame *without* the 24-byte 802.11 header. `getCursor()` starts at the buffer's first byte and `actionFrameHasCorrectOUI` compares `00:17:f2 / 08 / 00` at offsets 1..5, i.e. the category is at offset 0 |
+| 2. `uint len` | the length of that body (**wrong**: it is the frame type `0xc`, see §10.26) |
+| 3. `void* param` | a pointer to `apple80211_act_frm_hdr`, the 802.11 header of the frame. `findPeer()` looks the peer up with it and `addAWDLPeer()` copies its first six bytes into `IO80211AWDLPeer::withAddressAndManager()` - so **the sender's address is at offset 0**. Offset `0x10` is the channel (`updateAFStats` compares it with 14 to tell 2.4 GHz from 5 GHz), offset `0x2c` a timestamp (**wrong**: `+0x2c` is the RSSI and the struct is 0x48 bytes, see §10.26) |
+| 4. `uint64 category` | the expected category byte, `0x7f` (`isValidAF` rejects anything `<= 0x47` and hands the low byte to `actionFrameHasCorrectOUI`) (**wrong**: it is the header length and must be `0x48`, see §10.26) |
+
+**The fix.** The buffer is now a real `IO80211Buffer`, taken from the Family's own pool machinery
+(`IO80211Buffer::allocBufferSingle(type, size, &pool, name)`, exported by IO80211Family - the argument order was wrong in
+this round and is what panicked next, see §10.24), with the body written into it
+(`writeBytes`/`setLength`). The buffers are kept in a ring of eight and reused round-robin instead of being freed right after
+the call: the Family copies the payload out, but its peer bookkeeping may still look at the buffer, and freeing it would turn
+that into a use-after-free.
+
+The header the peer manager wants next to it is built as `apple80211_act_frm_hdr` with the sender's address at offset 0, the
+channel at `0x10` and the sender's clock (the AWDL `phy_tx` timestamp) at `0x2c`; the fields the Family never reads are zero.
+
+The core now also hands the channel the frame was heard on up to the interface (`ItlNativeAwdlRx::channel`), so the peer
+manager gets the right channel instead of a guess.
+
+### 10.24 The panic in 10.23: `allocBufferSingle` was called with its arguments swapped
+
+The next round (Kernel-2026-10-22-131442) panicked on the first AWDL frame that reached `awdlRxBuffer`:
+
+```
+IO80211StaticBufferPool::flushPool+0x2b          CR2=0x8, RAX=0
+IO80211StaticBufferPool::free+0x1c
+IO80211StaticBufferPool::withOptions+0x6b
+IO80211BufferPool::withOptions(IO80211BufferPoolOptions*, bool)+0x94
+IO80211Buffer::allocBufferSingle(uint, ulong, IO80211BufferPool**, char const*)+0x7a
+itlmt7925AwdlInterface::awdlRxBuffer+0x6b
+```
+
+This is not a race and not a Family bug: **we passed the two first arguments the wrong way round.** The 25G241
+IO80211Family (extracted from `BootKernelExtensions.kc`, the same `xnu-12377.161.15.700.19~2` build the panic came from):
+
+`IO80211Buffer::allocBufferSingle` (0xffffff800233b71e) builds `IO80211BufferPoolOptions` on the stack like this:
+
+```
+mov  qword ptr [rdi], 1              ; options+0x00 = 1
+mov  qword ptr [rdi+8], rsi          ; options+0x08 = SECOND argument  <-- the buffer size
+mov  qword ptr [rdi+0x18], rcx       ; options+0x18 = name
+mov  dword ptr [rdi+0x28], r13d      ; options+0x28 = FIRST argument   <-- the allocator type
+mov  word  ptr [rdi+0x38], 0
+xor  esi, esi
+call IO80211BufferPool::withOptions ; bool = false -> the static pool path
+```
+
+`IO80211StaticBufferPool::initWithOptions` (0xffffff80021889ee) validates `options+0x08` **before** it links anything:
+
+```
+mov  rax, qword ptr [r14+8]          ; the size
+mov  qword ptr [rcx+0x38], rax       ; ivars+0x38
+test rax, rax
+je   0xffffff8002188d99              ; size == 0 -> return false
+...
+mov  qword ptr [rcx], rcx            ; (only now) list anchors get linked
+```
+
+The driver called `allocBufferSingle(kAwdlRxBufCap /*2048*/, 0, &pool, "itlmt-awdl-rx")`, so the Family got
+**size = 0** (the second argument) and 2048 as the allocator type (the first). `initWithOptions` returned false with the
+0x110-byte `kalloc_type` IVars still zeroed. `IO80211StaticBufferPool::withOptions` then takes its failure path
+(`call qword ptr [rax+0x28]` = `free()`), `free()` calls `flushPool()` through vtable slot 0x128, and `flushPool` does:
+
+```
+mov  rcx, qword ptr [rbx+0x10]       ; ivars
+mov  rdi, qword ptr [rcx+0x48]       ; 0, nothing to kfree
+mov  rax, qword ptr [rcx]            ; list anchor = 0 (zeroed memory)
+cmp  rcx, rax                        ; not the anchor -> treat it as a buffer
+mov  rdx, qword ptr [rax+8]          ; <-- fault, CR2=0x8
+```
+
+The registers in the panic are exactly that state: `RBX` = the new pool, `RCX` = the zeroed IVars, `RAX`/`RDI`/`R14` = 0,
+`R13` = 0x800 (our first argument, preserved in `allocBufferSingle`), `R12` = 0 (our second argument: the size).
+`R14` in `flushPool` is zeroed just before the fault, which is why it is 0 and not the loop counter the pre-25G241 code had.
+
+**The first fix (superseded by 10.25).** Call it as the Family does: `allocBufferSingle(0, kAwdlRxBufCap, &pool, name)`. Apple's own callers confirm the
+order in the same build: `IO80211LQMCrashTracer::initLQMRingBuffer` passes `(0, size)`, `IO80211IOUCEventPipe::initWithClient`
+passes `(0x10003, pageRoundedSize)` and `(0x10003, 0xc)`. The allocator type goes into the slab options at `+0x20` and from
+there to the kalloc call, so 0 (what the LQM ring buffer uses) is the plain case.
+
+That fixed the panic (the 22 Oct 17:45 boot is clean), but it is not enough for the static pool: `options+0x08` is the
+controller's DMA segment (see 10.25), which this driver does not own. The receive path therefore takes its buffers from an
+`IO80211DynamicBufferPool` instead.
+
+`allocBufferSingle` also already frees and releases the pool on its own failure paths and only writes `*pool` on success, so
+the `if (pool) pool->free()` in our error branch was removed: it could only ever have been a second free.
+
+The lesson for the rest of the Family API: the mangled name fixes the *types* but says nothing about the *meaning* of the
+arguments. `j`/`m` told us `uint` and `ulong`, and the natural reading - `(size, flags)` - was wrong. Every Family entry point
+used from here on has to be read out of the KernelCollection, not guessed from its signature.
+
+The entry a kernel collection hands a disassembler is not a standalone Mach-O: its load commands keep the file offsets of the
+`.kc` file, so Ghidra (and lldb) reject or misread it. `tools/kc_extract.py` now rebases them (segments, sections, symtab,
+dysymtab, dyld info, linkedit data, encryption info) while keeping the vmaddrs. The extracted 25G241 IO80211Family is then a
+normal Mach-O and can be read with REA/Ghidra (`GHIDRA_INSTALL_DIR`, `rea decompile <macho> <mangled symbol>`), e.g.
+`__ZN13IO80211Buffer17allocBufferSingleEjmPP17IO80211BufferPoolPKc`.
+### 10.25 Which buffer pool the driver may use (Kernel-2026-10-22-131442)
+
+The first attempt at 10.23 asked the Family for a buffer through `IO80211Buffer::allocBufferSingle(size, segment, &pool, name)`
+and the machine panicked in the Family's own error path:
+
+```
+IO80211StaticBufferPool::flushPool + 0x2b          page fault, CR2 = 0x8
+IO80211StaticBufferPool::free + 0x1c
+IO80211StaticBufferPool::withOptions + 0x6b
+IO80211BufferPool::withOptions + 0x94
+IO80211Buffer::allocBufferSingle + 0x7a
+itlmt7925AwdlInterface::awdlRxBuffer + 0x6b
+```
+
+`allocBufferSingle` is not a general-purpose entry point. It fills `IO80211BufferPoolOptions` with `count = 1`, the name, a
+size at `+0x28` and **its second argument at `+0x08`** - and for the static pool that field is the **DMA segment** Apple's
+driver owns (`initWithOptions` does `rivars[0x38] = opts[8]; test rax, rax; je <fail>`). With a zero there the pool fails, and
+`IO80211StaticBufferPool::withOptions` then calls the object's release slot on a half-built object, whose `flushPool` walks a
+null list. That is a Family bug, but it is reachable only by calling that entry point without a segment.
+
+The pools, and what each needs:
+
+| pool | needs | usable here |
+|---|---|---|
+| `IO80211StaticBufferPool` | `opts[8]` = Apple's mapped DMA segment | no |
+| `IO80211MallocBufferPool` | nothing, but its buffers only override `getLength`/`setLength`/`readBytes` - the base `writeBytes` would read the slab at `+0x10`, which a `IO80211MallocBuffer` does not have (its state is at `+0x18`) | no |
+| `IO80211DynamicBufferPool` | `opts[0]` = count, `opts[8]` = bytes per buffer, `opts[0x18]` = name | **yes** |
+
+The dynamic pool allocates its own memory: `getBuffer()` -> `allocateSlab()` -> `IO80211BufferSlab::withOptions()` ->
+`IOBufferMemoryDescriptor::inTaskWithGuardPages()`, then `allocateBufferFromSlab()` -> `IO80211Buffer::allocBuffer()`, which
+builds a plain `IO80211Buffer` (state at `+0x10`, `getLength` at `slab[0x20]`). Those buffers support the base
+`writeBytes(offset, data, len)` and `setLength(len)`, which is exactly what the receive path needs.
+
+So the receive path creates one `IO80211DynamicBufferPool` (8 buffers x 2048 bytes) on the first AWDL frame and takes the
+ring's buffers from it; the pool stays alive for the lifetime of the interface, so nothing the peer manager still looks at is
+ever freed.
+
+`IO80211BufferPool::withOptions(opts, bool)` is not used: apart from the `bool` (which selects the malloc pool) it decides
+between static and dynamic on a boot-arg (`dynamic_buffer`), not on the caller's wish, and it panics when the chosen pool
+fails to build.
+
+### 10.26 Round 2026-11-03: the receive hand-off had four ABI errors, read out of 25G241 (no reboot yet)
+
+State at the start of this round: the installed kexts are the f7058a9 build (dynamic pool, §10.25). The roadmap has no
+hardware result for it, and on the 2026-11-03 21:24 boot `awdl0` did not exist (it is only created by
+`tools/awdl/awdl-vif-test.applescript` / `~/vif_create_test en5`, §9.3), so the receive path never ran. The two panics of
+that morning (08:39, 09:03) are in `com.nullmoth.NMXGPU` (`amdgpu_cs_ioctl`), not in this driver.
+
+Before spending a boot on it, the whole hand-off was read again in the 25G241 KernelCollection (`tools/kc.py`, the
+vtables with `tools/kc_vtable.py`; vtable offsets below are from the vptr). It had four errors, each of which alone would
+have kept peers from ever appearing, and one of which is a use-after-free.
+
+**1. The Family consumes the buffer - the round-robin ring was a use-after-free.** `IO80211AWDLPeerManager::actionFrameInput`
+ends every path with `call [buf->vptr + 0x118]`, which is `IO80211Buffer::returnBuffer()` (slot 37). `returnBuffer` calls
+the owning pool's `returnBuffer(buf)` (`[pool->vptr + 0x120]`), and `IO80211DynamicBufferPool::returnBuffer` sets the slab's
+free bit and **releases the buffer object** (`call [buf->vptr + 0x28]`), freeing the slab too when it is empty and above the
+pre-allocated count. When the AF queue is enabled (`ivars+0x41f0` bit 0) the buffer pointer is stored in the queue
+(entry `+0x00`, 0x68-byte entries) and returned later by the AF worker. The ring of eight therefore kept pointers to freed
+objects and wrote the ninth frame into one of them. Apple's driver does the same as the fix: one fresh buffer per frame,
+never touched again after the hand-off (`AppleBCMWLANProximityInterface::handleActionFrame_rx` takes a buffer from the pool,
+and returns it itself only on its own error path).
+
+**2. The fourth argument is the length of the receive header, and it must be 0x48.** `isValidAF` rejects anything
+`<= 0x47`, and the queued path of `actionFrameInput` does `cmp r15, 0x49; jae ud2` before
+`memmove(entry + 0x10, hdr, r15)`: the only value both accept is `0x48`. The driver passed the category `0x7f` there (the
+§10.23 reading of the argument was wrong; `actionFrameHasCorrectOUI` only prints it). With the AF queue enabled that is a
+`ud2` - a kernel panic - on the first frame; in the direct path it went through only because nothing else checks it.
+
+**3. The second argument is a frame type (0xc), not the body length.** Apple's driver does not call the peer manager at all:
+it calls `IO80211VirtualInterface::bpfTapInput(buf, 0xc, &hdr, 0x48)`, and `bpfTapInput` forwards to
+`peerManager->actionFrameInput(buf, 0xc, hdr, 0x48)` (vtable `+0x238`) only when the type is `0xc`, otherwise it goes to
+BPF and returns the buffer. The type is stored in the AF queue entry (`+0x08`) and handed to `sendToBpfTap`. The driver now
+calls the exported `bpfTapInput` exactly like that, which also removes the vtable-slot-73 call and its pointer-distance
+check.
+
+**4. `apple80211_act_frm_hdr` is 0x48 bytes and `+0x2c` is the RSSI, not a timestamp.** `handleActionFrame_rx` bzeroes
+0x48 bytes on its stack and fills:
+
+| offset | field | source in Apple's driver | read by the Family |
+|---|---|---|---|
+| `+0x00` | sender address (6) | firmware event `addr` | `findPeer`, `addAWDLPeer` -> `IO80211AWDLPeer::withAddressAndManager` |
+| `+0x0c` | `apple80211_channel` {version, channel, flags} | `ChanSpecConvToApple80211Channel` | `updateAFStats` (`+0x10` vs 14), `determinePeerReachability` (`+0x10` vs 15) |
+| `+0x28` | rate | `rx_frame_data` rate (byte-swapped) | (wifip2pd) |
+| `+0x2c` | **RSSI, dBm** | `rx_frame_data` rssi (byte-swapped) | `actionFrameProcessInput`: a new peer only if `rssi >= ivars+0x281c` (-70, `initParamsToDefaults`, `setAwdlElectionRssiThresholds`); `determinePeerReachability`: `rssi == 0` -> 3 = unreachable, `addAWDLPeer` then creates no peer; `enqueuePeerInOrder(peer, rssi)` |
+| `+0x30` | receive time | `rx_frame_data` mactime | (wifip2pd) |
+| `+0x40`, `+0x44` | v2 event fields | `rx_frame_data` v2 | - |
+
+`postAFToP2pd` copies exactly 0x48 header bytes plus the body to wifip2pd. The driver had a 0x38-byte struct with the
+sender's clock at `+0x2c`: as a signed RSSI that is a random number, so a peer was created only when the clock happened to
+look like a value above -70 and the queued path read 16 bytes past the struct.
+
+**The fix (native `itlmt7925_awdl.cpp`, `io80211_buffer_min.h`; core `itlmt7925_m2/m3/eth.cpp`, `itl_native_bridge.h`):**
+
+* `AwdlActFrmHdr` is the 0x48-byte layout above (`static_assert`), with `chVersion = 1`, `chFlags` = band (0x8 / 0x10) |
+  0x2, the RSSI and the receive time.
+* One buffer per frame from a dynamic pool (16 x 2048) that is shared by every AWDL interface and lives as long as the kext,
+  so a buffer the Family returns late always has its pool; handed over with `bpfTapInput(buf, 0xc, &hdr, 0x48)`.
+* The core decodes the RSSI of every queued AWDL frame with the beacon decoder (`rxRssi()`, RCPI of the RX vector) and stamps
+  the host uptime in microseconds; `ItlNativeAwdlRx` is version 2 with `rssi` / `rxTimeUs` (the core still answers v1, the
+  native side falls back to v1 against an older core). The `awdl af rx` line now prints `rssi=`, RXD1 and the header offset,
+  so the next boot shows whether the vector is found in the sniffer layout. A frame whose vector cannot be decoded gets -70
+  (the peer manager's own default edge) and is counted as `norssi` - interim, until that line pins the layout down.
+* The TLVs of the body (1-byte type, 2-byte LE length) are walked; a tail of at most 4 bytes after the last complete TLV
+  (an FCS or padding from the RX buffer) is cut, a longer mismatch is passed on unchanged and counted (`badtlv`).
+* `awdl:rx af` traces the first 8 frames and every 200th, with the counters
+  `norssi / weak (< -70) / nobuf / trim / badtlv`. The `ok=` value is gone: `actionFrameInput` always returns 0.
+
+Built at the round's commit, link-checked against this KC (`tools/check_kext_links.py`, `bpfTapInput` is exported), and the
+call checked in the binary (`edx = 0xc`, `r8d = 0x48`, `rcx = &hdr`). **Staged on the ESP 2026-11-03 21:41**; the previous
+kexts are `EFI/OC/Kexts-backup/itlmt7925.kext.20261103-214158` and `itlmt7925Native.kext.20261103-214158` (Info.plist
+identical, no credentials to carry). Nothing in this batch runs before `awdl0` exists, so station Wi-Fi is the same code as
+before.
+
+#### Test for the next boot (one boot, the order matters - §10.9)
+
+1. Boot normally. Check Wi-Fi first: `ping -c3 1.1.1.1`; `kmutil showloaded | grep itlmt7925` must show new UUIDs
+   (not `76DA2B9F...` / `550DFC0C...`).
+2. Create the interface: `osascript tools/awdl/awdl-vif-test.applescript` (asks for the administrator password). Expect
+   `rc=0 bsd_name='awdl0'`.
+3. Finder > AirDrop, "Allow me to be discovered by: Everyone for 10 Minutes"; close the AirDrop window and open it again.
+4. Put an iPhone (or a Mac) next to it with its AirDrop share sheet open (screen on, Wi-Fi + Bluetooth on). Leave both for
+   two minutes; more than 8 frames have to be received, because the ninth is where the old ring wrote into a freed buffer.
+5. Collect, in one go:
+   ```
+   bash tools/awdl/collect.sh > ~/awdl-10.26.txt 2>&1
+   log show --last 15m --predicate 'sender == "IO80211Family" OR process == "wifip2pd"' --style compact 2>/dev/null | grep -i -E 'peer|awdl' | tail -200 >> ~/awdl-10.26.txt
+   ```
+6. Read:
+   * native trace: `awdl:rx buffer pool ready (16 x 2048)` once, then `awdl:rx af n=...` with `n` past 8 and no panic.
+     `rssi=` should be negative and `norssi=0`; `nobuf` / `badtlv` should stay 0; `trim` says whether the RX buffer carries
+     a tail.
+   * core ring: `awdl af rx ... rssi=<dBm> d1=<RXD1> off=<header offset>` - `rssi=0` means `rxRssi()` does not find the
+     vector in the sniffer layout (then `d1`/`off` are what fixes it).
+   * Family / wifip2pd log: a peer being added for the phone's AWDL address (the `sa=` of the `awdl:rx af` lines).
+7. If it panics: keep `/Library/Logs/DiagnosticReports/Kernel-*.panic`. Undo (the ESP is mounted user-owned):
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad && mv Kexts-backup/itlmt7925.kext.20261103-214158 Kexts/itlmt7925.kext && mv Kexts-backup/itlmt7925Native.kext.20261103-214158 Kexts/itlmt7925Native.kext
+   ```
+   Not running step 2 is enough to keep the new receive code from running at all.
+
+Next, depending on the result: with peers in the Family's table, phase 4 starts - check that the peer lists us in its sync
+tree (our PSF accepted) and read `IO80211AWDLPeerManager`'s TX of the MIF / service response; without peers but with
+`rssi` / TLVs clean, the next suspect is the body itself (`actionFrameProcessInput`'s TLV parse, `isValidAF`).
+
+### 10.27 Hardware result of 10.26 (boot 2026-11-03 21:45): the peer manager has peers - next blocker is the AW timeline
+
+Test as in §10.26: new kexts loaded (core `CD0BF2A1`, native `6A5546E5`), Wi-Fi up, `vif_create_test` -> `awdl0`, AirDrop
+"Everyone" reopened. **No panic** with well over 8 frames received (the old ring would have written into a freed buffer at
+the ninth).
+
+What the traces show:
+
+* `awdl:rx buffer pool ready`, then `awdl:rx af` on all three social channels from five AWDL addresses; the RX-vector RSSI
+  decodes in the sniffer layout (`d1=80970fff`, header at 184): -55 .. -86 dBm, one frame of ~20 without a vector
+  (`norssi=1`). About half the frames are below the -70 edge (`weak`), as expected for devices in other rooms.
+* **The Family accepts them.** `com.apple.p2p.awdl0` logs `pppDone: Posted Peer Presence for DE:18:B3:E8:23:30` /
+  `86:B4:13:80:4C:AF`, `actionFrameReport: no overlap slots with [ 2A:0C:B5:75:EC:C7 ]`, and election runs against the peers'
+  trees (`isPeerSafeForElection: Peer DE:18:... seems to be stuck at AW0 18240, current AWSeqNum 18243`). §10.26 was the
+  receive blocker; receive is done.
+* `awdl:rx tail cut 2 bytes` - the RX buffer carries 2 bytes after the frame; cutting them is right.
+
+What blocks next (all from the same log, in order of importance):
+
+1. **No availability-window events.** `monitorAWEvents WARNING: Did not get AW start event for (70705 ms)` and
+   `isPeerSafeForElection: ALERT: Self ... seems to be stuck at AW0 0, current AWSeqNum 0`. On Apple hardware the firmware
+   runs the AW schedule and the driver forwards every AW start: `AppleBCMWLANProximityInterface::handleAvailabilityWindowStart`
+   copies the firmware event into an `apple80211_availability_window_start` (0x24 bytes) and calls
+   `IO80211Controller::postMessage(iface, 0x29, &aw, 0x24, true)`; the Family consumes it in
+   `IO80211AWDLPeerManager::reportDataPathEvents` (-> `monitorTimeline`, `logAWStart`). Layout as Apple's driver fills it
+   (firmware event offsets in brackets): `+0x00` u32 [fw+0x0a, u16], `+0x04` u32 role (fw+0x0d: 0 -> 2, 1 -> 3, 2 -> 1),
+   `+0x08` u32 [fw+0x04], `+0x0c` u16 [fw+0x08], `+0x0e` u32 [fw+0x16], `+0x12` u16 [fw+0x1a], `+0x14` u32 [fw+0x00],
+   `+0x18` `apple80211_channel` (from the chanspec at fw+0x0f). The meaning of each field (AW sequence number, TSF, slot,
+   ...) is next to read out of `monitorTimeline` / `logAWStart` / `sanityCheckAWStart`. This is the phase-4 core: the driver
+   has to run the AW timeline itself (sync to the master's TX down-counter from the sync-parameters TLV, AW = 16 TU, one
+   channel-sequence slot per EAW) and post 0x29 (and the AW-end / extension events, `handleAvailabilityWindowEnd` /
+   `...Extension`) on that schedule - which is also what the ROC windows must follow instead of the free-running 440 ms timer.
+2. **MIF frames are cut at 512 bytes.** MIFs on the air are 644-1015 bytes (`awdl af rx len=1015 ... sub=03`); the core's
+   queue slot (`AwdlRxSlot.data[512]`) and the native poll buffer are 512, so `TLVs end at 466 of 488`. Both need ~1600.
+3. **Single band.** `configureValidAWDLChannels Dual band not supported ... 5G: 0` and the channel sequence the Family sends
+   is channel 6 only (`CHANSEQ ... e0=6/008`), while the peers sit on 149/44 slots (`no overlap slots`). The AWDL device
+   capabilities / RSDB answer has to report 5 GHz.
+4. `buildMasterIndicationTemplate: Invalid _htCapabilityLength 0, skipping buildEnhDataRateTlv` - the MIF goes out without
+   HT capabilities; the driver has to hand the Family its HT capability IE.
+
+Items 2-4 are small and go into the same batch as 1; that batch is the next reboot.
+
+### 10.28 Round 2026-11-03 (2): the driver keeps the AW timeline, MIFs fit, dual band, HT caps (no reboot yet)
+
+All four blockers of §10.27 in one batch, each read out of 25G241 before it was written.
+
+**1. The AW timeline and the AW start event.** On Apple hardware the firmware numbers the availability windows (AW, 16 TU),
+puts four in an extended window (EAW, 64 TU) that takes one of the 16 channel-sequence slots, and at the start of every EAW
+it is present in hands `AppleBCMWLANProximityInterface::handleAvailabilityWindowStart` an event, which calls
+`IO80211Controller::postMessage(iface, 0x29, &aw, 0x24, true)` (`APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START`). The peer
+manager consumes it in `reportDataPathEvents` case 0x29 and `monitorTimeline`. `apple80211_availability_window_start`:
+
+| Offset | Field | Read by the Family as |
+|---|---|---|
+| +0x00 | AW number (u16 in a u32) | `AwNumber`; slot = `(AwNumber >> 2) & 15`; the next one is expected 4 AWs later per present slot |
+| +0x04 | sync role, the Family's own numbering (1 master, 2 slave, 3 non-election master) | `ivars+0x4284` |
+| +0x08 | master (6 bytes) | compared with the master it asked for in `SYNC_STATE` ("Waiting for Master=") |
+| +0x0e | top master (6 bytes) | "Detected TopMaster change" |
+| +0x14 | AW start time, microseconds, big endian | `FwAwStartTime` (byte-swapped) |
+| +0x18 | `apple80211_channel` {1, channel, flags} | the EAW's channel |
+
+The driver now keeps that clock (`itlmt7925_awdl.cpp`, `awdlTlTick`): a timer aimed at every EAW boundary posts 0x29 for each
+slot whose channel (from `setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE`) is non-zero. While the Family says we are master
+(`apple80211_awdl_sync_state` +4 = 1, read the way `setAWDL_SYNC_STATE` reads it: +4 state, +8 master address) the clock
+free-runs from the moment AWDL is enabled. As a slave (+4 = 2) it is re-aligned on every PSF/MIF from that master (or, when
+the master has not been heard for 1 s, from a node whose TLV names the same master) using the synchronisation parameters
+TLV: value +1 = TX down counter in TU ("dc"), +29 = AW sequence number ("sn"), +21 = the sender's master, the offsets
+`IO80211AWDLPeer::parseAwdlSyncParamsTlv` uses; the action header's PHY TX minus target TX time is subtracted. Top master is
+`apple80211_awdl_election_params` +0x16 (what Apple hands its firmware's election tree), the sync master when zero.
+
+The PSF now goes out on that timeline: every 7 EAWs (448 TU, the Family asks for 440), at an EAW start, on that slot's
+channel (walking 6/44/149 while the sequence has a single channel). The core transmits right after the ROC grant instead of
+at the end of the 100 ms dwell, and stamps the sync TLV's "dc" and "sn" at the real TX moment (`ItlNativeAwdlSync` v2 carries
+the timeline; `awdlStampSync`). Open point: whether "sn" names the AW in progress (default) or the next one. Both directions
+use the same convention, and `itlmt_awdl_snnext=1` in the boot args flips it without a rebuild.
+
+Not done: the AW end / extension end event (0x2b, 0x28 bytes, from `handleAvailabilityWindowEnd`); the radio is still on the
+AWDL channel only during the PSF window, not for every AW of the sequence (that is the data-path phase).
+
+**2. MIF truncation.** The core's AWDL RX slot (`AwdlRxSlot.data`) and the interface's receive buffer were 512 bytes; MIFs on
+the air were 644-1015. Both are 1600 now (the interface's is a member, not on the stack).
+
+**3. Dual band.** `IO80211AWDLPeerManager::configureValidAWDLChannels` tests the controller's loaded card capabilities
+(`ivars+0xb37 & 0x20`, i.e. `apple80211_capability_data` byte +7 bit 5, capability 29; Apple sets it from BCM feature flag
+0x1c) and otherwise logs "Dual band not supported" and zeroes every 5 GHz AWDL channel - which is why the sequence was 16 x
+ch 6. `getCARD_CAPABILITIES` now sets it: the MT7925 is a 2.4/5/6 GHz radio. This is the one bit there that the infra side
+can see change; watch station Wi-Fi in step 1.
+
+**4. HT capabilities.** The peer manager asks the infra interface for ioctl 0x9a (`getHT_CAPABILITY`, slot 481) through
+`IO80211PeerManager::getHtCapabilityIE`; the old "unsupported" left `_htCapabilityLength` 0. Answered now with the MT7925's
+HT Capabilities element (28 bytes with its header, the layout `AppleBCMWLANCore::getHT_CAPABILITY` returns): LDPC, 20/40,
+SM PS off, SGI 20/40, STBC, 7935-byte A-MSDU, A-MPDU 64 KiB / 8 us, MCS 0-15. The generator's CUSTOM set has it
+(`tools/gen_native_iface.py`).
+
+Staged 2026-11-03 22:16: core `70ED9B79-F037-3E9C-A9D5-30E0C2415E4C`, native `FE13D2AF-E38A-3EA3-B8C4-DE64F13E6DA2`; the
+previous pair (round 1, §10.26) is in `Kexts-backup/*.kext.20261103-221645`. Links checked against the KC (`check_kext_links`);
+the `postMessage` call has the same registers as Apple's (controller, interface, 0x29, &ev, 0x24, 1).
+
+#### Test for the next boot
+
+1. Boot normally. `ping -c3 1.1.1.1`; `kmutil showloaded | grep itlmt7925` must show `70ED9B79...` / `FE13D2AF...`.
+   Station Wi-Fi must behave as before (the dual-band bit and the HT answer are visible to the infra side).
+2. `osascript tools/awdl/awdl-vif-test.applescript` (administrator password) -> `rc=0 bsd_name='awdl0'`.
+3. Finder > AirDrop, "Everyone for 10 Minutes"; an iPhone/Mac with its share sheet open next to it, two minutes.
+4. Collect:
+   ```
+   bash tools/awdl/collect.sh > ~/awdl-10.28.txt 2>&1
+   /usr/bin/log show --last 15m --predicate 'subsystem == "com.apple.p2p.awdl0" OR sender == "IO80211Family" OR process == "wifip2pd"' --style compact 2>/dev/null | grep -i -E 'AW start|AwNumber|stuck|Master|Dual band|CHANSEQ|htCapability|sn=|election|peer' | tail -400 >> ~/awdl-10.28.txt
+   ```
+5. Read:
+   * native trace: `awdl:tl start role=1`, `awdl:tl aw=... posted=N fail=0` with N growing; `awdl:set CHANSEQ` with 44/149 in
+     the entries now (`e0..e2` not all `6/008`); after the Family elects a master, `awdl:tl role=2 master=...` and
+     `awdl:tl sync master ... adj=` with small `adj` (a few ms) after the first one.
+   * core: `awdl sync: tx ... stamped=N miss=0`; `awdl af rx` lengths above 512 for MIFs.
+   * Family: no "Did not get AW start event", no "Self ... stuck at AW0"; `monitorTimeline` "AwNumber=a->b" stepping by 4
+     (or 4 x the skipped slots); no "Dual band not supported"; no "Invalid _htCapabilityLength".
+   * If, as a slave, "AW Number discontinuity" or the peers' `sn=` disagree with our `aw=` by one: set
+     `itlmt_awdl_snnext=1` (boot args) for the following boot.
+6. Undo if needed (ESP is user-owned):
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad && mv Kexts-backup/itlmt7925.kext.20261103-221645 Kexts/itlmt7925.kext && mv Kexts-backup/itlmt7925Native.kext.20261103-221645 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.29 Hardware result of 10.28 (boot 2026-11-03 22:36) and round 3: TLV 4 built by the driver, the MIF goes out
+
+**What 10.28 fixed (seen on hardware).** Both kexts loaded, station Wi-Fi unchanged, `awdl0` up through the applescript. The AW
+start events are accepted: no "Did not get AW start event", no "stuck at AW0", and the PSF ticks now run on the AW timeline.
+The dual-band bit took: `awdl:set CHANSEQ` has 149 in it. MIFs arrive whole (938 bytes; 512 used to cut them). The Family
+holds one peer with 4 valid AirDrop services.
+
+**What is still broken.** AirDrop finds nothing, in either direction (the owner's report: this Mac does not see the other
+device and the other does not see this Mac). We found four causes, and fixed three of them this round:
+
+1. **Our frames had no sync parameters TLV (type 4).** Both Family templates carry only the Family's own TLVs:
+   * the PSF template starts with TLV 6;
+   * the MIF payload starts with the election parameters TLV.
+
+   Every PSF/MIF on the air starts with TLV 4. Apple's firmware inserts it, and so does every iPhone frame we capture (73
+   value bytes). A peer takes our timeline, master and channel sequence from that TLV. Without it nobody could sync to us,
+   and the core's TX stamping had nothing to stamp (`miss` counted up).
+2. **The MIF never left the radio.** `IO80211AWDLPeerManager::updatePrimaryPayloadMI` hands the master indication frame to
+   the driver. It uses `setAWDL_OOB_AUTO_REQUEST` (ioctl 0xe1), or `setAWDL_OOB_REQUEST` (0x95) for a one-shot. Both
+   answered unsupported, and the auto one was even exempted from the trace. The MIF is the frame that carries our services,
+   so no peer could see our AirDrop.
+3. **HT capabilities were still refused.** `getHT_CAPABILITY` existed (10.28), but ioctl 0x9a is not in `commandAllowed`,
+   so the gate answered ret 58 before the slot was ever reached.
+4. **There is no data path yet.** The radio is on an AWDL channel only during the PSF windows (100 ms of every 448 ms), and
+   awdl0 has no data path. AirDrop also needs mDNS/TCP over awdl0 (phase 5), so even with discovery working, a transfer
+   cannot finish yet. Not addressed this round.
+
+**Fixes (all in one boot).**
+
+* `itlmt7925_wifi.cpp`: `case 0x9a` (HT_CAPABILITY) is allowed.
+* `itlmt7925_awdl.cpp`, TLV 4: `awdlBuildSyncTlv()` builds the synchronisation parameters TLV (type 4, 73 bytes). The value
+  layout is the one `parseAwdlSyncParamsTlv` reads:
+
+  | Field | Value |
+  |---|---|
+  | tx channel | the window's channel |
+  | master channel | from `setAWDL_MASTER_CHANNEL`, default 6 |
+  | AW period | 16 |
+  | AF period | 110 |
+  | flags | 0x1800 |
+  | ext / cmn | 16 / 16 |
+  | ext counts | 3 |
+  | master address | self while master, the sync master while slave |
+  | presence mode | 4 |
+  | channel sequence | 16 entries, encoding 3 (channel + 20 MHz operating class: 81, 115, 118, 121, 124), step 3, fill 0xffff, 2 bytes of padding |
+
+  `awdlBuildFrame()` builds the 40-byte 802.11 + AWDL action header, then TLV 4 (unless the Family's TLVs already carry one),
+  then the Family's TLVs. The frame is built at every transmission because TLV 4 names that window's channel. The core
+  still stamps `dc`/`sn` and the timestamps at TX time.
+* `itlmt7925_awdl.cpp`, OOB requests: `awdlOob()` implements both OOB slots. The layout was confirmed this round from
+  `AppleBCMWLANProximityInterface::setAWDL_OOB_AUTO_REQUEST`:
+
+  | Offset | Field |
+  |---|---|
+  | +4 | u32 |
+  | +8 | u16 |
+  | +0xc | u32 |
+  | +0x10 | u32 |
+  | +0x14 | u16 |
+  | +0x16 | address |
+  | +0x28 | length (u16) |
+  | +0x30 | payload pointer |
+
+  Apple's driver hands these to the firmware as the iovar `awdl_oob_af_auto`. Ours handles them like this:
+  * the payload (≤ 1400 bytes) becomes a MIF, subtype 3;
+  * the auto request is broadcast; a one-shot to a unicast address goes to that address and is sent once;
+  * length 0 stops the MIF.
+* `setAWDL_SYNC_PARAMS` (0x18 bytes) is stored, traced and published raw, so the Family's values can be checked against our
+  TLV 4 defaults.
+* Core, `ItlNativeAwdlSync` v3:
+  * frames up to 1600 bytes (was 256);
+  * a second frame (`frame2`/`len2`), sent and stamped right after the PSF in the same ROC window;
+  * both frames are snapshotted into member buffers (too big for the stack);
+  * the eth bridge accepts v3 and keeps the 256-byte limit for v1/v2;
+  * the native side falls back from v3 to v2 to v1 against an older core.
+* Diagnostics on the AWDL interface's ioreg node (`ioreg -r -c itlmt7925AwdlInterface`). The NVRAM ring is 2 KB and lost
+  the `awdl:tl` lines within seconds. `tools/awdl/collect.sh` prints these properties:
+
+  | Property | Contents |
+  |---|---|
+  | `itlmt-awdl` | counter line, refreshed every 64 EAWs: role, eaws, posted/fail/late, syncs/adj, psf ticks/len, mif submitted/len, oob auto/once/stop/too-long, tlv4 inserted/present, peer TLV 4s seen, rx/norssi/weak, slot 0, multi, sync ABI version |
+  | `itlmt-awdl-self-tlv4` | our first TLV 4 (raw) |
+  | `itlmt-awdl-peer-tlv4` | the first TLV 4 heard from a peer (raw) |
+  | `itlmt-awdl-peer-hdr` | the bytes in front of that peer TLV 4 (raw) |
+  | `itlmt-awdl-syncparams` | `setAWDL_SYNC_PARAMS` (raw) |
+  | `itlmt-awdl-oob-auto` / `-oob-once` | OOB request header without the pointer (raw) |
+
+  The core's `awdl sync: tx` line adds `len=psf/mif` and `mif=ok/try`; `awdl rxstat` adds `stamp=` and `mif=`.
+
+Staged 2026-11-03 22:56: core `FEB66BA5-B20E-326D-B244-92301D817471`, native `563B3169-5523-3DAC-9975-DCA7E4713155`. The
+previous pair (10.28) is in `Kexts-backup/*.kext.20261103-225614`. Links checked against the KC; both plists unchanged.
+
+#### Test for the next boot
+
+1. Boot normally. `ping -c3 1.1.1.1`; `kmutil showloaded | grep itlmt7925` must show `FEB66BA5...` / `563B3169...`.
+2. `osascript tools/awdl/awdl-vif-test.applescript` (administrator password) -> `rc=0 bsd_name='awdl0'`.
+3. Finder > AirDrop, "Everyone for 10 Minutes"; the iPhone with its share sheet open (AirDrop row) next to the Mac, two
+   minutes. Note whether the Mac appears on the iPhone, and the iPhone in Finder.
+4. Collect:
+   ```
+   bash tools/awdl/collect.sh > ~/awdl-10.29.txt 2>&1
+   /usr/bin/log show --last 15m --predicate 'subsystem == "com.apple.p2p.awdl0" OR sender == "IO80211Family" OR process == "wifip2pd" OR process == "sharingd"' --style compact 2>/dev/null | grep -i -E 'AW start|AwNumber|stuck|Master|CHANSEQ|htCapability|OOB|MI |election|peer|service|airdrop' | tail -500 >> ~/awdl-10.29.txt
+   ```
+5. Read:
+   * `itlmt-awdl`:
+     * `oob=a<N>` with N > 0 and `mif=<n>/<len>`, both growing: the Family hands over the MIF and it is submitted;
+     * `tlv4=<n>/0`: TLV 4 is inserted, not duplicated.
+   * Core: `awdl sync: tx ... len=<psf>/<mif> ok=1 stamped=N miss=0 mif=K/K`.
+   * Compare `itlmt-awdl-self-tlv4` with `itlmt-awdl-peer-tlv4`. Same length (0x49 value bytes)? Same AW/AF period, flags,
+     presence mode, encoding? Check the iPhone's per-entry bytes against our channel/opclass pairs. If any of them differ,
+     take the iPhone's values next round.
+   * Family: no "Invalid _htCapabilityLength"; the iPhone should now list this Mac as a peer (on the iPhone side only the
+     UI shows it).
+   * `itlmt-awdl-syncparams`: the five values, for the TLV 4 comparison.
+6. Undo if needed (ESP is user-owned):
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad3 && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad3 && mv Kexts-backup/itlmt7925.kext.20261103-225614 Kexts/itlmt7925.kext && mv Kexts-backup/itlmt7925Native.kext.20261103-225614 Kexts/itlmt7925Native.kext
+   ```
+
+Even if discovery works after this boot, a transfer will not complete yet: that needs the data path over awdl0 (phase 5:
+mDNS/TCP, and the radio staying on the AWDL channel for the windows in the sequence).
+
+### 10.30 Hardware result of 10.29 (boot 2026-11-03 23:14): AWDL frames go both ways; AirDrop now waits on election + data path
+
+**Transmit works.** In every window both frames went out with the sync parameters TLV in place:
+* `awdl sync: tx ch=149 len=249/249 ok=1`;
+* after ~650 windows: `stamp=1294/0`, `mif=644/647`, `rocfail=3`;
+* `itlmt-awdl` showed `tlv4=77/0` (TLV 4 inserted every time, never duplicated) and `oob=a6`: the Family handed over its MIF
+  six times (133-byte payloads), and we sent it.
+
+The `setAWDL_SYNC_PARAMS` values are `0 16 16 16 110 0`, the same as the TLV 4 defaults we chose.
+
+**Receive needs the iPhone's share sheet open.** For the first 6 minutes the share sheet was closed: zero AWDL frames were
+heard (`sig=0`). Once it was open, frames arrived: `af` 66 -> 98, `rx` 74 -> 108. The Family then:
+* logged `actionFrameReport SUI from 7E:59:... has changed` and `Posted Peer Presence`;
+* kept `peers:1` with 4 AirDrop services.
+
+**The iPhone's TLV 4 next to ours** (`itlmt-awdl-peer-tlv4` / `-self-tlv4`):
+
+| Field | iPhone | Ours |
+|---|---|---|
+| AW / AF period, flags, ext/cmn, ext counts, presence mode | 16 / 110, 0x1800, 16 / 16, 3, 4 | identical |
+| dc | 0x20 (32 TU) | — |
+| master address | its own (7e:59:...): it is master of its own tree | ours (we are master of ours) |
+| channel sequence encoding | 1 (legacy: flags byte, then the *center* channel) | 3 (opclass) |
+
+The iPhone's sequence entries:
+
+| Slots | Bytes | Meaning |
+|---|---|---|
+| 0 | `1e 7e` | 40 MHz, center 126, flags & 3 = 2 (primary = center + 2) |
+| 2, 10 | `1d 97` | 40 MHz, center 151, primary 149 |
+| 8 | `2b 06` | 2.4 GHz ch 6, 20 MHz |
+| every other slot | `00 00` | absent |
+
+From these values, the legacy flags look like: bits 0-1 = primary position (1 lower, 2 upper, 3 = 20 MHz), 0x08/0x04 =
+width, 0x10 = 5 GHz, 0x20 = 2.4 GHz. This is an inference; we have not checked it against a parser yet. Change made from
+this comparison: an empty slot in our TLV is now `00 00` (it used to be the master channel). That change is built but not
+staged; it goes with the next batch.
+
+**Why neither side shows the other in the AirDrop UI.**
+1. **No election.** On Apple hardware the firmware runs the master election: the Family only hands down
+   `AWDL_ELECTION_PARAMS` ("Initialize FW Election Params") and waits for sync-state events. Our driver has no election, so
+   both devices stay masters of their own trees: we stay `role=1, syncs=0`, and the iPhone names itself as master. Two
+   unsynchronised trees never line up their AWs, so neither side can schedule anything with the other.
+2. **No data path.** AirDrop does not show a device just because its MIF service records arrive. sharingd first runs the
+   AirDrop discovery exchange over TCP/TLS on awdl0's IPv6 link-local addresses. awdl0 has no data path yet (phase 5),
+   and the radio is on an AWDL channel only for 100 ms of every 448 ms.
+
+**Next work (a phase of its own, larger than a batch):**
+* **Election in the driver.** Compare the peers' election TLV (metric/counter, as the Family's `ELECTION_PARAMS` defines it)
+  with our own. When a peer wins, call `setAWDL_SYNC_STATE`-equivalent events up to the Family (slave, master = peer, top
+  master), so the existing `awdlTlSync` follows its clock. That needs the sync-state-changed message number and its layout
+  from `handleSyncStateChanged` in the BCM driver.
+* **On-channel scheduling.** Instead of one 100 ms ROC per 7 EAWs, stay on the AWDL channel for the AWs of the sequence
+  while the AP link tolerates it (or drop the AP channel while AirDrop is active).
+* **Data path.** 802.11 data frames with Apple's AWDL LLC/SNAP header in both directions on awdl0 (the Skywalk queues that
+  `registerAwdlInterface` already creates).
+
+### 10.31 Round 2026-11-03 (4): the election runs in the Family, triggered by the AW end event (no reboot yet)
+
+**Finding (25G241).** The master election is not done in firmware. The Broadcom firmware only reports the outcome: its
+events end up in `handleMasterEvent` / `handleSlaveEvent` / `handleNonElectionMasterEvent`, which post message 0x2e (16
+bytes, +0 the state: 1 master, 2 slave, 3 non-election master). But the decision itself comes from the Family:
+`IO80211AWDLPeerManager::runElection` → `programChipWithNewMaster` → ioctls down to the driver (`setAWDL_SYNC_STATE`,
+`setAWDL_ELECTION_PARAMS`, sync frame period).
+
+`runElection` has exactly one caller: `reportDataPathEvents`, case **0x2b** (jump-table index 2 at `0xffffff80021e0b80`).
+0x2b is `APPLE80211_M_AWDL_AVAILABILITY_WINDOW_END`. It is gated by `shouldRunElection`, which needs:
+* `ivars+0x2843` bit 0 (set by `configure` unless `+0x2841`);
+* `ivars+0x3ee0` bit 1 (AWDL on).
+
+The driver posted AW start (0x29) since §10.28 but never AW end, so the Family never ran an election. Both nodes stayed
+masters, which explains `role=1 syncs=0` in §10.30.
+
+**AW end layout** (`AppleBCMWLANProximityInterface::handleAvailabilityWindowEnd`, 0x28 bytes):
+
+| Offset | Field |
+|---|---|
+| +0 | event byte +0xc |
+| +4 | event word +0 |
+| +8 | event byte +0x11 |
+| +0xc | event word +0x12 (the Family keeps it at `ivars+0xa6b4`) |
+| +0x10 | u16 version 1 + per-AW statistics, written only when the firmware event is ≥ 0x34 bytes |
+
+The election path reads none of these fields. The statistics are read only when +0x10 == 1, so a zero tail means "none".
+
+**The election tree read-back.** `getAWDL_ELECTION_PARAMS` answered unsupported. Apple's driver fills it from the firmware
+`awdl_election_tree`:
+
+| Offset | Field |
+|---|---|
+| +0x10 | flags |
+| +0x12 | election id |
+| +0x14 | tree depth |
+| +0x16 | top master |
+| +0x1c | top master metric |
+| +0x20 | self metric |
+
+**Fixes (native only; the core is unchanged from §10.29).**
+* `awdlTlTick` posts AW end (0x2b) for the previous present EAW, just before the next AW start. It carries the channel
+  and the end time of the 16-TU AW.
+* `setAWDL_ELECTION_PARAMS` stores the first 0x24 bytes. `getAWDL_ELECTION_PARAMS` echoes them back; before the first set
+  it answers self as top master with our metric.
+* The `itlmt-awdl` line gains these fields:
+  * `chg=` (role/master changes from `setAWDL_SYNC_STATE`);
+  * `master=` / `top=`;
+  * `end=posted/fail`.
+* From §10.30: empty slots of our TLV 4 channel sequence are `00 00`.
+
+Staged 2026-11-03 23:31: native `0600CBA6-BD06-375E-9D34-142F38A7BD8B`, core unchanged (`FEB66BA5...`). The previous native
+(§10.29) is in `Kexts-backup/itlmt7925Native.kext.20261103-233153`.
+
+#### Test for the next boot
+
+1. Boot. `ping -c3 1.1.1.1`; `kmutil showloaded | grep itlmt7925` must show `FEB66BA5...` / `0600CBA6...`.
+2. `osascript tools/awdl/awdl-vif-test.applescript` → awdl0. Open Finder > AirDrop (Everyone). **Open the iPhone's share
+   sheet** (without it the iPhone sends no AWDL frames at all, §10.30).
+3. After two minutes: `bash tools/awdl/collect.sh > ~/awdl-10.31.txt 2>&1`, then this, which adds the Family's election
+   logs:
+   ```
+   /usr/bin/log show --last 10m --predicate 'sender == "IO80211Family"' --style compact 2>/dev/null | grep -iE "elect|master|syncState|SYNC_STATE|AW end|stuck" | tail -200 >> ~/awdl-10.31.txt
+   ```
+4. Read `itlmt-awdl`:
+   * `end=N/0` with N growing (the AW end events are accepted);
+   * then `role=2 chg>=1 master=7e59...` (the iPhone's address) and `syncs>0` with small `adj` (our clock follows it);
+   * or `role=1` with a winning metric: then the iPhone's next TLV 4 should name *us* as master (`itlmt-awdl-peer-tlv4`
+     +21).
+5. Undo (native only):
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad4 && mv Kexts-backup/itlmt7925Native.kext.20261103-233153 Kexts/itlmt7925Native.kext
+   ```
+
+Even with the election working, the AirDrop UI still needs the data path (phase 5). This round only checks that the two
+trees merge.
+
+### 10.32 Hardware result of 10.31 (cold boot 2026-11-04 09:05) and round 5: listen where the peer is
+
+**What 10.31 did on hardware.**
+* **Bluetooth.** A warm reboot lost Bluetooth (MtkBtFw "section 2: block 49 failed", see `docs/BLUETOOTH.md`). A cold boot
+  brought it back.
+* **AWDL enable ordering.** After the cold boot AWDL never came up. sharingd had started its AirDrop browse before awdl0
+  existed, mDNSResponder deduplicated the later one, and wifip2pd never got an `AWDLBrowse`, so `SYNC_ENABLED` never came.
+  Test workaround: create awdl0 first, then run `dns-sd -includeAWDL -B _airdrop._tcp local.` in the background. That
+  triggers `AWDLBrowse ... started` → "enabled AWDL". The real fix (awdl0 present before sharingd browses) is open.
+* **AW end is accepted.** `end=975/0`. The Family runs its election about every 3 s
+  (`runElection: ElectionParamsChanged`, `programChipWithNewMaster`).
+* **The election did pick the iPhone, once.** At 09:12:50 the log has:
+  ```
+  programChipWithNewMaster: Programming new Mst: AE:E5:E4:83:39:FB ... HC 1 met 538 my met 522
+  runElection: ... New P:AE:E5:E4:83:39:FB ... [RLFC:621 HC:1 RMet:538 SLFC:52 SMet:522]
+  topMasterChanged: Top master changed to AE:E5:E4:83:39:FB
+  ```
+  So the merge logic works: the iPhone's metric 538 beats our 522.
+* **Then the peer aged out.** Within 5 s:
+  ```
+  shouldRemovePeerFromNDP: No Action frames for(2397mSec) from AE:E5:E4:83:39:FB
+  Posted Peer Absence
+  ```
+  The election then went back to self, and `SYNC_INFO: AWDLSequenceNumberNotUpdated for_9_AW_Start_events` was logged
+  while we were nominally a slave.
+* **Counters.** Over ~10 min the counters were `rx=63` (`weak=45` below −70 dBm). The `peer4=61` TLVs came in bursts
+  separated by more than 2.4 s.
+
+**Why the iPhone is heard so rarely.** Its channel sequence (`itlmt-awdl-peer-tlv4`, legacy encoding) is:
+
+| Entry | Slots | Primary |
+|---|---|---|
+| `1e 26` | 0, 1, 7, 9, 11, 15 | 40 |
+| `1d 97` | 2, 10 | 149 |
+| `2b 06` | 8 | ch 6 |
+
+So it sits on 2.4 GHz for 1 EAW in 16 (~65 ms a second) and on 5 GHz 40/149 the rest. Our only receive time was the
+100 ms ROC per ~459 ms PSF window. That window was placed on *our* clock, on our slot channel or the 6/44/149 rotation, and
+44 is not even one of its channels. It overlapped the iPhone's presence only by chance.
+
+**dc counts to the next EAW, not the next AW.** The iPhone's TLV 4 down counter is 29 TU here (32 TU in §10.30), with
+16-TU AWs. With sn=6 that is "AW 8 starts in 29 TU": the counter runs to the sender's next *extended* window, where AW % 4 == 0
+(presence mode, +27). Our stamping (core `awdlStampSync`) and our slave alignment (`awdlTlSync`) both assumed the next AW,
+so a peer following us was off by up to 3 AWs, and so was our alignment to it.
+
+**Fixes (round 5, core + native).**
+* **Core, `ItlNativeAwdlSync` v4.** A listen-only window (`frame == nullptr, len == 0`): ROC on the channel, sniffer on,
+  dwell, back. Counted in the `awdl stat:` line as `listen=`.
+* **Core, `awdlStampSync`.** dc runs to the next AW whose number is a multiple of the presence mode (TLV +27).
+* **Native, peer timelines.** Every received TLV 4 updates a 4-entry table `AwdlPeerTl`:
+  * the peer's next EAW start on our clock;
+  * its AW number;
+  * AWs per entry;
+  * the primary channel of each of its 16 entries. Legacy encoding: center ∓ 2 by flags & 3.
+* **Native, listen timer.** A second timer follows one peer:
+  * the master while we are a slave, else the peer heard most recently (within 8 s);
+  * it fires 2 ms before the peer's next present EAW;
+  * it opens a 40 ms window on that EAW's channel;
+  * it re-arms for the next present EAW.
+
+  While a peer is followed, a due PSF/MIF is not sent on our own slot. It rides in the next listen window, on the peer's
+  channel, where the peer can hear it.
+* **Native, instant slave alignment.** `setAWDL_SYNC_STATE` → slave takes the new master's clock at once, from its cached
+  timeline, instead of waiting for its next frame. Counted as `align=`.
+* **Native, PSF period.** The PSF period follows `setAWDL_SYNC_PARAMS` +0x10 ("Setting PSF period to 110" → every 2 EAWs),
+  instead of a fixed 7.
+* **Native, `itlmt-awdl` line.** Gains these fields:
+  * `lsn=windows/with-tx/fail`;
+  * `ch=` (the last listen channel);
+  * `ptl=` (peer timeline updates);
+  * `align=`.
+
+**Air-time cost.** While a peer is followed, the radio spends ~40 ms of each of the peer's present EAWs (9 of 16 for this
+iPhone) off the AP's channel, about 35 % of the time. Infrastructure throughput drops during AirDrop. This is the same
+time-sharing Apple's AWDL does.
+
+Staged 2026-11-04 09:23:
+
+| Kext | UUID | Backup |
+|---|---|---|
+| core | `9DA98E35-5229-3B43-A040-53C7206ACE48` | `Kexts-backup/itlmt7925.kext.20261104-092327` (= `FEB66BA5...`) |
+| native | `F7B9FFEE-4099-3F82-AC70-FC5CAEC864DA` | `Kexts-backup/itlmt7925Native.kext.20261104-092327` (= `0600CBA6...`) |
+
+#### Test for the next boot (cold boot, so Bluetooth comes up)
+
+1. **Check the boot.** `ping -c3 1.1.1.1`. `kmutil showloaded | grep itlmt7925` must show `9DA98E35...` / `F7B9FFEE...`.
+2. **Bring AWDL up, in this order.**
+   1. `osascript tools/awdl/awdl-vif-test.applescript` → awdl0.
+   2. `dns-sd -includeAWDL -B _airdrop._tcp local.` in a terminal; leave it running.
+   3. Finder > AirDrop (Everyone). Open the iPhone's share sheet and keep it open.
+3. **Collect.** After two minutes:
+   ```
+   ioreg -l -w0 | grep '"itlmt-awdl' > ~/awdl-10.32.txt
+   /usr/bin/log show --last 5m --predicate 'sender == "IO80211Family" AND eventMessage CONTAINS "awdl0"' --style compact 2>/dev/null | grep -iE "programChip|topMaster|No Action frames|Peer Presence|Peer Absence|SequenceNumber" >> ~/awdl-10.32.txt
+   ```
+4. **Read `itlmt-awdl`.**
+   * `ptl>0` and `lsn=N/M/0` with N growing: the listen windows run. `ch=` should be 40, 149 or 6.
+   * `rx` should grow by several frames a second, not a few a minute.
+   * The log should show `Programming new Mst: AE:E5...` (the iPhone, its random MAC may differ) and stay there, with no
+     `No Action frames for` lines.
+   * `role=2 align>=1 syncs>0` with small `adj`.
+5. **If Wi-Fi (infra) drops** while AirDrop is open, the 40 ms dwell is too long for this AP. Note it; the dwell is
+   `awdlLsnFire`'s 40.
+6. **Undo (both kexts).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad5 && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad5 && mv Kexts-backup/itlmt7925.kext.20261104-092327 Kexts/itlmt7925.kext && mv Kexts-backup/itlmt7925Native.kext.20261104-092327 Kexts/itlmt7925Native.kext
+   ```
+
+Open after this round:
+* awdl0 must exist before sharingd browses;
+* the weak RSSI (45 of 63 frames below −70 dBm with the iPhone next to the Mac: check the RCPI decode);
+* the data path (phase 5).
+
+### 10.33 Hardware result of 10.32 (cold boot 2026-11-04 10:10): AWDL discovery works end to end; round 6 is the data path
+
+**What 10.32 did on hardware** (core `9DA98E35`, native `F7B9FFEE`; iPhone share sheet open from ~10:17:50).
+* **The listen windows follow the iPhone.**
+  * `lsn=473/335/0 ch=149 ptl=163` means the windows run on its channels (40/149/6).
+  * `rx` climbed from 25 to 164 in about a minute, where earlier boots got a few frames a minute.
+  * From 10:17:53 the Family kept the iPhone (`AE:E5:E4:83:39:FB`) as a peer continuously. There was no
+    `No Action frames for ...` line and no `Peer Absence`.
+* **Election.**
+  * At 10:14:17 the Family elected the iPhone (`HC 1 met 516`, while our metric was still 65).
+  * 0.4 s later our metric was 537 and it re-elected us. Since then we are master (`role=1`), which is correct: 537 > 516.
+  * Whether the iPhone follows us (its TLV 4 +21 naming our address) is not yet checked: `itlmt-awdl-peer-tlv4` is
+    published once only.
+* **Bonjour over AWDL works.** `dns-sd -includeAWDL -B _airdrop._tcp local.` on awdl0 (if 15) listed:
+  ```
+  10:18:04.058  Add  15 local. _airdrop._tcp. 366bfda0f544
+  10:18:04.593  Add  15 local. _airdrop._tcp. 6bfb34049458
+  ```
+  These are the iPhone and a second Apple device (`2E:4D:39:A2:2D:4D`, also a Family peer). `ndp -an` has
+  `fe80::ace5:e4ff:fe83:39fb%awdl0` / `fe80::2c4d:39ff:fea2:2d4d%awdl0` as permanent entries.
+* **The next blocker is the data path.**
+  * sharingd sends AirDrop `DISCOVER` requests to those services: `Sending DISCOVER request` →
+    `DISCOVER request timeout` → `Bonjour service ... failed discovery`.
+  * awdl0 shows `Opkts 0`, `Ipkts 0`. The awdl0 Skywalk queues were created and registered, but they were never put on the
+    interface's work queue or enabled, and the TX submission action consumed nothing. No packet ever left the stack.
+* **Side issue: radio time.** With no peer being followed, the PSF fallback now runs every 2 EAWs, with a 100 ms dwell each
+  time. Infra still worked (ping fine), but this is too much time off the AP's channel.
+
+**Fixes (round 6, phase 5: the data path).**
+
+| Part | Change |
+|---|---|
+| Frame format | AWDL data frame = 802.11 data, no DS bits, addr1 = DA, addr2 = our awdl0 address, addr3 = `00:25:00:ff:94:73`; LLC/SNAP `aa aa 03 00 17 f2 08 00`; AWDL data header `03 04`, sequence (LE16), `00 00`, ethertype (BE); payload. Protocol facts per the OWL paper/implementation, read as a reference only. |
+| Core RX (`awdlRxData`) | Inside an AWDL window, data frames matching the BSSID + SNAP go into the AWDL RX ring, which grows from 4 to 16 slots. `awdl rxstat:` gains `full=` and `data rx=`. |
+| Core TX | `ITL_NATIVE_AWDL_DATA_TX`: a 16-slot ring. `awdlDataFlush()` sends it, fixed 6 Mb/s on ALTX0 like the PSF, every ms of every AWDL window (listen or PSF). `data ... tx=queued/sent/fail/full`. |
+| Native registration | The three awdl0 queues are added to the interface's work queue (`awdl:dp queues on the work queue 3/3`). |
+| Native enable | `enable()` override and `SYNC_ENABLED`: enable the completion queues, then TX submission, and start a 5 ms data path timer (`awdl:dp enabled`). |
+| Native TX | Ethernet → AWDL data frame → core. The packet is completed on the next tick. |
+| Native RX | AWDL data frame → Ethernet (IPv6 length trims an FCS tail) → RX completion queue, with broadcast/multicast flags. |
+| `itlmt-awdl` | Gains `dp=0/1 dtx=in/queued/full/bad/done drx=in/up/notus/fail`. |
+
+Not in this round: the dwell of the no-peer fallback (above), and the RSSI of 5 GHz frames.
+
+Staged 2026-11-04 10:23:
+
+| Kext | UUID | Backup |
+|---|---|---|
+| core | `AB264730-940A-3287-ADA9-7D4DDF9F3BBC` | `Kexts-backup/itlmt7925.kext.20261104-102307` (= `9DA98E35`, §10.32, works) |
+| native | `AE068461-4938-3BA9-AE8D-DFFD989CE09C` | `Kexts-backup/itlmt7925Native.kext.20261104-102307` (= `F7B9FFEE`) |
+
+#### Test for the next boot (cold boot)
+
+1. **Check the boot.** `kmutil showloaded | grep itlmt7925` must show `AB264730...` / `AE068461...`. Ping the AP.
+2. **Bring AWDL up, in this order.**
+   1. `osascript tools/awdl/awdl-vif-test.applescript`.
+   2. `dns-sd -includeAWDL -B _airdrop._tcp local.` (leave it running).
+   3. Finder > AirDrop. Open the iPhone's share sheet and keep it open.
+3. **Read the state.**
+   ```
+   ioreg -l -w0 | grep '"itlmt-awdl"'
+   netstat -I awdl0
+   ioreg -l -w0 | grep '"m3-log"' | sed 's/.*"m3-log" = "//' | tr ';' '\n' | grep -E "awdl (data|rxstat)" | tail -5
+   ```
+   Expected:
+   * `dp=1`;
+   * `dtx` growing, with `queued` equal to `in`;
+   * `Opkts` > 0 on awdl0;
+   * `data rx` > 0 in the core;
+   * `drx up` > 0 and `Ipkts` > 0;
+   * in `log show --predicate 'process == "sharingd"'`, the DISCOVER requests stop timing out and the iPhone shows up in
+     Finder > AirDrop.
+4. **If it panics,** or awdl0 breaks Wi-Fi, undo both kexts to §10.32:
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad6 && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad6 && mv Kexts-backup/itlmt7925.kext.20261104-102307 Kexts/itlmt7925.kext && mv Kexts-backup/itlmt7925Native.kext.20261104-102307 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.34 Hardware result of 10.33 (cold boot 2026-11-04 11:53) and round 7: a state-1 master that is not us makes us a slave
+
+**What 10.33 did on hardware** (core `AB264730`, native `AE068461`).
+* **The data path transmits.**
+  * `dp=1` (the queues are on the work queue and enabled).
+  * awdl0 shows `Opkts 25` for the first time.
+  * Native `dtx=25/25/0/0/25` (in/queued/full/bad/done); core `data ... tx=24/24/0/0` (queued/sent/fail/full).
+  * Infra Wi-Fi kept working.
+* **Nothing received yet.** `data rx=0`, `Ipkts 0`. No AirDrop `DISCOVER` happened in this boot: sharingd removed its AirDrop
+  client at 12:25:52. So the TCP exchange was never attempted, and the receive half is untested.
+* **Bonjour.** `_airdrop._tcp` over awdl0 again: `366bfda0f544` at 12:26:11.
+* **The election now picks the iPhone** (new random MAC `82:F6:FC:2E:AB:90`, metric 515 vs our 510):
+  ```
+  programChipWithNewMaster: Programming new Mst: 82:F6:FC:2E:AB:90 ... HC 1 met 515 my met 510
+  ```
+  It holds for minutes. But the driver stayed `role=1 align=0`: `setAWDL_SYNC_STATE` carried **state 1** with the iPhone's
+  address, and the driver only treated state 2 as "slave". Our clock never followed, and the Family flagged it:
+  ```
+  SYNC_INFO: (v10.0:iOS)(82:F6:FC:2E:AB:90) MI AF has sequence number:(21953), current window:(6248)
+  ```
+  It also still logs `No Action frames for(2446mSec)` now and then.
+
+**Fix (round 7, native only).**
+* `setAWDL_SYNC_STATE`: state 1 with a non-zero master address that is not this interface → our role is 2 (slave). Counted
+  as the second number of `align=a/b`.
+* The slave path then runs: immediate alignment from the master's cached timeline, `awdlTlSync` on every master frame, and
+  the listen windows following the master.
+* The AW start events still carry the state the Family itself set (`awdlFamilyState`), not the derived role.
+
+Staged 2026-11-04 12:27: native `DBDD093B-7B5C-3FF6-A172-EC7641E7327E`. The core is unchanged (`AB264730`). The previous
+native (§10.33) is in `Kexts-backup/itlmt7925Native.kext.20261104-122723`.
+
+#### Test for the next boot (cold boot)
+
+1. **Check the boot.** `kmutil showloaded | grep itlmt7925` must show `AB264730...` / `DBDD093B...`.
+2. **Bring AWDL up.** Run awdl0 + `dns-sd -includeAWDL -B _airdrop._tcp local.` as in §10.33. Open Finder > AirDrop and
+   keep that window open, then open the iPhone's share sheet.
+3. **Read `itlmt-awdl`.**
+   * `role=2 master=<iPhone>` and `align=N/M` with N ≥ 1, M ≥ 1;
+   * `syncs` growing with small `adj`;
+   * no more `MI AF has sequence number ... current window` mismatches in the Family log.
+4. **Read the data path.** With the Finder window open, sharingd should log `Sending DISCOVER request`. Then:
+   * `drx` / `Ipkts` > 0;
+   * core `data rx` > 0;
+   * no `DISCOVER request timeout`.
+5. **Undo (native only).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad7 && mv Kexts-backup/itlmt7925Native.kext.20261104-122723 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.35 Boot 2026-11-04 12:29: infrastructure Wi-Fi died before AWDL started; the core now resets a dead chip
+
+This boot never reached the §10.34 test. The first join came up (`RESULT rc=0 link up`), then:
+1. DHCP got no reply (`pulse ... rxd=2 eth=0`).
+2. 4 s after link-up the firmware went silent (`postmortem silent 4s`, the known issue in `docs/ROADMAP.md`).
+3. The Family disconnected before the 15 s beacon watch fired.
+4. From then on every MCU command timed out: `bss_info(del) rc=-110`, `edca rc=-110`, and every scan came back empty
+   (`no configured network seen in the scan`).
+
+Only the beacon-watch path requested a chip reset, so nothing reset it, and Wi-Fi stayed down. The owner fell back to USB
+networking. AWDL had not been started (no awdl0); round 7's native change only touches `SYNC_STATE`.
+
+**Fix (core).** `m3Cmd`: two MCU command timeouts in a row set `recoverWanted`. The supervisor then runs the same
+`chipRecover()` (wfsys reset, rings, firmware reload) after the current attempt. This shows in the log as
+`mcu: ... chip reset requested` → `recover #1`. The root cause of the silence is still open.
+
+Staged 2026-11-04 12:35: core `0C89AEB3-EC59-3BA8-8DE7-B2FBF0E41694`. The previous core (`AB264730`) is in
+`Kexts-backup/itlmt7925.kext.20261104-123537`. The native stays `DBDD093B` (§10.34).
+
+**Next boot: cold boot.** Then run the §10.34 test. If Wi-Fi drops again, the m3-log should show `chip reset requested` and
+`recover #1`, followed by a fresh join instead of a dead radio. Undo (core only):
+```
+cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad8 && mv Kexts-backup/itlmt7925.kext.20261104-123537 Kexts/itlmt7925.kext
+```
+
+### 10.36 Hardware result of 10.34/10.35 (cold boot 2026-11-04 12:46) and round 8: AWDL data frames were never found in RX
+
+**Verified on this boot.**
+* Infrastructure Wi-Fi and Bluetooth came up normally. The §10.35 recovery was not exercised: no MCU timeouts.
+* **Slave sync works (§10.34).** `role=2 master=aee5e48339fb` (the iPhone), `align=2/59`, `syncs=465`, `adj` a few
+  hundred µs. The Family's sequence numbers sit next to the iPhone's (`MI AF has sequence number:(13302), current
+  window:(13292)`). Election metric: iPhone 537, ours 511.
+* **Data TX works (§10.33).** Native `dtx` 96 queued / 96 done; core `tx=95/95/0`; awdl0 `Opkts 96`.
+* **wifip2pd.**
+  * `AWDLBrowse _airdrop._tcp.local was started`.
+  * Discovery results for the iPhone's `_applicationservicepairing` / `_appsvcprepair` at −42 dBm.
+  * `Posted peer presence for ae:e5:e4:83:39:fb on awdl0`.
+  * `AWDLAdvertise 366bfda0f544._airdrop._tcp.local was started` (our instance).
+  * sharingd: `Device in everyone mode`.
+* **No data RX.** `drx=0`, core `data rx=0`, awdl0 `Ipkts 0`. sharingd never logged a DISCOVER from the iPhone.
+
+**Enable ordering (workaround, not fixed).** At boot, wifip2pd tries to create AWDL on en5 three times (12:47:06–12:47:59)
+and gets `Operation Not Supported`. awdl0 appears at 12:49:05, once Wi-Fi is powered and joined. AWDL was enabled only at
+12:55:29, after this sequence:
+1. Close Finder > AirDrop.
+2. Kill the `dns-sd -includeAWDL` processes, by PID.
+3. Start `dns-sd -includeAWDL -B _airdrop._tcp local.` again.
+
+A browse started before awdl0 existed keeps mDNSResponder's AWDL session to wifip2pd stale, so `SYNC_ENABLED` never
+comes. The root fix is to answer wifip2pd's early create; that is open.
+
+**Bug 1: RX header offset in sniffer mode.**
+* The forensics lines show it: `awdl rx fx len=1143 hdr=52 ... sig=1@208 bss=1@200`. rxHdrOff() returns 52, but the
+  802.11 header really starts at 184 (addr3 = AWDL BSSID at 200). The sniffer adds RX vector groups that rxHdrOff()
+  does not count.
+* Action frames are found anyway, because their path scans the whole buffer for the AWDL signature.
+* `awdlRxData()` only looked at `rxHdrOff()+0..7`, so no AWDL data frame could ever match.
+* **Fix:** `awdlRxData()` locates the header by addr3 == 00:25:00:ff:94:73 anywhere in the buffer, then checks: data
+  frame, no DS bits, AWDL SNAP. Null data is consumed. QoS +HTC (+4) is handled in the core and the native.
+* New counters: `rxstat ... data rx=N hdr=A/B` (A = at rxHdrOff, B = elsewhere).
+
+**Bug 2: TX retry storm while AWDL is not on the air.**
+* Before the enable, the stack pushed into a full core ring, and `dtx` full reached 61892 retries.
+* **Fix:** the core records the uptime of the last AWDL radio window. When the ring is full and no window ran in the last
+  second, the frame is refused as stale (`kIOReturnNotReady`). The native drops it (new 6th `dtx` field) instead of
+  retrying. A full ring while windows are running is still backpressure.
+* New counter: `rxstat ... stale=N`.
+
+Staged 2026-11-04 13:01:
+
+| Kext | UUID | Backup |
+|---|---|---|
+| core | `8525CBFF-7B4F-3175-A87F-D7E84DCD4974` | `Kexts-backup/itlmt7925.kext.20261104-130156` = `0C89AEB3` |
+| native | `529071AB-BDA2-3619-B195-167A7F7EB913` | `Kexts-backup/itlmt7925Native.kext.20261104-130156` = `DBDD093B` |
+
+**Next boot (cold).**
+1. **Check the boot.** `kmutil showloaded | grep itlmt7925` must show `8525CBFF...` / `529071AB...`.
+2. **Bring AWDL up.** Do not open Finder > AirDrop and do not start dns-sd until `ifconfig awdl0` exists. Then start
+   `dns-sd -includeAWDL -B _airdrop._tcp local.`, then open Finder > AirDrop. If `itlmt-awdl` shows no `dp=1` within a
+   minute, use the restart sequence above.
+3. **Check sync.** Same as §10.34: `role=2`, `align` growing.
+4. **Check data RX** (the point of this round). Open the iPhone share sheet.
+   * m3-log `awdl data rx len=... sa=aee5e48339fb` lines appear; `rxstat data rx` > 0 with `hdr=0/B`, B > 0.
+   * Native `drx=in/up/...` with up > 0; awdl0 `Ipkts` > 0.
+   * Then sharingd `Received DISCOVER` / the Mac appears on the iPhone.
+5. **If `data rx` stays 0** but the iPhone's MIFs keep arriving, the iPhone is not sending data to us. Look next at
+   whether our MIF carries the `_airdrop` service response.
+6. **Undo.**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad9 && mv Kexts-backup/itlmt7925.kext.20261104-130156 Kexts/itlmt7925.kext
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad9 && mv Kexts-backup/itlmt7925Native.kext.20261104-130156 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.37 Hardware result of 10.36 (cold boot 2026-11-04 13:03) and round 9: does the iPhone ever take our frames into its election?
+
+**Verified on this boot.**
+* Core `8525CBFF` and native `529071AB` loaded; infrastructure Wi-Fi joined normally.
+* **Data RX fix works.** The first AWDL data frame was found ~130 bytes past rxHdrOff (`hdr=0/1`) and reached the stack:
+  `drx=1/1`, awdl0 `Ipkts 1`. It was mDNS (`da=3333000000fb`) from a third Apple device, `62:ed:76:a2:79:0d`, not
+  from the iPhone.
+* **Stale-drop works.** `stale=0`, `dtx` 105/105: no retry storm.
+
+**Bring-up needed three manual steps** (the ordering problem from §10.36):
+1. awdl0 does not come up by itself. wifip2pd logs `Failed to create interface AWDL on en5 ... Operation Not
+   Supported`, and that create never reaches the driver: no `cmd=5e` in the native trace, no IOUC log line. So it is
+   refused in userland, before the ioctl. awdl0 was created with `osascript tools/awdl/awdl-vif-test.applescript`, the
+   same way as the earlier boots.
+2. Close Finder > AirDrop, then restart `dns-sd -includeAWDL -B _airdrop._tcp local.`. This rebuilt mDNSResponder's
+   AWDL session and gave `enabled AWDL`.
+3. **New this boot:** no `AWDLAdvertise ..._airdrop` until AirDrop was switched to No One and back to Everyone.
+   sharingd had registered its service before AWDL was up. After the toggle we got `AWDLAdvertise
+   366bfda0f544._airdrop._tcp.local was started`, a listener on awdl0:8770, and the MIF TLV payload grew from 133 to
+   940 bytes.
+
+**Still not shown on the iPhone.**
+* The iPhone stayed present (`Posted Peer Presence`), but sent no data frame to us and no DISCOVER.
+* The election on this boot:
+  * The iPhone was master at first (`met 518`), then dropped out once (`Peer Absence`).
+  * After that we elected ourselves (`met 529`, `role=1`) for the rest of the boot.
+* The Family's own dump says `AWDL on for more than 30 seconds with no TX (...) or RX (...)`. Its counters do not see
+  our data path.
+* The only peer TLV 4 we have, published once at the first frame, names the iPhone itself as master (`+21 =
+  aee5e48339fb`). Ours names us. That looks like two masters, but the copy is stale.
+
+**Hypothesis.** The iPhone does not take our PSF/MIF into its election or its service discovery. That would explain both
+boots:
+* §10.36: we were slave and the iPhone never discovered us.
+* This boot: we were master with a higher metric, and the iPhone kept itself master.
+
+**Round 9 (native only, instrumentation).**
+* Every peer TLV 4 is decoded for the master it names: `pm=self/us/other last=<master>@<AW seq>` on the `itlmt-awdl`
+  line.
+* `itlmt-awdl-peer-tlv4` and `itlmt-awdl-self-tlv4` are republished every 200 frames instead of once, so each can be
+  compared with the current role.
+
+Staged 2026-11-04 13:19: native `30B898E6-C430-3F4F-A2DD-D08089E3245D`. The previous native (`529071AB`) is in
+`Kexts-backup/itlmt7925Native.kext.20261104-131905`. The core stays `8525CBFF` (§10.36).
+
+**Next boot (cold).**
+1. **Check the boot.** `kmutil showloaded | grep itlmt7925` must show `8525CBFF...` / `30B898E6...`.
+2. **Bring AWDL up.** Do not open Finder > AirDrop yet. Then, in order:
+   1. Run `osascript tools/awdl/awdl-vif-test.applescript` and wait for `ifconfig awdl0`.
+   2. Start `dns-sd -includeAWDL -B _airdrop._tcp local.` and wait for `enabled AWDL` in the wifip2pd log.
+   3. Switch AirDrop to No One and back to Everyone, and wait for `AWDLAdvertise ..._airdrop`.
+   4. Open Finder > AirDrop and the iPhone share sheet.
+3. **Read `pm=`.**
+   * `pm=0/N/0`, the iPhone names us: it follows us. If the Mac still does not show, look at the discovery and TCP
+     path next.
+   * `pm=N/0/0` while we are `role=1`: the iPhone ignores our frames. Next, check what the iPhone can be missing:
+     * our frame timing against its AW (`last=...@seq` against our own AW number);
+     * the TLV 4 fields: compare `self-tlv4` and `peer-tlv4` byte by byte;
+     * the TX rate and channel of our PSF/MIF.
+   * `role=2`, with the iPhone named on both sides: same as §10.36. The slave is synced, so the question becomes
+     service discovery.
+4. **Undo (native only).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad10 && mv Kexts-backup/itlmt7925Native.kext.20261104-131905 Kexts/itlmt7925Native.kext
+   ```
+
+**Open, for a later round.** The root fix for the bring-up order: find why wifip2pd refuses its own AWDL create on en5 in
+userland, so awdl0 exists before sharingd and mDNSResponder start.
+
+### 10.38 Hardware result of 10.37 (cold boot 2026-11-04 13:21): TCP runs over AWDL; unicast to awdl0 is never ACKed
+
+**Bring-up.**
+1. vif tool, then `dns-sd -includeAWDL -B _airdrop._tcp local.`. This time `enabled AWDL` came at once (13:30:53),
+   because Finder > AirDrop was not open before awdl0 existed.
+2. AirDrop No One → Everyone toggle, then `AWDLAdvertise 366bfda0f544._airdrop._tcp.local was started`.
+
+**Results.**
+* **pm=271/0/1.** In every frame the iPhone names itself as master. We are master too (`role=1`, metric 537 vs the
+  iPhone's ~518), so the trees are split. Even so, the iPhone sends data to us.
+* **Data RX.** `data rx=163 hdr=0/163`, `drx=163/163`, awdl0 `Ipkts 171`. Included is unicast to our awdl0 MAC
+  (`fc=8808`, i.e. QoS data with the **retry** bit, `da=de567b3481d4`, ch 149).
+* **Data TX.** `dtx=274/274`, core `tx=273/273`.
+* **TCP over AWDL works.** A 40 s `tcpdump -i awdl0` (351 packets) shows:
+  * The Mac connects to the iPhone's `_appsvcprepair` service (iPhone ports 57707/57710), with SYN → SYN-ACK → data
+    in both directions.
+  * The iPhone answers mDNS on awdl0 (PTR `_applicationServicePairing`/`_appSvcPrePair`).
+  * We answer with our `_airdrop` PTR / TXT.
+* **But every unicast from the iPhone arrives many times.** One SYN-ACK came 22 times, in bursts a few ms apart with an
+  identical TCP timestamp, so these are 802.11 retries, not TCP retransmits. The iPhone's 1412-byte segment is resent
+  again and again even though we ACK it.
+  * **Cause:** the chip's MAC only acknowledges addr1 == an active OMAC, and only OMAC 0 (the station address) is
+    programmed. The iPhone never gets an 802.11 ACK, treats every unicast as lost, and backs off.
+  * Our own TX also needed up to 8 SYNs. Those go out only inside our windows, so that part is expected.
+* **No AirDrop connection.** Nothing to port 8770 in the capture. The Mac still does not show on the iPhone.
+
+**Round 10.**
+* **Core: awdl0 as a second OMAC.** The first AWDL frame handed to the core gives the interface address (addr2). The
+  link thread then sends `DEV_INFO_UPDATE` with omac_idx 1, band auto, active, link_idx 1 and that address. This is the
+  same layout attach uses for OMAC 0. After a chip recover the command is sent again.
+  * Log line: `awdl own mac (omac 1) rc=… st=…` / `awdl own mac <addr> rc=…`.
+* **Native: 802.11 duplicate filter.** For AWDL data, keyed on sender + sequence control, with the retry bit set and an
+  8-sender table. A retry of the frame just delivered is dropped. Shows as the new 5th `drx` field (`drx=in/up/notus/
+  fail/dup`).
+
+Staged 2026-11-04 13:38:
+
+| Kext | UUID | Backup |
+|---|---|---|
+| core | `A03A05D7-DD1C-3343-976C-5FDEF705313D` | `Kexts-backup/itlmt7925.kext.20261104-133809` = `8525CBFF` |
+| native | `DC024A86-7633-361E-A26F-DD9ADDD0A56D` | `Kexts-backup/itlmt7925Native.kext.20261104-133809` = `30B898E6` |
+
+**Next boot (cold).**
+1. **Check the boot.** `kmutil showloaded` must show `A03A05D7` / `DC024A86`. Infrastructure Wi-Fi must still join:
+   the second OMAC must not disturb the station.
+2. **Bring AWDL up.** Same order as §10.37: vif tool, dns-sd, wait for `enabled AWDL`, AirDrop toggle, then Finder >
+   AirDrop and the iPhone share sheet.
+3. **m3-log.** `awdl own mac de567b3481d4 rc=0`.
+4. **Capture.** Record 40 s of `tcpdump -i awdl0` (as root), then check:
+   * No more bursts of identical SYN-ACKs. If some remain, compare `drx ... /dup` with the bursts.
+   * Port 8770 traffic, and the Mac shown on the iPhone.
+5. **If rc ≠ 0, or the retries stay the same,** the RMAC also wants a BSS bound to OMAC 1. Next step:
+   `BSS_INFO_UPDATE` basic for bss_idx 1 / omac 1, as an "AWDL"/P2P-device connection type.
+6. **Undo.**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad11 && mv Kexts-backup/itlmt7925.kext.20261104-133809 Kexts/itlmt7925.kext
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad11 && mv Kexts-backup/itlmt7925Native.kext.20261104-133809 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.39 Hardware result of 10.38 (cold boot 2026-11-04 14:37): unicast is ACKed, Continuity TCP runs over AWDL; AirDrop stops before AWDL
+
+**Verified.**
+* Core `A03A05D7` and native `DC024A86` loaded. Infrastructure Wi-Fi joined normally, so the second OMAC does not
+  disturb the station.
+* **OMAC 1 accepted.** `awdl own mac (omac 1) rc=0 st=0` / `awdl own mac de567b3481d4 rc=0`.
+* **Bring-up.** vif tool, then dns-sd: `enabled AWDL` immediately (14:41:35). After the AirDrop toggle, `AWDLAdvertise
+  366bfda0f544._airdrop._tcp.local was started` (14:43:27).
+* **Unicast retries are gone.** `drx=49/34/0/0/15`: 15 retries were filtered. The 45 s awdl0 capture has 57 packets and
+  only 2 repeated segments; before, one SYN-ACK arrived 22 times.
+* **The iPhone opens TCP to the Mac over AWDL.** rapportd (Continuity) holds `fe80::dc56…:61351 ↔ fe80::ace5…:56199`,
+  ESTABLISHED: the iPhone connected and we accepted with a SYN-ACK. This is the first Apple service running over this
+  driver's AWDL.
+* **Election.** `pm=678/5/6`: for the first time, the iPhone named us as master (5 frames). It is mostly still its own
+  master, and we stay `role=1`.
+
+**AirDrop fails in both directions at the same point, before AWDL.**
+* **iPhone → Mac.** The Mac is not shown on the iPhone. The iPhone sends no mDNS for `_airdrop` on awdl0 and makes no
+  connection to :8770.
+* **Mac → iPhone.** With the iPhone's AirDrop set to Everyone for 10 Minutes, it is not shown in Finder. wifip2pd gets
+  no `_airdrop` discovery result from the iPhone (its `_applicationservicepairing` / `_appsvcprepair` do arrive), and
+  dns-sd lists only our own instance.
+
+AWDL itself (service TLVs, mDNS, TCP) works; only the AirDrop instances never appear. AirDrop discovery is gated on
+Bluetooth LE:
+* the sender's BLE AirDrop advertisement wakes receivers;
+* receivers advertise `_airdrop` on AWDL only after they see it.
+
+sharingd logs `Starting to advertise for <private>`, but whether the MT7925 Bluetooth controller really puts that
+advertisement on the air has never been checked. Scanning works: sharingd sees NearbyInfo devices. That is the next
+suspect, and it belongs to the Bluetooth work, not to AWDL.
+
+**Next checks (no reboot needed).**
+1. **Mac → air.** On the iPhone, a BLE scanner (e.g. nRF Connect) should show the Mac advertising Apple manufacturer
+   data (company 0x004C) while Finder > AirDrop is open. If no Apple advertisement from the Mac shows up, BLE advertising
+   on the controller is the blocker.
+2. **iPhone → Mac.** While the iPhone's share sheet is open, sharingd should log the iPhone's AirDrop BLE advertisement
+   (AirDropNW.BLE). None was seen in this boot.
+
+**Reference check (OpenDrop README, read for facts).** Under "Current Limitations/TODOs", OpenDrop says Apple receivers start
+their AWDL interface and AirDrop server only after they receive a custom Bluetooth LE advertisement. Without that trigger
+they may not be discovered, even when set to Everyone. OpenDrop never implemented the trigger, which is why it can miss
+Apple receivers. Our stack is different: macOS's own sharingd sends the trigger, so what has to work is the BLE
+advertising path of the MT7925 Bluetooth controller (HCI LE advertising commands accepted, and the advertisement
+actually on the air).
+
+No kext change this round. Core `A03A05D7` and native `DC024A86` stay staged.
+
+### 10.40 Same boot (14:37), ~15 min of AWDL: the firmware went silent and took infrastructure Wi-Fi with it
+
+**What happened** (m3-log):
+1. After ~3100 AWDL windows (`rocfail=133`, i.e. 133 never granted), `sniffer off` and `roc_abort` timed out
+   (`rc=-110`). The log then shows `mcu: roc_abort and the command before it timed out: chip reset requested` and
+   `postmortem silent 4s`.
+2. The link thread kept scheduling AWDL windows: `rx_filter`, `sniffer on`, `roc_acquire`, ... each waited 3 s for the
+   dead MCU.
+3. The infrastructure link was declared lost only 15 s later (`no beacon or data from the AP for 15 s`). Only then did
+   the supervisor run `recover #2` (so this was the second time this boot).
+4. Wi-Fi rejoined (`RESULT rc=0 link up`) and AWDL came back (OMAC 1 again). Then the link left twice "for a command",
+   and the owner switched Wi-Fi off and fell back to USB tethering.
+
+**Cause (likely).** Every AWDL window asked the firmware for a **JOIN-type ROC with a 5000 ms maxinterval**, then
+aborted it after 20–100 ms, about 10 times a second. Linux mt7925 (read for facts) uses `MT7925_ROC_REQ_JOIN` = 0 only for
+association, and `MT7925_ROC_REQ_ROC` = 1 for a remain-on-channel, with `maxinterval` = the requested duration. Hundreds of
+5-second join reservations cancelled immediately is a plausible way to wedge the firmware's channel manager. §10.35's
+silence (4 s after link-up, without AWDL) is a separate trigger.
+
+**Fix (core).**
+* AWDL windows request `reqtype 1` (ROC) with `maxinterval = dwell + 30 ms`. The join path keeps JOIN / 5000 ms.
+* As soon as `recoverWanted` is set, the link loop declares the link lost ("the firmware stopped answering MCU
+  commands") and the supervisor resets at once, not after 15 s.
+* No AWDL window is scheduled while a reset is pending.
+
+Staged 2026-11-04 15:00: core `88160DDE-6965-3E99-9991-E36849B247BC`. The previous core (`A03A05D7`) is in
+`Kexts-backup/itlmt7925.kext.20261104-150020`. The native stays `DC024A86` (§10.38).
+
+**Next boot.**
+1. Run AWDL for at least 20 minutes, with the §10.38 bring-up order. Watch `awdl stat ... rocfail=`: it should stay
+   near 0.
+2. Infrastructure Wi-Fi must keep working throughout (`pulse` lines advancing, no `chip reset requested`).
+3. If the firmware still goes silent, the log should show `recover #N` within ~6 s of the first timeout, then a rejoin.
+4. **Undo (core).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad12 && mv Kexts-backup/itlmt7925.kext.20261104-150020 Kexts/itlmt7925.kext
+   ```
+
+### 10.41 The AirDrop blocker is Bluetooth: bluetoothd's LE advertising never becomes ready (boot 14:37, Android scan 15:08)
+
+* **The Mac asks for advertising.** sharingd: `AirDropNW.BLE Started advertising` (15:05:52) and `CBAdvertiser Activated
+  ... CA DC:56:7B:34:81:D6`. bluetoothd receives `start advertising` requests for Nearby (`0B FF 4C 00 10 …`), type 9
+  (`0D FF 4C 00 09 …`) and AirDrop.
+* **bluetoothd sends nothing.** Every request ends in `[Server.LE.Advertise] Stack is not started, updateAdvertisement
+  returning`. Since the core stack started (14:38:25, `STACK_READY/StackStarted`), that was 81× `Stack is not ready,
+  waiting for the stack to start` and 79× `not started`, and never a success. WirelessProximity: `Trying to update
+  advertiser but peripheral manager isn't powered on` (WPErrorDomain 26).
+* **Capabilities bluetoothd detected at start:** `enableBTSpecAdvertisingSets=0 enableExtendedAdvertising=0 ...
+  maxAdvHandles=4`, and the chip is reported as `BCM_4350C2` / `THIRD_PARTY_DONGLE`. With BT 5.0 advertising sets off,
+  bluetoothd uses its legacy multi-advertising path, and the LE advertise module never reports the stack as started on
+  this controller.
+* **On air.** nRF Connect on Android (RSSI ≥ −60, filter `0x4C00`) showed Apple Nearby/Find My devices, but nothing
+  attributable to the Mac and no `4C 00 05` AirDrop packet.
+
+**Conclusion.** AirDrop receivers wake only on the sender's BLE AirDrop advertisement (OpenDrop, §10.39). The Mac emits
+no BLE advertisement at all, so the iPhone never starts its AirDrop side. The Mac also never sees the iPhone's AirDrop
+advertisement as a trigger. Scanning works; advertising does not. The AWDL side (sync, data, TCP, OMAC ACKs) is not the
+blocker any more.
+
+**Next (Bluetooth work, outside the AWDL kexts).** Find what the LE advertise module waits for. Candidates:
+* the HCI LE advertising commands the controller rejects at start: `LE Set Advertising Parameters` / `LE Read Advertising
+  Channel Tx Power`, or the vendor multi-advertising command bluetoothd sends for `maxAdvHandles=4`;
+* the controller features bluetoothd reads to decide that LE advertising is available.
+
+PacketLogger (Additional Tools for Xcode) on the HCI trace at Bluetooth start is the direct way to see the failing command.
+
+**Found and patched (2026-11-04, docs/BLUETOOTH.md "LE advertising never starts").** No HCI command fails: bluetoothd sets
+a third-party USB controller to chipset 0, its legacy multi-advertising path needs a per-chipset vendor table
+(`LE_InitMultipleAdvertising failed with status STATUS 152` right after `Stack Did Start`), and BT 5.0 advertising sets are
+gated by a chipset whitelist that excludes chipset 0. `BtLeDlFix` now forces that one whitelist answer to yes (the MT7925
+supports the LE extended advertising commands). Staged on the ESP, untested; next-boot test in docs/BLUETOOTH.md.
+
+
+**Hardware 15:52 + second patch.** Advertising sets came up but flapped (718 = HCI 0x12 on LE Set Extended Advertising
+Enable, 766 = 0x42 follow-on): bluetoothd skips LE Set Advertising Set Random Address for chipset ≤ 3, so the random-address
+sets never get an address. `BtLeDlFix` now keeps that command on. Staged 16:07, untested (docs/BLUETOOTH.md).
+
+**16:52 boot: still 718 (~9/s), and the BLE mouse stopped working (connected, no input).** Advertising patches reverted on
+the ESP at 17:07 (pre-59db42b build); open lead: `primaryPHY:0` in the extended advertising parameters (docs/BLUETOOTH.md).
+
+**Fourth patch (23:43, HCI trace).** The PHY lead was wrong. Real cause of the remaining 718: bluetoothd caches each set's
+random address and sends LE Set Advertising Set Random Address only when it changed; at stack start it sends it for sets 0
+and 2 before they exist (0x42), caches it anyway, so the AirDrop set (2) is later enabled without an address (0x12) and the
+stack loops ~2300×/min. `BtLeDlFix` now always resends the address before Enable. Verified
+live with a swapped bluetoothd: every advertising command st=00, AirDrop data `4C 00 05` enabled, no 718/766. Staged on the
+ESP (patches 1-4).
+
+Next boot: (1) `sudo dmesg | grep btledl` shows three advertising patches; (2) 0× `result 718|766` in
+`log show --last 5m`; (3) the BLE mouse moves the pointer with Finder > AirDrop open; (4) nRF Connect shows `4C 00 05`
+from the Mac; (5) retry iPhone ↔ Mac AirDrop. Undo: `-btledlfxnoadv`, or copy
+`Kexts-backup/BtLeDlFix.kext.20261104-234307-preadv` back (docs/BLUETOOTH.md).
+
+**2026-11-05 10:24 boot: advertising OK, BLE mouse dead.** Not the advertising patches: the builds from
+fix/bt-le-advertising lacked the macOS 26 LE data length wait patch that the uncommitted v1.1.0 build had, so the mouse
+link never reaches LE Link Ready (no GATT discovery, HID notifications dropped). v1.2.0 restores it (docs/BLUETOOTH.md
+"BLE mouse connected but dead"), staged on the ESP. Next boot: mouse moves, `LinkReady took` in the log, 0× 718/766, nRF
+Connect shows `4C 00 05`, then iPhone ↔ Mac AirDrop.
+
+**10:42 boot (v1.2.0): BLE mouse works and advertising is clean** (LinkReady 180 ms, 0× 718/766). Next: nRF Connect
+`4C 00 05` from the Mac, then iPhone ↔ Mac AirDrop.
+
+**10:54: Mac's AirDrop BLE advert seen on air** (nRF Connect: `4C 00 05 12 40 F5 …` from 57:8F:05:5D:57:87, matching the
+HCI trace). The §10.41 blocker is closed. Next: iPhone ↔ Mac AirDrop over AWDL.
+
+### 10.42 Boot 2026-11-04 16:52 (core 88160DDE): fast recovery works, but the firmware now hangs every 1-3 minutes of AWDL
+
+Recorded live (`ioreg` m3-log + state every 5 s) from AWDL enable at 17:05:19:
+
+| Time | Event |
+|---|---|
+| 17:06:42 | `sniffer off rc=-110`, then `roc_abort rc=-110` → `chip reset requested` |
+| 17:06:50 | `link lost: the firmware stopped answering MCU commands`, `recover #1` (the §10.40 fast path: ~8 s instead of 15) |
+| 17:07:11 | rejoined (`RESULT rc=0 link up`), AWDL resumed |
+| ~17:08 | `recover #2` |
+| 17:09:20 → 17:09:56 | `rocfail` 39 → 81 (42 ungranted ROCs in 36 s) |
+| 17:10:11 | `chip reset requested`, `recover #3`; 17:10:46 link up |
+
+* Three hangs in 7 minutes, against one in ~15 minutes with the old JOIN/5000 ms ROC (§10.40). The ROC type change did
+  not fix the hang and made it come sooner.
+* Every hang follows a run of `roc fail ... grant=0 status=255`: requests the firmware never granted within 80 ms, which
+  we then aborted, and the next window asked again 20-60 ms later. Linux mt7925 waits up to 4 s for a grant and never
+  aborts a ROC that has not been granted.
+* Infrastructure Wi-Fi comes back on its own each time (about 20-35 s without connectivity). Between hangs the AP link
+  keeps working (`pulse` advancing).
+
+**Round 12 (core).**
+* **Strict ROC lifecycle.** The grant is waited for up to 300 ms, with m3Pump servicing the AP meanwhile.
+  * A grant after 80 ms is accepted, and the ROC released at once, with nothing sent in it.
+  * A ROC that is never granted is aborted, and AWDL windows pause for 2 s, so ungranted requests no longer pile up.
+* **Trace.**
+  * `awdl roc latency <10/<40/<80/late/never` goes out with each `awdl stat`.
+  * On `chip reset requested`, `mcu hist ...` dumps the last 24 MCU commands (`name:rc@ms`), so the sequence the firmware
+    died in is on record.
+
+Staged 2026-11-04 17:12: core `29E5C6A5-2307-380C-A592-D12D9E37B13C`. The previous core (`88160DDE`) is in
+`Kexts-backup/itlmt7925.kext.20261104-171219`. The native stays `DC024A86`.
+
+**Next boot.**
+1. Bring AWDL up as in §10.38. Run the recorder (5 s `ioreg` snapshots) for 20 minutes.
+2. Expect no `chip reset requested`, and a `never=` count that stays low.
+3. If the firmware still dies, read `mcu hist`:
+   * dies after `roc_acquire` with no grant: the windows themselves are the problem. Next step: fewer windows, a longer
+     minimum gap between them, or the sniffer left on for the whole AWDL session instead of toggled per window;
+   * dies after `sniffer off` / `rx_filter`: the per-window sniffer toggling is the problem.
+4. **Undo (core).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad13 && mv Kexts-backup/itlmt7925.kext.20261104-171219 Kexts/itlmt7925.kext
+   ```
+
+**Also this boot.** The BLE mouse is "connected" but does not work after BtLeDlFix `96742446`
+(`fix/bt-le-advertising`). Reported to the Bluetooth session.
+
+### 10.43 Boot 2026-11-04 17:29 (core 29E5C6A5): no firmware hang. Wi-Fi drops because AWDL starves the AP link
+
+AWDL was enabled at 17:34:09. At 17:38:12 en5 went down. It rejoined at 17:38:25 (RESULT rc=0 link up).
+
+* **The firmware did not hang.**
+  * No `chip reset requested`, no `link lost`, no `rc=-110`.
+  * ROC latency: `<40=946 late=6 never=1`. The §10.42 strict ROC lifecycle held.
+* **airportd left the network itself.**
+  * symptomsd measured `TCP progress ... problem ratio: 1.00` from 17:36:58 on.
+  * airportd went `not broken -> tcp friction (strong) -> confirmed (quick probe)` (broken backhaul).
+  * At 17:38:12 it sent `WCL_LEAVE_NETWORK`, which the core logs as `supervisor: disconnect`. Auto-join rejoined 12 s later.
+* **Why TCP broke.** The radio was away from the AP's channel most of the time.
+  * The `pulse` beacon count (beacons from our AP only) fell from ~10/s before AWDL to 1-6/s with AWDL.
+  * From 17:36:39 to 17:36:54 neither `rxd` nor `tx` moved.
+  * Each window is 100 ms (`kAwdlPsfRocMs`), plus the ROC grant and 5-6 MCU commands. Windows came back to back at
+    ~3.3/s.
+  * Nothing told the AP that we were away, so its downlink frames were retried into the void.
+* **The LQM summary the native reports is wrong** (`txFail ≈ txFrames`, `beaconRecv` tiny) already before AWDL. It
+  played no part here (bbh works from TCP metrics), but it is a separate bug. Follow-up.
+
+**Round 13 (core).**
+* **802.11 power save toward the AP around every AWDL window.**
+  * A null-data frame with PM=1 (`fc 48 11`, ToDS, to the BSSID) goes out before the sniffer, RX filter and ROC commands.
+  * A null-data frame with PM=0 goes out as soon as `roc_abort` returns. Every way out of the window does this
+    (`winEnd()`).
+  * The AP buffers our downlink while we are away. Any later uplink data frame (PM=0) also wakes us, so a lost PM=0 null
+    cannot leave the link asleep.
+* **Off-channel duty cap.**
+  * The time from the PM=1 null to the PM=0 null is measured.
+  * The next window is not taken before the same time has passed again on the AP's channel (at most half the airtime
+    away). Windows refused this way are counted as `skip`.
+* **Trace.** `awdl duty: off=<ms> in <n> windows (avg) skip=<n> ps=<pm1>/<pm0> apbcn=<AP beacons>`, with every
+  `awdl stat`.
+
+Staged 2026-11-04 17:43: core `525C76B6-B8D5-385D-AD56-587618D32DD6`. The previous core (`29E5C6A5`) is in
+`Kexts-backup/itlmt7925.kext.20261104-174343`. The native stays `DC024A86`.
+
+**Next boot.**
+1. Bring AWDL up as in §10.38, and leave it on for 20 minutes with the recorder running. Use Wi-Fi normally: browse,
+   play a video.
+2. **Expected.**
+   * en5 stays up.
+   * No `tcp friction` / `broken backhaul` in `log show --predicate 'process == "airportd"'`.
+   * `awdl duty` shows `ps` counts equal to the window count, an avg near 130-150 ms, and `skip` > 0.
+   * `apbcn` keeps rising at ≥5/s.
+3. **If TCP still stalls.**
+   * `ps` stays 0: no link up at window time, so check `m3linkUp`.
+   * `ps` counts rise but downlink still dies: the AP ignores our PM bit (check with a sniffer that the AP sets our TIM
+     bit), or the firmware overrides it. Next lever: shorten the dwell (`kAwdlPsfRocMs` 100 → 48 ms, native).
+4. **Also check.** AWDL itself still works with fewer windows:
+   * `awdl data rx` / peer `drx` still rising;
+   * the iPhone still listed by `dns-sd -includeAWDL`.
+5. **Undo (core).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad14 && mv Kexts-backup/itlmt7925.kext.20261104-174343 Kexts/itlmt7925.kext
+   ```
+
+### 10.44 Boot 2026-11-04 21:38 (core 525C76B6): Wi-Fi drops without AWDL. The AP's group key rekey was never answered
+
+The owner reported unstable Wi-Fi and went back to USB tethering. AWDL was not up this boot (no awdl0), so the §10.43
+code never ran.
+
+* **The network is a different AP:** `9c:5d:12:89:1f:24`, ch 157, VHT80, SSID length 12.
+* **The AP drops us.** Disassociation reason 2, then deauthentication reason 1, every 30-80 s (21:46:59, 21:48:43,
+  21:49:40 ...). airportd rejoined each time, 10 s per join, and the core ran a full `recover #N: wfsys reset` for every
+  drop.
+* **Cause.** Before each drop, `pulse rxe` (EAPOL frames received) rises by 1-3 long after the 4-way handshake: 24→27,
+  29→31→32. These are the AP's group key handshake (message 1/2, the GTK rekey).
+  * After `RESULT link up`, `m3wantEapol` is false, so the RX path counted and dropped them.
+  * The AP got no message 2/2, resent message 1/2, and then removed the station. An AP with a short group rekey interval
+    makes this look like random instability.
+
+**Round 14 (core).**
+* EAPOL-Key frames on the link are queued and handled in the link loop by `m3EapolOnLink()`:
+  * group message 1/2 (ver 2, MIC|ACK|SECURE, non-pairwise);
+  * the replay counter must be newer than the last accepted one (M3, or the previous rekey);
+  * the MIC is checked with the KCK;
+  * the GTK KDE is unwrapped with the KEK;
+  * message 2/2 (`0x0302`, same replay counter) is sent encrypted with the PTK;
+  * the new GTK is installed on the broadcast wcid.
+* **Trace.** `eapol group rekey #n id= len= msg2= key rc=` (also in ev-log). Rejections are logged as `eapol on link: ...`.
+* A PTK rekey (a pairwise M1 on the link) is logged and ignored. Follow-up if an AP ever does it.
+
+Staged 2026-11-04 21:53: core `B1CA2849-0759-38A1-B6A9-2C5061E571BF`. It also carries round 13 (§10.43). The previous core
+(`525C76B6`) is in `Kexts-backup/itlmt7925.kext.20261104-215326`. The native stays `DC024A86`.
+
+**Next boot.**
+1. Join the same AP and use Wi-Fi only (unplug USB tethering) for 15 minutes.
+2. **Expected.**
+   * `eapol group rekey #1, #2 ... key rc=0` in m3-log at the AP's rekey interval.
+   * No `link lost: disassociation/deauthentication`.
+   * No `recover #`.
+3. If the drops continue, look for `eapol on link:` lines:
+   * `MIC rejected` / `key data not usable`: the key derivation or KDE parsing differs for this AP;
+   * `pairwise ... ignored`: the AP does PTK rekeys, so the 4-way has to run on the link too.
+4. Then the AWDL test of §10.43: power save + duty cap.
+5. **Undo (core).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad15 && mv Kexts-backup/itlmt7925.kext.20261104-215326 Kexts/itlmt7925.kext
+   ```
+
+### 10.45 Same boot (22:57, core B1CA2849): Wi-Fi is stable; why wifip2pd never creates awdl0 (capability 32)
+
+**Wi-Fi (§10.44 verified).**
+* The AP rekeys its group key about once a minute. `eapol group rekey #1..#8 ... key rc=0`, with no `link lost` and no
+  `recover`.
+* With USB tethering unplugged, all traffic over en5: 74/74 HTTPS probes OK in 5 min, a 10 MB download at ~3 MB/s.
+* One 25 s gap right after unplugging USB (23:05:45-23:06:10). The core's TX counter stood still while beacons kept
+  coming: the stack sent nothing. That is consistent with Cloudflare WARP blocking all traffic while it rebuilds its tunnel
+  on the new default route, not with a driver fault.
+
+**awdl0 auto-create: root cause.**
+* wifip2pd still logs `Cannot create AWDL interface because the device is missing the capability` after Wi-Fi joined
+  (22:59:10). So this is not boot ordering.
+* Disassembly of `/usr/libexec/wifip2pd` (x86_64, the function that logs the message at 0x100048450):
+  * For each interface type (`NAN` 0x4e414e, `AWDL` 0x4c445741) it calls `Apple80211RawGet` with type 0xc
+    (CARD_CAPABILITIES), len 21, into a stack buffer.
+  * It then tests one bit: AWDL = buffer[4] bit 0, NAN = buffer[9] bit 0. Clear bit: the error, and no ioctl.
+* `tools/awdl/caps_get.m` (RawGet 0xc as a normal user) shows the buffer userland gets: `6f e6 73 24 00 41 04 00 01 02 ...`.
+  * That is our capability array **without the version word**, so buffer[4] is our `d[0x08]`, which was 0.
+  * Capability 32 = AWDL. Apple's driver sets it from a firmware feature flag. We left it clear under the "claim nothing
+    we cannot back" policy.
+
+**Round 15 (native).** `getCARD_CAPABILITIES` sets `d[0x08] = 0x01`, capability 32, AWDL. The driver implements the
+AWDL interface, so the bit is backed. NAN stays clear.
+
+Staged 2026-11-04 23:12: native `E1DE91CA-5A6B-30A6-81BB-B00E60FCEB10`. The previous native (`DC024A86`) is in
+`Kexts-backup/itlmt7925Native.kext.20261104-231225`. The core stays `B1CA2849`.
+
+**Next boot.**
+1. Do **not** run the vif tool. Check `ifconfig awdl0` and the log
+   `log show --predicate 'process == "wifip2pd"' | grep -E 'AWDL interface|capability'`:
+   * **expected:** `Creating AWDL interface` followed by no `missing the capability`, then awdl0 present;
+   * `cmd=5e` in the native trace.
+2. Then check that AirDrop comes up without the manual steps of §10.38: Finder > AirDrop "Everyone" →
+   `AWDLAdvertise ..._airdrop._tcp.local was started`, `dns-sd -includeAWDL -B _airdrop._tcp local.` → `enabled AWDL`.
+3. Wi-Fi with AWDL on: the §10.43 power-save and duty-cap test (20 min, normal use, no `broken backhaul`).
+4. **If something regresses.** The Family itself also reads the capability array, and may now start its own AWDL paths at
+   boot. Collect `itlmt_native_trace` and the wifip2pd log first.
+5. **Undo (native).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad16 && mv Kexts-backup/itlmt7925Native.kext.20261104-231225 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.46 Boot 2026-11-04 23:32 (core B1CA2849, native E1DE91CA): awdl0 comes up by itself; a new AP drops us because M4 is lost
+
+**§10.45 verified.** At 23:32:57, 2 s after Wi-Fi came up and with no tool run, wifip2pd logged
+`Found new interface awdl0 with role AWDL`. awdl0 is up with MAC `c6:91:a2:50:20:ba`. There is no
+`missing the capability` this boot.
+
+**New AP, new failure.**
+* The AP is `02:f0:7b:79:7c:56` (ch 52, SSID length 14, CCMP/PSK, no MFP). The owner sees "Weak Security" in the Wi-Fi
+  menu and the network keeps dropping.
+  * The label comes from ControlCenter's recommendation UI (`DISPLAY WIFI RECOMMENDATION UI`, 23:35:09). It describes the
+    AP's configuration. airportd's records all say `NetworkHasWeakSecurity = 0`.
+* airportd logs a link down every 15-30 s (23:33:27, 23:33:53, 23:34:20, 23:35:21, 23:35:52 ...).
+  * After each link up the core logs `eapol on link: pairwise info=13ca ignored`. 0x13ca is message 3 again: the AP never
+    received M4.
+  * The handshake summaries show `txFree=0`. The M4 had not left the queue when the PTK was installed (the old fixed 30 ms
+    wait).
+  * §10.44 only answered group messages, so the AP retried M3, gave up and the link went down.
+
+**Round 16 (core).**
+* **The first M4 is freed before the keys are installed.** The link thread pumps until TXFREE for M4 is seen, at most
+  300 ms and at least 30 ms. It logs `eapol m4 freed|NOT freed after wait`.
+* **A retransmitted M3 on the link is answered.**
+  * The replay counter must be newer, and the MIC is checked with the KCK.
+  * M4 is sent again in the clear (the AP installs its PTK only once it has M4).
+  * Keys are not installed again (no PN reset, no KRACK pattern).
+  * Logged as `eapol on link: m3 again #n, m4 resent=`.
+
+Staged 2026-11-04 23:43: core `7579D98A-B4BF-3F86-BBA0-7AA27BB1BF10`. The previous core (`B1CA2849`) is in
+`Kexts-backup/itlmt7925.kext.20261104-234340`. The native stays `E1DE91CA`.
+
+**Next boot.**
+1. Join the ch 52 AP and use Wi-Fi alone for 10 minutes.
+2. **Expected.**
+   * `eapol m4 freed after wait`;
+   * at most a few `m3 again` (each answered);
+   * no airportd `Link down event` every 15-30 s.
+   * On the earlier AP (`9c:5d:...`), the group rekeys still work.
+3. awdl0 should again appear by itself (§10.45). Then the AWDL + Wi-Fi test of §10.43.
+4. **Undo (core).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad17 && mv Kexts-backup/itlmt7925.kext.20261104-234340 Kexts/itlmt7925.kext
+   ```
+
+### 10.47 Boot 2026-11-05 08:46 (core 7579D98A, native E1DE91CA, BtLeDlFix F715BA43): §10.46 verified on the ch 52 AP
+
+* `eapol m4 freed after wait` on the first handshake. The AP never resent M3 (`rxe=2` for the whole run), so no
+  `m3 again` was needed.
+* 12 minutes on en5 alone:
+  * one join, zero airportd `Link down event`, no `recover`;
+  * 134/137 HTTPS probes OK (the misses: one moment without a default route at 08:51:00, one 5 s timeout at 08:56:26);
+  * 10 MB at ~2.7 MB/s.
+* awdl0 came up by itself again (§10.45).
+* **Open.**
+  * BLE mouse and AirDrop with the Bluetooth session's fourth BtLeDlFix (`bbac9e0`, branch `fix/bt-le-advertising`).
+  * The AWDL + Wi-Fi test of §10.43.
+
+### 10.48 Sleep took 17.5 s longer because en5 advertised keepalive offload it does not have (sleep test 2026-11-05 08:50)
+
+From the owner's sleep test (`~/ga403-logs/syssleep-20261105-084946`, 08:50:15-08:50:33):
+
+| Time | Event |
+|---|---|
+| 08:50:15.517 | powerd: `Entering Sleep state`; apsd `prepareForSleep`, `Waiting to acknowledge power change event` |
+| 08:50:15.525 | airportd: `WOW_ENABLED` on en5 → -3900, `WoW is not active on en5`; airportd itself acknowledges at once |
+| 08:50:15.544 | apsd: `Unable to obtain sleep proxy keep alives, reason = -65542` |
+| 08:50:16.607 | apsd: `_interfaceSupportsKeepAliveProxy {interfaceHasSupport: YES, usedRecursiveSearch: YES}`, so it asks again |
+| 08:50:30.555 | powerd: `apsd TimedOut ... com.apple.apsd-requestkeepaliveproxy-push.apple.com` (15 s) |
+| 08:50:33.036 | apsd: `Acknowledging power change event after waiting` |
+
+**Cause.** `itlmt7925WifiInterface` carries `"mDNS_KEY" = "2009-07-30"` and `"mDNS_Keepalive" = Yes` in the IORegistry.
+* These are the keys mDNSResponder and apsd search for (recursively, from the BSD interface up) to decide that the NIC
+  can hold Bonjour sleep-proxy records and TCP keepalives while the host sleeps.
+* Our code never sets them; the Family publishes them on the interface.
+* The driver implements neither offload, and `WOW_ENABLED` answers unsupported. So apsd waited for keepalive records the
+  NIC could never take.
+
+**Round 17 (native).**
+* `itlmt7925WifiInterface` overrides the `setProperty` overloads the Family can use (OSSymbol / OSString / C string with
+  OSObject, string, bool) and never stores those two keys.
+* A real WoW + TCP keepalive offload would be the other way to fix this; it is follow-up work.
+
+Staged 2026-11-05 09:09: native `59639683-12FE-3989-9689-9C44E28D4536`. The previous native (`E1DE91CA`) is in
+`Kexts-backup/itlmt7925Native.kext.20261105-090941`. The core stays `7579D98A`.
+
+**Next boot.**
+1. `ioreg -l -w0 | grep -E '"mDNS_(KEY|Keepalive)"'` prints nothing.
+2. Sleep test:
+   * no `Unable to obtain sleep proxy keep alives`;
+   * no `apsd TimedOut ... requestkeepaliveproxy`;
+   * apsd acknowledges within ~1 s of `prepareForSleep`.
+3. Wi-Fi after wake: link back, no airportd link-down loop. awdl0 still auto-created (§10.45).
+4. **Undo (native).**
+   ```
+   cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad18 && mv Kexts-backup/itlmt7925Native.kext.20261105-090941 Kexts/itlmt7925Native.kext
+   ```
+
+### 10.49 Boot 2026-11-05 10:42 (core 7579D98A, native 59639683): first iPhone ↔ Mac AirDrop test; Wi-Fi died in a DFS ROC
+
+**AirDrop, both directions: the devices do not see each other.**
+* **Bluetooth works:** sharingd hears the iPhone (`Found BLE device`, `Device in everyone mode`), and the AirDrop Bonjour
+  server listens on awdl0:8770.
+* **The Family keeps the iPhone unroutable.** In 83 of 83 checks: `isPeerRoutable: Peer E6:4F:AE:93:D5:E7 rssi:-80 Not
+  Routable. Peer discovered(on 2.4GHz only) and is outside bubble`. With no route, nothing reaches the TCP/Bonjour stage.
+* **Why (read from 25G241, facts only).**
+  * `IO80211AWDLPeer::isPeerRoutable` calls `isDualBandPeerDiscoveredOn5GHz`. That is false for a dual-band peer whose
+    5 GHz action frame counters (`ivars+0xa0` MIF, `+0xa8` PSF) are both 0.
+  * In that case the peer is routable only if its RSSI reaches the bubble threshold (`mgr ivars+0x2824`). The RSSI it
+    uses is `+0x4a4`, else `+0x49c - 10`, else -100. Here -80, i.e. -70 - 10.
+  * `IO80211AWDLPeer::actionFrameReport` increments the 5 GHz counters when the receive descriptor's channel (`hdr+0x10`)
+    is above 14: subtype 3 → `+0xa0`, 0 → `+0xa8`. On 2.4 GHz it increments `+0x9c` / `+0xa4` instead.
+  * So the Family never received an iPhone frame tagged with a 5 GHz channel. The iPhone's sequence (TLV 4, encoding 1)
+    is 157 (40 MHz, center 159), 149 (center 151), and 6. Our listen windows go to 157/149, but no frame from the iPhone
+    was handed up from them.
+* **Not synchronised.** We stay our own master (`master=eeaf4d21ea44`); the iPhone follows `7e:59:0c:c9:7b:24`.
+  `pm=473/1/62`: peers name themselves, and us only once.
+
+**Wi-Fi lost at 11:01:33.**
+* The sequence: `sniffer off rc=-110`, `roc_abort rc=-110`, `chip reset requested`. `mcu hist` ends with `roc_acquire:0`,
+  then `sniffer off:-110`, which matches §10.42 step 3a: it dies after a `roc_acquire` with no grant.
+* The ROC the firmware never granted was on **channel 136** (`awdl sync: roc fail ch=136 grant=0 status=255`). That is a
+  DFS channel, taken from a peer's channel sequence (entry 0x8a, 40 MHz lower → 136). The station has done no channel
+  availability check there.
+* **Recovery failed:** `recover #1`, then `recover: M1 rc=-5`. It was tried once only. airportd then sent a disconnect, so
+  the supervisor idled with a dead chip and Wi-Fi stayed down (the owner switched to USB tethering).
+  * m1-log still held the boot log, so the failing step is not on record. -5 after `patch:` most likely means the patch
+    semaphore was still held by the firmware that hung.
+
+**Round 18 (core + native).**
+* **No AWDL window on DFS channels (52-144).**
+  * The core skips them: `awdl: no window on DFS channel N (skipped n)`.
+  * The native listen timer picks the peer's next non-DFS slot.
+* **Recovery that does not give up.**
+  * A failed `chipRecover` is retried after 1 s and 2 s.
+  * If the chip is still dead, the supervisor reloads it every 30 s, even after a disconnect (up to 16 recoveries):
+    `supervisor: chip back after recovery #n`.
+  * m1-log is cleared at each recovery, and on failure `recover: M1 tail ...` copies the last step into m3-log.
+* **Patch semaphore.** When the semaphore is not free (`patch sem=N not free: release and retry`), it is released and
+  requested once more, instead of returning -5.
+* **Band trace, to settle the AirDrop question.**
+  * Core: `awdl band: af=<2.4>/<5> win=<2.4>/<5> never=<2.4>/<5> dfs=n`, with every `awdl stat`. Counts AWDL frames
+    parsed, windows granted, and windows never granted, per band.
+  * Native `itlmt-awdl`: `band=<2.4>/<5> rssi24=min..max rssi5=min..max`, the frames handed to the peer manager per band.
+
+Staged 2026-11-05 11:50:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `C0EA9FA9-4FA9-325C-AD0A-52D851C5C07F` | `7579D98A` | `Kexts-backup/itlmt7925.kext.20261105-115013` |
+| native | `9BC74AF3-F512-3019-BDCF-17DEC33155A1` | `59639683` | `Kexts-backup/itlmt7925Native.kext.20261105-115013` |
+
+The import lists are unchanged (`nm -u` diff empty).
+
+**Next boot (a cold boot is best: the chip is dead now).**
+1. Wi-Fi comes up on its own. awdl0 is up, as in §10.45.
+2. Run the recorder: m3-log and `itlmt-awdl` every 5 s, plus the sharingd/wifip2pd/kernel awdl `log stream`. Keep it
+   running for 20 minutes, with AirDrop open in Finder ("Everyone") and the iPhone's share sheet open from time to time.
+3. **Wi-Fi.**
+   * No `chip reset requested` should appear. `dfs=` may grow, but `never=` must stay low.
+   * If the firmware still dies, the recovery should now bring the link back (`chip back after recovery`, or
+     `recover: M2 rc=0`) without a reboot. If it fails, read `recover: M1 tail`.
+4. **AirDrop, read `band`.**
+   * **5 GHz af = 0** (core): the radio hears nothing in the 5 GHz windows. Check the ROC/sniffer band fields and the
+     window timing on 5 GHz.
+   * **Core 5 GHz af > 0, native band 5 = 0:** the frames are lost between the core ring and the peer manager.
+   * **Native band 5 > 0:** the Family must stop printing `discovered(on 2.4GHz only)`. Then follow sharingd to the
+     TLS/HTTP stage on awdl0:8770.
+5. **Undo.**
+   * Core:
+     ```
+     cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad19 && mv Kexts-backup/itlmt7925.kext.20261105-115013 Kexts/itlmt7925.kext
+     ```
+   * Native:
+     ```
+     cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad19 && mv Kexts-backup/itlmt7925Native.kext.20261105-115013 Kexts/itlmt7925Native.kext
+     ```
+
+### 10.50 Boot 2026-11-05 12:29 (core C0EA9FA9, native 9BC74AF3): 5 GHz frames now reach the Family; a hang on garbage channels
+
+**What §10.49 fixed (verified).**
+* Wi-Fi came up on its own after the cold boot.
+* AWDL frames are now heard on 5 GHz:
+  * core `awdl band: af=36/91` at 12:33;
+  * native `band=37/91 rssi5=-60..-40`, the frames handed to the Family.
+  * The `discovered(on 2.4GHz only)` lines are gone.
+* `recover #1` at 12:32:55 worked (`M1 rc=0`, `M2 rc=0`). The link was back at 12:34:22 without a reboot, after
+  ~2 minutes, about half of it the airportd disconnect → rejoin cycle.
+
+**Still open.**
+* AirDrop: the devices do not see each other. `rtg(0)` (no routable peer); `peers:2`.
+* We are still master of our own cluster: `master=8e7c08617f6b` is our own (new) AWDL address, and `pm=34/0/0`, so no
+  peer names us. The iPhone (`52:28:55:00:25:36`) was heard on ch 6, 149 and 157 at -54..-61 dBm. The election not
+  converging is the next thing to read.
+* The owner switched to USB tethering at 12:34:38 (router 172.31.158.61). If that is the iPhone's Personal Hotspot,
+  the iPhone may keep AWDL off while tethering. Test without it.
+
+**The hang (12:32:27-12:32:48).** Three ROCs the firmware never granted, all on **channels that do not exist**: 26, 253
+and 249 (`status=255`). Then `rx_filter` and `sniffer on` timed out (`mcu hist ... rx_filter:-110@8705 sniffer
+on:-110@12170`). The channels came from a peer's channel sequence that was misread or used a fill value.
+
+**Round 19.**
+* **Core.** A window opens only on a real, non-DFS 20 MHz channel: 1-13, 36-48, 149-165. Anything else logs
+  `awdl: no window on channel N (DFS or invalid, skipped n)`.
+* **Native.** `awdlSeqPrimary()` returns 0 (absent) for any such channel, so the listen timer goes to the next usable
+  slot.
+
+Staged 2026-11-05 12:36:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `D9564AA8-D738-3A7F-8FE4-05678B87470F` | `C0EA9FA9` | `Kexts-backup/itlmt7925.kext.20261105-123609` |
+| native | `13C3687D-909B-3FAA-9A95-28F114904E66` | `9BC74AF3` | `Kexts-backup/itlmt7925Native.kext.20261105-123609` |
+
+The import lists are unchanged.
+
+**Next boot.**
+1. No `chip reset requested`. An `awdl: no window on channel ...` line is the guard working.
+2. AirDrop test with the iPhone **not** tethering. Read:
+   * `rtg(n)` in the kernel's `AWDLStateDump`;
+   * `master=` and `pm=` in `itlmt-awdl` (does anyone name us, or do we follow the iPhone?);
+   * `moving from NO ROUTE -> ROUTABLE`.
+3. **Undo:** the same commands as §10.49, with the `20261105-123609` backups.
+
+### 10.51 Same boot (12:29-12:55): three root causes traced from the recorder log
+
+**1. Garbage channels come from FCS-failed frames.**
+* wifip2pd logged `Failed to parse event[48]` 8 times. The event is our `apple80211_act_frm_hdr` + action body from
+  `52:28:55:00:25:36`. Its TLV 4 is intact up to the channel sequence (`0f 01 00 03 ff ff 1d 9f`), and from there on it is
+  noise (`00 80 d7 a1 32 27 00 e0 c8 fa ...`).
+* The same frames gave the listen timer channels 26, 249 and 253.
+* Cause: the window's RX filter had BIT(2) (pass FCS-failed frames) and the sniffer config `drop_err = 0`. Both were set
+  as diagnostics in §10.22, so frames with bit errors went to the Family as if they were valid.
+
+**2. The window's promiscuous RX filter was never undone.**
+* Hangs at 12:39:29 and 12:49:04 had no ungranted ROC before them. `mcu hist` shows normal windows, then `rx_filter:-110`
+  ~47 s after the last command. So the firmware died during an AWDL pause, with the filter still set to "other BSS +
+  control + FCS-fail" on the AP's channel.
+* Linux only sets those bits for a monitor interface (`mt7925_configure_filter`). A station runs with `ENABLE` alone.
+
+**3. Recovery ran out of DMA memory.**
+* Recoveries #1, #2 and #5 worked; #3, #4 and #6-#11 failed with `ring alloc failed` (M1 rc=-5), the same -5 as at 11:01.
+* `chipRecover()` freed every ring and `m1Run()` allocated them again: about 4 MB of physically contiguous memory below
+  4 GB each time. Once that memory is fragmented the allocation fails, and the chip stays dead.
+* Linux keeps the queues' memory across a reset (`mt792x_wpdma_reset`).
+
+**Also seen.**
+* The AWDL peer we talk to, `52:28:55:00:25:36`, is a **MacBook Air (2)**, not the iPhone. wifip2pd discovered its
+  `_airdrop._tcp`, `_appsvcprepair._tcp` and `_applicationservicepairing._tcp` and established a datapath
+  (`AWDLDatapathInitiator ... datapath established`). So the AWDL path works with a real Apple device.
+* The MacBook Air names `7e:59:0c:c9:7b:24` as its master, the same master the 10:42 boot saw; that may be the iPhone.
+  We never adopt it, and we stay master of our own cluster (`master=` our own address).
+
+**Round 20 (core).**
+* Window filter: `0x80000040` (enable + other BSS), no FCS-fail, no control frames. Sniffer `drop_err = 1`.
+* Every window ends with `m3RxFilter(0x80000000)`, the station's own filter.
+* `chipRecover()` no longer frees the rings. `ringInit()` reuses memory that is large enough and only resets it.
+  An allocation failure now names its queue and size (`ring qN: desc/buf alloc S failed`).
+
+Staged 2026-11-05 12:55:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `7E6BA3AE-EC6D-3775-A552-EB3C2E101985` | `D9564AA8` | `Kexts-backup/itlmt7925.kext.20261105-125517` |
+| native | `13C3687D` (§10.50) | — | — |
+
+The import lists are unchanged.
+
+**Next boot.**
+1. No `Failed to parse event` from wifip2pd, and no `awdl: no window on channel` for garbage values.
+2. No `chip reset requested`. If one comes, `recover: M1 rc=0` every time (no `ring alloc failed`).
+3. AirDrop: the MacBook Air (2) should show up in Finder → AirDrop. Then read whether we ever follow
+   `7e:59:0c:c9:7b:24`.
+4. **Undo (core):** as §10.49, with `itlmt7925.kext.20261105-125517`.
+
+### 10.52 Boot 2026-11-05 13:03 (core 7E6BA3AE, native 13C3687D): recovery works; a stale ROC event still kills the firmware
+
+**§10.51 verified in part.**
+* The hang came again, and this time `recover #1` gave `M1 rc=0` and `M2 rc=0`, then the link came back. The ring
+  memory reuse works.
+* There was no garbage channel before the hang.
+
+**What happened.**
+| Event | Meaning |
+|---|---|
+| `awdl sync: roc fail ch=149 grant=1 status=173 after 0 ms` | a "grant" before the request could have been answered |
+| `awdl sync: roc fail ch=157 grant=0 status=255 after 329 ms` (twice), then the same on ch 6 | no grant at all after that, on valid channels |
+| `rx_filter:-110`, `sniffer on:-110` | the firmware no longer answers: chip reset |
+
+**Cause.** `m3Event()` took **every** `UNI_ROC` event as the grant of the request in flight:
+* it checked neither the TLV tag nor the token;
+* it **overwrote `rocTok` with the event's token**.
+
+So the late event of the previous, already-aborted ROC (status 173) answered the new request at once. The window then
+aborted with the old token. The firmware's real ROC for the new request was never released, and it granted nothing more
+before it went silent.
+
+Linux (`mt7925_mcu_uni_roc_event`) only acts on `UNI_EVENT_ROC_GRANT` (tag 0).
+
+**Round 21 (core).**
+* A ROC event counts only if its tag is 0, a request is pending, and its token is the one we sent.
+* `rocTok` is no longer overwritten.
+* Every other event is ignored and logged: `roc event ignored: tag= tok= (want , pending=) status= n=`.
+* The join path, before link up, still accepts a token mismatch and logs it (`roc event: join grant with tok=..., asked
+  ... (accepted)`), so a firmware that numbers tokens on its own cannot block the connection.
+
+Staged 2026-11-05 13:08:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `541830A0-896B-3EA9-AC2B-59342E0BE1DC` | `7E6BA3AE` | `Kexts-backup/itlmt7925.kext.20261105-130830` |
+| native | `13C3687D` (unchanged) | — | — |
+
+The import lists are unchanged.
+
+**Next boot.**
+1. Use Wi-Fi normally for 30+ minutes, no USB.
+2. Expect no `chip reset requested`. `roc event ignored` lines are the fix catching stale events. Their count shows how
+   often it happened before.
+3. If the firmware still dies, read the `mcu hist` and the last `roc` lines before it.
+4. **Undo (core):** as §10.49, with `itlmt7925.kext.20261105-130830`.
+
+### 10.53 Boot 2026-11-05 13:31 (core 541830A0, native 13C3687D): discovery works, unicast data does not
+
+**What works now.**
+* No stale-ROC kill: `roc event ignored` caught 3 stale events (tag `0xBEEF`, status `0xAD`) in the first 2 minutes.
+* The Mac synced as a slave to the iPhone (`role=2 master=7e590cc97b24`).
+* wifip2pd discovered the iPhone's services, `_airdrop._tcp` included. sharingd logged the endpoints as passing its
+  filter. A `dns_sd` browse and resolve over `awdl0` returned SRV port 8770 and a 13-byte TXT.
+
+**What fails.** Unicast between the two devices, in both directions:
+* `ping6 fe80::7c59:cff:fec9:7b24%awdl0` loses 100 %; a TCP connect to port 8770 never completes.
+* `dtx` rose 139 → 246, every frame "sent" at DMA level (fail 0). Whether the iPhone ACKed any of them is unknown:
+  nothing parsed TX status.
+* All 53 received data frames are multicast mDNS (`da=3333000000fb`), on channel 6. No unicast frame from the iPhone
+  was ever classified as AWDL data.
+
+**What the code did.**
+* AWDL data goes out on ALTX0 with wcid 1 (the AP's station record) and TXD1 `OWN_MAC` 0, the station's address.
+  mt7925 `mac_write_txwi` puts the interface's `omac_idx` there. The AWDL address is OMAC 1 (`awdlOwnMacApply`).
+* TXD5 asked for a TX status (`PID 3 | TX_STATUS_HOST`), but `PKT_TYPE_TXS` (0) records were only logged by
+  `m3RxMgmt()` while a join waited, and otherwise dropped.
+
+**Round 22 (core).**
+* `m3Txs()` parses TXS records on both rings: two header dwords, then 8-dword records (`mt7925_queue_rx_skb`).
+  It counts by PID, taking ok vs failed from TXS0 `ACK_ERROR_MASK` (bits 18:16: queue / RTS / ACK timeout). WCID is
+  TXS2 27:16, PID is TXS3 31:24.
+* AWDL data has its own PIDs: 4 for unicast, 5 for group. The first 8 unicast records are logged raw
+  (`txs awdl uc: wcid= err= …`).
+* AWDL data is sent with TXD1 `OWN_MAC` = 1 once OMAC 1 holds the AWDL address (`awdlOwnRc == 0`). The run-time
+  switch `itl_awdlomac=0` (itlctl) returns to OMAC 0, so both can be compared without a reboot.
+* RX: `awdlDataRxUc` counts AWDL data with a unicast DA, and `awdlDataRxUcMine` those to our AWDL address. The first 4
+  are logged (`awdl data rx uc …`).
+* New stat line, every 50 sync windows: `awdl txs: n= host=ok/fail uc=ok/fail grp=ok/fail other= err q/rts/ack=
+  rxuc= mine= own= omac1=`. `own` is the OMAC 1 `DEV_INFO` result, which was not exported before.
+
+**Round 22 (native).** The election TLVs (5 and 0x18) are published:
+* `itlmt-awdl-self-el` holds ours, as the Family built them;
+* `itlmt-awdl-peer-el` holds the peer's, after its 6-byte address.
+
+`isPeerQualifiedForElection` compares the v2 value at +0x1c with our election ID. These two show whether the iPhone and
+the Mac agree.
+
+Staged 2026-11-05 13:45:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `79525B98-4CC9-356D-9B1E-581D33EF676B` | `541830A0` | `Kexts-backup/itlmt7925.kext.20261105-134523` |
+| native | `F8D2F469-8318-38BB-BC14-852DA4A5C4E5` | `13C3687D` | `Kexts-backup/itlmt7925Native.kext.20261105-134523` |
+
+**Next boot.**
+1. Turn on AirDrop on both devices and keep the iPhone's AirDrop sheet open. Run
+   `ping6 -c 20 fe80::<iPhone awdl IPv6>%awdl0` (from `ndp -an | grep awdl0`).
+2. Read the `awdl txs:` line in `m3-log`:
+   * `uc` with ok > 0: the iPhone ACKs our unicast, so TX works and the fault is on our RX side (go to step 3);
+   * `uc` with fail only and `ack` errors: the iPhone does not ACK. Run `sudo itlctl itl_awdlomac=0`, ping again and
+     compare. If both fail, the frame is not reaching the iPhone in its window (timing or channel);
+   * `uc=0/0`: no TXS for AWDL data. Check `n` (are any TXS records arriving?) and `host`.
+3. `rxuc` / `mine`:
+   * 0 while the iPhone retries: our MAC does not take the iPhone's unicast. Check `own=` (must be 0).
+   * `mine` > 0 but ping fails: the frames reach the core. Follow them into the native interface (`awdlDeliverRx`
+     and the data path).
+4. Compare the election ID in `ioreg -l -w0 | grep -E 'itlmt-awdl-(self|peer)-el'`: the v2 TLV (0x18) value at +0x1c.
+5. **Undo:** copy both `…20261105-134523` backups back as `itlmt7925.kext` / `itlmt7925Native.kext`.
+
+### 10.54 Boot 2026-11-05 13:52 (core 79525B98, native F8D2F469): the iPhone's unicast arrives; ours mostly does not
+
+**Measured.**
+* `rxuc=126 mine=126`: the iPhone's unicast data to our AWDL address reaches the core and the IP stack (`drx` up 142,
+  dup 97, the iPhone's own 802.11 retries).
+* tcpdump on awdl0 (as root) shows TCP in both directions:
+  * The Mac connects to the iPhone on port 57339. Of about 10 SYNs, one gets through: the iPhone's SYN-ACK echoes its
+    timestamp.
+  * Our ACK went out 0.1 ms after the SYN-ACK reached the stack, followed by data, yet the iPhone kept repeating the
+    SYN-ACK.
+  * The iPhone connects to our port 59050 and repeats its SYN, so our SYN-ACKs are lost too.
+  * ping6 got no replies.
+* `itl_awdlomac=0` at run time (itlctl) changed nothing, so the OMAC is not the cause.
+* TXS: round 22 decoded the records two dwords off. On this chip the header is 4 dwords. Decoded correctly, the five
+  logged records are wcid 1, SN 0x040-0x04c, `ACK_ERROR` 0: some frames are ACKed.
+
+**Cause (from the code).** `awdlSyncTx` handed data to the hardware until the last millisecond of the dwell, then called
+`m3Roc(false)` at once. A frame posted late was still queued or retrying when the radio went back to the AP's channel:
+* a 1500-byte frame at 6 Mb/s takes about 2 ms per attempt, up to 15 attempts;
+* the ROC was requested 30 ms longer than the dwell, but that margin was never used.
+
+The window loop also ran `dwellMs` iterations of `m3Pump(1)` rather than `dwellMs` milliseconds.
+
+**Round 23 (core).**
+* `awdlDwell()`:
+  * data goes to the hardware only while 10 ms or more of the dwell remain;
+  * after the dwell it waits up to 25 ms, within the ROC margin, until every AWDL data frame has its TXS, and only then
+    ends the window;
+  * the dwell is measured in milliseconds.
+* TXS parser: header 16 bytes, length from RXD0, zero records skipped. The first 4 packets are logged raw (`txs pkt`).
+  Up to 12 unicast records are logged with pid, err, sn, rate, channel, and whether the window was still open.
+* PID by class: 4 = unicast to a peer not heard in this window, 6 = unicast to a peer heard in this window (an AF or
+  data frame from it since the grant), 5 = group.
+* `awdl txs:` line: `pk n host uc ucheard grp other err q/rts/ack late uc24 uc5 guard drain=timeouts/ms rxuc mine own
+  omac1`. `late` counts AWDL data whose TXS arrived after the window closed, meaning it was sent on the wrong channel.
+
+Staged 2026-11-05 14:02:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `C3BEDEF3-33AD-3F97-8F22-D0E3CFA43EEB` | `79525B98` | `Kexts-backup/itlmt7925.kext.20261105-140227` |
+| native | `F8D2F469` (unchanged) | — | — |
+
+**Next boot.**
+1. AirDrop on both devices, the iPhone's share sheet open. Run `ping6 -c 20 fe80::7c59:cff:fec9:7b24%awdl0`, then send a
+   photo from the iPhone to the Mac.
+2. `awdl txs:` line:
+   * `late` should stay at 0;
+   * `uc`/`ucheard` ok against fail shows the ACK rate, and whether "peer heard in this window" matters;
+   * `err` says which failure: queue, RTS or ACK timeout.
+3. A high `drain` timeout count means no TXS comes back for some AWDL frames. Read the `txs pkt` lines.
+4. If ACKs are good but TCP still fails, the loss is above the MAC: compare a tcpdump on awdl0 with the TXS SNs.
+5. **Undo:** copy `itlmt7925.kext.20261105-140227` back as `itlmt7925.kext`.
+
+### 10.55 Boot 2026-11-05 14:19 (core C3BEDEF3): data frames get no TXS; their result is in TXFREE
+
+**Measured.**
+* With the 4-dword header the parser works: 951 records in 2 minutes, all PID 3 (our PSF/MIF, all OK).
+* Not one TXS for AWDL data (PID 4/5/6), although 73 data frames went out. So every window with data waited the full
+  25 ms drain: `drain=33/826ms`. The guard held data in 29 windows.
+* The iPhone had not synced at the time of reading (`role=1`, master = us, no peer in `ndp`).
+  `awdl band: af=1/42`: some peer action frames were heard.
+
+**Cause.** On this chip data frames do not produce TXS records. Linux mt7925 takes per-frame results for data from TXFREE:
+`mt7925_mac_tx_free` reads `MT_TXFREE_INFO_HEADER` words, STAT 29:28 (non-zero = failed) and COUNT 27:24
+(attempts), for the MSDUs that follow. `m3TxFree()` already summed these into `stTxFwFail` / `stTxFwRetry` for all
+traffic, but not per frame.
+
+**Round 24 (core).**
+* `txPid[slot]` remembers each staging slot's PID. TXFREE attributes the preceding header's STAT/COUNT to AWDL data
+  slots (PID 4..6).
+* `awdl txfree:` line: `uc ucheard grp` (ok/fail), `tries`, `late` (freed after the window closed), `uc24 uc5`.
+  The first 10 unicast results are logged as `txfree awdl pid= st= tries= ch= win=`.
+* The drain after the dwell now waits for TXFREE of the AWDL frames instead of TXS. It is skipped when the TX pool is
+  off.
+
+Staged 2026-11-05 14:23:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `334EDC98-8887-3BCE-AD37-6ABB4B3DD2E2` | `C3BEDEF3` | `Kexts-backup/itlmt7925.kext.20261105-142331` |
+
+**Next boot.** The same as §10.54, reading `awdl txfree:` instead of the TXS line for data. `drain` timeouts should
+now be rare.
+
+### 10.56 Same boot (core C3BEDEF3, 14:24-14:32, iPhone share sheet open): every window comes up 10-40 ms late
+
+**Measured.**
+* `awdl roc latency <10=0 <40=1780 late=13`: every grant took 10-40 ms after the request.
+* The AWDL AW is 16 TU. A window handed over at its boundary reached the channel after the peer's PSF/MIF and AW were
+  over.
+* The Family flapped between itself and the iPhone as master:
+  * `programChipWithNewMaster` alternated 5E:29… ↔ 7E:59… in runs of 2-95;
+  * the iPhone's metric is the higher one (533 against 521);
+  * the master is dropped whenever its frames have not been heard for ~3 s.
+* With the iPhone heard so rarely, it never sent us unicast: `rxuc=0`. 0/20 pings went through, and the Mac's TCP SYNs
+  to port 57347/57352 got no answer.
+* Off-channel time: `duty: off=219985 ms in 1794 windows (avg 122)`, `skip=3085`. The AP-share rule skipped more
+  windows than ran.
+
+**Cause.** Two delays added up:
+* The native interface submitted each window when it was already due: the PSF tick at the EAW boundary, the listen
+  timer 2 ms ahead.
+* The core then spent the start of the window on setup: the AP null frame, the RX filter and sniffer commands, the ROC
+  request, the 10-40 ms grant, and the sniffer channel config. Only after all that did it send the PSF.
+
+**Round 25 (core + native, bridge v5).**
+* `ItlNativeAwdlSync.startUs` (v5): host uptime at which the window's AW starts.
+  * The PSF tick hands over the **next** EAW's window: channel of slot `aw+4`, start `awStart + 64 TU`.
+  * The listen timer fires 50 ms ahead of its window. The next one is armed from this window's start.
+  * A core that rejects v5 is driven as v4, as before.
+* Core: waits, servicing the AP, until `startUs - awdlLeadUs`, then does the setup. `awdlLeadUs` is an EWMA of the
+  measured setup-to-grant(+sniffer) time + 3 ms, clamped to 4-45 ms, starting at 30 ms. Early on the channel → waits for
+  the AW start, then sends the PSF/MIF. The dwell is counted from the AW start. The ROC duration includes the wait. A
+  window more than half its dwell late is dropped (`stale`).
+* `itl_awdllead=0` (itlctl) returns to "set up when due", for an A/B test without a reboot.
+* Stat line: `awdl lead: lead=us early= late= avglate=us stale= wait=ms on=`.
+
+Staged 2026-11-05 14:34:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `917672D3-1245-371B-A255-006AC77193E3` | `C3BEDEF3` (334EDC98 was staged, not booted) | `Kexts-backup/itlmt7925.kext.20261105-143407` |
+| native | `3A8B6D6E-C683-3865-9F89-D00EC486D82E` | `F8D2F469` | `Kexts-backup/itlmt7925Native.kext.20261105-143407` |
+
+This build also contains round 24 (TXFREE ACK results, §10.55).
+
+**Next boot.**
+1. Wi-Fi first. The windows now leave the AP channel up to 45 ms earlier, but not for longer. Watch for drops, as
+   before.
+2. Open the iPhone's share sheet.
+3. `awdl lead:` should show `early` ≫ `late`, and `lead` should settle at the real setup time.
+4. In `log show … programChipWithNewMaster`, the master should stay 7E:59… (the iPhone) instead of flapping.
+5. `awdl txfree:` shows the unicast ACK rate. Run ping6, and tcpdump on awdl0 as root.
+6. **A/B without a reboot:** `sudo itlctl itl_awdllead=0`.
+7. **Undo:** copy both `…20261105-143407` backups back.
+
+### 10.57 Boot 2026-11-05 14:47 (core 917672D3, native 3A8B6D6E): windows on time; the iPhone still does not sync
+
+**Measured (iPhone share sheet open 14:55-14:59).**
+* `awdl lead: early=1571 late=212 avglate=6.5ms lead=33ms`: the v5 start works.
+* `awdl txfree: uc5=31/41`: 43 % of our unicast data is ACKed by the iPhone. The failures took 15 attempts.
+* Election (`itlmt-awdl-*-el`, `runElection`): our metric is 537, the iPhone's 519. Each device is its own master. The
+  iPhone never adopts us although we rank higher, and with no common master it sent us no unicast (`drx` 7, multicast
+  only). 0/20 pings.
+* Discovery still works: wifip2pd found `_airdrop._tcp` at -44 dBm, and a datapath was established at 14:48:25.
+
+**Cause (presence).** A PSF window had a 100 ms dwell, behind a ~33 ms setup lead. The AP-share rule (§10.43) then keeps
+the radio home for as long as it was away: `duty: avg 107-153 ms off`, `skip` > windows run. So we were on the AWDL
+channel in about one EAW out of four, and our PSF/MIF reached the iPhone too rarely for it to keep us as a qualified
+peer, let alone a master.
+
+**Round 26 (native).**
+* Every window, PSF and listen alike, is one AW plus room for the MIF/unicast: 32 ms, so our absence drops to about
+  70 ms.
+* The boot-arg `itlmt_awdl_dwell=<10..100>` overrides the dwell.
+* The listen timer arms the next window right after this one's dwell.
+
+Staged 2026-11-05 15:00:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| native | `B8A62F9A-CFAA-365E-86DC-98652D13AFE7` | `3A8B6D6E` | `Kexts-backup/itlmt7925Native.kext.20261105-150025` |
+| core | `917672D3` (unchanged) | — | — |
+
+**Next boot.**
+1. Keep the iPhone's share sheet open, screen on, for 3 minutes.
+2. `awdl duty:` should show `avg` ≈ 65-75 ms, and windows run ≈ every other EAW.
+3. In `log show … programChipWithNewMaster` / `runElection`, one master shared by both devices. The iPhone's
+   `itlmt-awdl-peer-el` should name our address as master, or we should name its.
+4. `drx` should rise with unicast (`rxuc`/`mine` in `awdl txs:`). `awdl txfree: uc` ok/fail should improve on 43 %.
+5. ping6, and tcpdump on awdl0 as root: **start tcpdump first** (the password prompt), then ping.
+6. **Undo:** copy `itlmt7925Native.kext.20261105-150025` back.
+
+### 10.58 Root cause of the AP/AWDL cost: windows on the AP's own channel took the full off-channel cycle
+
+The owner's point: the AP-share rule (§10.43) and the shorter dwell (§10.57) patch the symptom. The question is why one
+window costs the AP ~100+ ms at all.
+
+**Facts.**
+* The AP is on 157: `system_profiler`, 802.11ac, Tx rate 1200, so 80 MHz around center 155.
+* The iPhone is on the same network. Its AWDL channel sequence (`itlmt-awdl-peer-tlv4`, encoding 1) is almost all
+  `0x9f` / `0x97`, the 40 MHz centers 159/151, i.e. primaries 157/149. One slot is on 6. So most of the iPhone's
+  windows are on our AP's primary channel.
+* Our window channels came out as 157 and 149 (`txfree awdl … ch=157/149`).
+* Every window ran the full off-channel cycle, including the ones on 157: PS null to the AP, filter, sniffer, a ROC
+  granted after ~33 ms, the abort, and the 1:1 share penalty. The sniffer config also pinned the radio to 20 MHz, so it
+  would have cut the 80 MHz link even on-channel.
+
+**Round 27 (core): on-channel windows.**
+* When the link is up and the window's channel is `tgtCh`, the core does not request or abort a ROC, sends no PS null,
+  leaves the off-channel time and the ROC latency stats alone, and does not apply the share rule. It does set the RX
+  filter (other BSS) and the sniffer for the dwell, then restores the station filter.
+* The sniffer config on the AP channel uses the link's width, center and sco (`fastBw` / `fastCenter`, as in
+  `bss_rlm`). It is 20 MHz only off-channel.
+* The setup lead is 5 ms on-channel. `awdlLeadUs` learns from ROC windows only.
+* `awdl lead:` line gains `onch=` (windows on the AP channel) and `apch=`.
+
+Windows on 149 (the same 80 MHz block, other primary) and on 6 still need a ROC. The radio only detects preambles on
+the primary 20 MHz.
+
+**Open (next).** As master we advertise our own sequence (6 / 149, built by the Family), not the infra channel 157. An
+iPhone that followed us would leave the AP channel too. Find how the Family learns the infra channel for the AWDL
+sequence (Apple devices put it there), and give it 157.
+
+Staged 2026-11-05 15:04:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `042B1D7B-5EF4-31EF-951C-54FF1E9A95E2` | `917672D3` | `Kexts-backup/itlmt7925.kext.20261105-150436` |
+| native | `B8A62F9A` (§10.57, 32 ms dwell) | `3A8B6D6E` | `Kexts-backup/itlmt7925Native.kext.20261105-150025` |
+
+**Next boot.**
+1. Wi-Fi with no iPhone: unchanged.
+2. With the iPhone's share sheet open for 3 minutes:
+   * `awdl lead: onch=` rises;
+   * `awdl duty: off` per window falls (on-channel windows count no off-time);
+   * Wi-Fi throughput holds during AWDL;
+   * the master and election are shared (`runElection`);
+   * `rxuc`/`mine` and `awdl txfree: uc` ok rise.
+3. Start tcpdump (password) first, then ping6.
+4. **Undo:** both backups above.
+
+### 10.59 Boot 2026-11-05 16:57 (core 042B1D7B, native B8A62F9A): AP on DFS 56; a window still costs ~100 ms with a 32 ms dwell
+
+**Measured.**
+* After this reboot the link came up on **channel 56 / 160 MHz** (Tx 2402), a DFS block. The AP moved; the core takes the
+  first 5 GHz BSS it hears. AWDL cannot run on DFS, so `onch=0`: every window has to leave the channel, and §10.58
+  could not be exercised.
+* `duty: off=67006 ms in 669 windows (avg 100)`. The dwell is now 32 ms (§10.57), so about 70 ms of each window is
+  overhead outside it. `roc latency <40=662`, `lead≈35 ms`.
+* The iPhone was only briefly present (random MAC 6E:6C…, peer absence soon after). No unicast test this boot.
+
+**What the overhead is made of (code).** A window runs nine steps in series:
+* PS null, RX filter, sniffer on;
+* ROC acquire, then the grant event;
+* sniffer config, PSF/MIF, dwell;
+* sniffer off, ROC abort;
+* RX filter, PS null.
+
+Every firmware command went through `m3Cmd`, which **waits for the reply** (`uniSend`, up to 3 s). Linux mt7925 sends
+UNI_ROC acquire and abort with `wait_resp = false` (`mt7925_mcu_set_roc`, `mt7925_mcu_abort_roc`).
+
+**Round 28 (core).**
+* `uniSend(…, noWait)` / `m3Cmd(…, noWait)`. ROC acquire for AWDL windows (reqtype 1) and ROC abort after the join are
+  fire-and-forget. The grant is still taken from the UNI_ROC event (eid 0x27; command replies are eid 0x01, so a late
+  reply cannot pass for a grant). The join ROC still waits.
+* Per-phase timing of ROC windows: `awdl phase (0.1ms avg over N): setup roc grant scfg wait dwell soff abort end`.
+  This tells exactly which step holds the radio away from the AP.
+
+Staged 2026-11-05 17:06:
+| Kext | New UUID | Previous UUID | Backup |
+|---|---|---|---|
+| core | `FC9DC74A-EE9F-35C8-A4AE-FCD373B39F8E` | `042B1D7B` | `Kexts-backup/itlmt7925.kext.20261105-170607` |
+| native | `B8A62F9A` (unchanged) | — | — |
+
+**Next boot.**
+1. Note the AP channel (`awdl lead: apch=`).
+2. `awdl phase` line: the biggest phase is the next target.
+   * If it is `grant`, the firmware's channel switch itself is slow. Then look at the ROC parameters: the JOIN vs ROC
+     type, and the dbdc band.
+   * If it is `setup`, `scfg`, `soff` or `end`, those commands are the next candidates for fire-and-forget or for
+     staying set between windows.
+3. `awdl duty: avg` should fall below 100.
+4. With the iPhone's share sheet open: election, `rxuc`, `txfree uc`, ping6 and tcpdump (start tcpdump first).
+5. **Undo:** `itlmt7925.kext.20261105-170607`.
+
+### 10.60 Boot 2026-11-05 18:03 (core FC9DC74A, native B8A62F9A): first ping replies and an AirDrop TLS exchange; latency is the blocker
+
+**Phases** (`awdl phase`, ms, average over 100 off-channel windows):
+
+| setup | roc | grant | scfg | wait | dwell | soff | abort | end | total |
+|---|---|---|---|---|---|---|---|---|---|
+| 4.4 | 0.4 | 24.6 | 6.8 | 2.2 | 33.4 | 1.9 | 0.1 | 15.2 | ≈ 89 |
+
+The total matches `duty avg 88`. Fire-and-forget ROC works: roc 0.4 ms, abort 0.1 ms. What is left is the firmware's
+channel switch, about 25 ms out (grant) and about 15 ms back. `end` is the station RX-filter reply, which the firmware
+only sends after it has switched back.
+
+**Result, with the AP still on DFS 56 and the iPhone at random MAC be:60:db…:**
+* ping6: **5 replies** (2 + 3 duplicates) out of 20, RTT 1.0-4.0 s. The first replies ever.
+* `awdl txfree: uc=44/18` (71 % ACKed), `ucheard=11/2`, `uc24=29/5`, `uc5=26/15`. `rxuc=mine=55`.
+* tcpdump on awdl0: sharingd connected to the iPhone's AirDrop port 8770. The iPhone sent a SYN-ACK and ACKed our
+  1497-byte TLS ClientHello, then sent 2447 bytes of TLS. A second connection got a SYN-ACK too.
+* sharingd force-cancels each attempt after **5 s** (`[C7] … force-cancel` 18:07:08.5 → 18:07:13.5). A TLS
+  handshake with 1-4 s round trips does not fit in that.
+* The iPhone came and went (`peer presence` / `absence`), and the master followed it. Still flapping.
+
+**Cause of the latency.** The AP is on a DFS channel, so every window is an off-channel window of about 89 ms, about
+40 ms of it channel switching. The AP-share rule then skips the next windows. A packet waits for one of the rare windows
+in each direction.
+
+**Options.**
+1. AP on a non-DFS 5 GHz channel (36-48 / 149-165). The iPhone parks its AWDL slots on the infra channel (§10.58), so
+   the windows become on-channel: no switch, no share penalty. This needs no code. The router setting is the owner's
+   call.
+2. Code: an AWDL "data active" mode. While a datapath has traffic (unicast queued, or unicast received in the last
+   ~500 ms), attend every peer slot and let the AP have only the gaps. This is the same trade as Apple's when AirDrop is
+   transferring. It is still to be designed; the AP side has to keep beacons/keepalive.
+
+### 10.61 One ROC held across consecutive same-channel windows (core 967ED589, native unchanged B8A62F9A)
+
+**Requirement (owner, 2026-11-05):** AirDrop has to work on whatever network the Mac is joined to, DFS channels included. Changing the router's channel is not a fix. The driver has to make AWDL and the infrastructure link coexist.
+
+**Root cause from the §10.59/§10.60 phase data.** Every off-channel window pays the firmware's channel switch twice:
+- about 25 ms from the ROC request to the grant;
+- about 15 ms from the abort back to the AP's channel, which is where the RX-filter reply waits.
+
+The Family hands over listen windows back to back, 32 ms each and about 33 ms apart. With the AP on DFS 56, every one of them goes through the full cycle: roughly 40 ms of switching for 32 ms of presence. The AP-share rule then keeps the radio home for as long again. The Mac ends up present in about one EAW out of three, which is the 1-4 s round-trip latency that makes sharingd cancel the AirDrop TLS connection after 5 s.
+
+**Change.** The core keeps one ROC across consecutive windows on the same channel:
+- Each off-channel ROC is requested for `dwell + 30 + lead + awdlChainMs` (default `awdlChainMs` = 64 ms). When nothing follows, it is still aborted right after the dwell.
+- At the end of a dwell, the window stays open if all of these hold:
+  - the next window is already in the mailbox;
+  - it is on the same channel;
+  - it starts within 8 ms;
+  - it ends inside the granted ROC.
+- While a window is held, the sniffer, the RX filter and the ROC stay up. The next window skips the PS null, filter, sniffer, ROC, grant and sniffer-config steps and goes straight to the AW-start wait and its PSF/MIF/data.
+- A held ROC is closed by any of these: a window on another channel, a window that does not fit, the timeout (next window start + 3 ms with nothing submitted), a scan, join or disconnect, the backoff path, or a failure to send.
+- The whole absence is billed to the AP-share rule (duty), so the AP still gets equal time afterwards.
+
+The absence is bounded by one dwell plus `awdlChainMs`, about 100 ms, so the AP misses at most about one beacon, buffered under PS. Phase timing (`awdl phase`) is summed over first windows only. New stat line: `awdl chain: held= break= timeout= chainms=`.
+
+**Runtime switch:** `sudo $S/itlctl itl_awdlchain=0` restores one ROC per window (§10.60 behaviour). Values 1-200 set the extra ms. Rebuild the tool if needed: `cc -o $S/itlctl tools/itlctl.c -framework IOKit -framework CoreFoundation`.
+
+**Undo:** the previous core is at `/Volumes/ESP/EFI/OC/Kexts-backup/itlmt7925.kext.20261105-181327` (FC9DC74A). Copy it back over `EFI/OC/Kexts/itlmt7925.kext`.
+
+**Next boot test (AP left as it is, on DFS 56):**
+1. Check the core UUID is 967ED589 (`kmutil showloaded | grep itlmt`), then start the recorder (`$S/rec.sh`).
+2. Turn on AirDrop on both sides (Everyone for 10 minutes) and keep the iPhone's share sheet open toward the Mac.
+3. After about 2 minutes, read the `awdl chain:`, `awdl duty:`, `awdl phase` and `awdl lead:` lines. Expected:
+   - `held` grows with the listen windows;
+   - `duty avg` rises (longer absences), but the number of absences falls;
+   - the AP's `pulse bcn` rate stays about 10/s.
+4. Ping the iPhone's AWDL address (`ping6 fe80::...%awdl0`, address from `ndp -a`) for 60 s. Compare the RTT with §10.60 (1-4 s). Then run `itlctl itl_awdlchain=0` and ping 60 s again for the A/B.
+5. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Watch sharingd: `log stream --predicate 'process == "sharingd"'`. Look for the TLS completing in under 5 s.
+6. If the infrastructure link suffers (beacons below 5/s, TCP stalls), set `itl_awdlchain=32` and note it.
+
+### 10.62 Boot 19:26 (core 967ED589): chaining idle, advertised presence ≠ real presence → presence schedule in the sequence (core 4CA0B0F2, native E414EFBE)
+
+**What the §10.61 boot showed** (AP on DFS 56, we are master, role=1):
+- `awdl chain: held=2 break=2` in about 840 windows. Listen windows come one per EAW (65.5 ms apart, 32 ms dwell, a 33 ms gap), never back to back, so the 8 ms hold rule never matched.
+- `awdl duty: avg 84 ms off`, `skip=1136` against 841 windows. The AP-share rule dropped more than half the windows.
+- Phase timing was unchanged: grant 21 ms, sniffer config 7 ms, end 15 ms.
+- The iPhone's AirDrop address answered 2 of 20 pings (131-438 ms).
+
+**Root cause.** Our TLV 4 channel sequence advertises presence in all 16 EAWs (6/149), but the radio was only there in about 1 EAW of 2.4. The skipping was decided at random by the share rule. The iPhone transmits to us in EAWs where our sequence says we are, so most of its frames went into EAWs we were not in. The coexistence has to be in the advertised schedule itself, the way AWDL is designed: the empty entries (`00 00`) are the time with the AP.
+
+**Change (native + core):**
+- Native `awdlSchedCh(slot)`:
+  - Blocks of `itlmt_awdl_block` EAWs alternate between one AWDL channel and empty. The default is 2: slots 0-1 AWDL, 2-3 AP, and so on, so 8 of 16 EAWs.
+  - Each block uses one channel: its 5 GHz entry if it has one, else its first non-empty entry.
+  - Boot-arg `itlmt_awdl_block=0` restores the Family's sequence unchanged.
+- The TLV 4 we build, the PSF tick (the next EAW's window, skipped for AP EAWs) and the listen timer all follow `awdlSchedCh`.
+- A scheduled window covers its whole EAW (`kAwdlEawWinMs` = 64 ms), so the 2 EAWs of a block are back to back and the core's §10.61 hold puts them on one ROC: one firmware channel switch per block.
+- The bridge `flags` bit 1 marks a scheduled window. The core then skips the AP-share rule (duty skip), because the AP's time is already in the sequence.
+- The Family's AW start/end events are unchanged; they still follow its own sequence.
+
+Expected per 4 EAWs (262 ms): AWDL about 131 ms, present when advertised. Off the AP for about 131 + 25 + 15 ms, so the AP gets about 90 ms, one beacon missed at most, buffered under PS.
+
+**Undo:** the previous kexts are at `/Volumes/ESP/EFI/OC/Kexts-backup/itlmt7925.kext.20261105-193814` (967ED589) and `itlmt7925Native.kext.20261105-193814` (B8A62F9A).
+
+**Next boot test (AP unchanged):**
+1. Check the UUIDs are 4CA0B0F2 / E414EFBE, then start the recorder.
+2. Turn on AirDrop on both sides and open the iPhone's share sheet toward the Mac.
+3. Read the stat lines. Expected:
+   - `awdl chain: held=` about the number of blocks;
+   - `awdl duty: skip=` stops growing;
+   - `awdl duty avg` about 170 ms;
+   - `pulse bcn` stays above about 5/s, and en5 keeps internet (`ping 1.1.1.1`).
+4. Run `ping6 -c 30 <iPhone AirDrop address>%awdl0` (from `ndp -an | grep awdl0`). Target: most pings answered, RTT under about 300 ms.
+5. Send a photo in each direction while watching sharingd (`log stream --predicate 'process == "sharingd"'`).
+6. If en5 suffers, the next step is `itlmt_awdl_block=1` (alternate single EAWs) or shorter AWDL blocks; record the numbers.
+
+### 10.63 Boot 21:20 (core 4CA0B0F2, native E414EFBE): the schedule runs, the held ROC hangs the firmware → chaining off by default (core 009308BE)
+
+**What happened.** The AP was on 161 (non-DFS) this boot; AWDL windows were on 149.
+- The schedule did its job: `skip=0` (no share-rule drops) and an average absence of 133 ms.
+- The iPhone's own TLV 4 sequence is the same shape as ours: 149 (40 MHz) for 4 EAWs, then 4 EAWs empty, with one slot on ch 6.
+- The firmware went silent **4 times in 4 minutes** (21:25:26, 21:25:55, 21:27:29, 21:28:50). Each time: `postmortem silent 4s`, `link lost 15 s`, chip reset, rejoin. The owner saw Wi-Fi dropping again and again.
+- Chain counters: `held=69 timeout=67`. Almost every held ROC ended by the link loop's timeout, not by a following window. Right before every silence, the log shows bursts of sniffer off / roc_abort / rx_filter.
+- After `itlctl itl_awdlchain=0` at 21:29:26, there was no further reset in the following 4.5 minutes, and `ping 1.1.1.1` was fine.
+
+**Conclusion.** The §10.61 held ROC (ROC requested for dwell + 30 + lead + 64 ms, about 190 ms with whole-EAW windows, then kept or timed out) is what made the firmware hang. Something in the hold logic is also wrong: a window should follow almost every hold.
+
+**Change (core 009308BE):**
+- `awdlChainMs` defaults to 0 (chaining off). `itl_awdlchain=<ms>` turns it back on at runtime.
+- New log lines: `awdl hold: take= chained= ch= s2-now= d2= rocend-now= seq= done=` for the first 16 decisions, and `awdl hold timeout: late= seq= done= ch=` for the first 8 timeouts. They show why the next window never arrived.
+- The native schedule (§10.62) is unchanged.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261105-213409` (4CA0B0F2).
+
+**Next boot test:**
+1. Check the core UUID is 009308BE. Leave chaining off, let Wi-Fi run for 10 minutes, and count `recover #` lines: it should be 0.
+2. AirDrop: open the share sheet, then ping the iPhone's AWDL address and record RTT and loss.
+3. Only after that, run `itlctl itl_awdlchain=64` for 1 minute to collect the `awdl hold` lines, then `itl_awdlchain=0` again.
+
+### 10.64 Boot 21:39 (core 009308BE, native E414EFBE): stable with chaining off; the hang is a double ROC close; schedule follows the peer (core 25E4B5AF, native 102D1566)
+
+**Stability.** With chaining off, there were no chip resets in 7 minutes. Ping 1.1.1.1 had 0% loss and beacons came in at about 6/s.
+
+**The hang, found.** I set `itl_awdlchain=64` for 40 s (21:46:50 to 21:47:36).
+- Every `awdl hold timeout` showed `seq == done`, about 78 ms late. The window it was waiting for had already run, chained, on the held ROC.
+- The chained branch never cleared `awdlHeldCh`. After that window had sent its own sniffer off / roc_abort / rx_filter, the link loop saw the hold expire and closed the same ROC a second time: an abort for a ROC that no longer existed, plus a PS null.
+- `recover #1` came at 21:47:22, the same pattern as the 4 resets in §10.63.
+- Fix: the chained branch clears `awdlHeldCh` when it takes the ROC. Hold logging now records every take (first 16) and only the first 4 non-takes.
+- Chaining stays **off by default** until a boot shows it is clean.
+
+**Why AirDrop overlap is still poor.** Compare the two TLV 4 sequences:
+- Ours (block 2): ch6 in slots 0-1, 149 in 4-5, ch6 in 8-9, 149 in 12-13, the rest empty.
+- The iPhone's: 149 in slots 0-4 and 9-12, ch6 in slot 8, the rest empty.
+- That is a same-channel overlap in 3 EAWs of 16.
+
+Fix: while a peer is being followed, `awdlSchedCh` returns the peer's own sequence, keeping only usable (non-DFS) channels. Our TLV 4, the PSF windows and the listen windows then sit exactly where the iPhone is, and the iPhone's empty slots are our AP time. With no peer, the block schedule applies as before.
+
+Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, the gap is 1.5 ms), so in a run of 5 EAWs roughly every other one is used. Chaining is what turns a run into one ROC.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261105-214853` (009308BE) and `itlmt7925Native.kext.20261105-214853` (E414EFBE).
+
+**Next boot test:**
+1. Check the UUIDs are 25E4B5AF / 102D1566 and let Wi-Fi run for 5 minutes. `recover #` should stay at 0.
+2. Open AirDrop and the share sheet on the iPhone. Check that the `itlmt-awdl-self-tlv4` entries match `itlmt-awdl-peer-tlv4`.
+3. Ping the iPhone's AWDL address (from `ndp -an`), 30 pings.
+4. Run `itlctl itl_awdlchain=64` for 2 minutes. Expect `awdl hold: take=1` lines, `held` growing and `recover #` staying at 0. Ping again.
+5. If there is no reset, try `itl_awdlchain=200` (covers a run of up to 4 EAWs).
+
+### 10.65 Boot 2026-11-06 12:50 (core 25E4B5AF, native 102D1566): the iPhone is master, AirDrop requests go both ways, files do not; chaining still hangs → one window per run (native 6B413594)
+
+**What works now.** The AP was on ch 40 this boot.
+- With the share sheet open, the Mac became the iPhone's **slave** (role=2, master = the iPhone's d2:e6:e3:2f:3d:af). This is the first time.
+- Our TLV 4 now carries exactly the iPhone's sequence: 149 in slots 0-2 and 9-10, ch 6 in slot 8, the rest empty.
+- Mac and iPhone see each other and AirDrop requests arrive in both directions (with the AirDrop code prompt), but no file goes through.
+- Ping to the iPhone: 14/30 answered (+18 duplicates), RTT 24 ms to 1.9 s, average 1.18 s.
+- Wi-Fi was stable for 36 minutes, with no reset while chaining was off.
+
+**Chaining still hangs the firmware, even with the §10.64 fix.**
+- I set `itl_awdlchain=64` at 13:26:54. There were 3 holds (`take=1`, s2-now about 2 ms, rocend-now about 83 ms).
+- At 13:27:16: `rx_filter`/`sniffer on` timed out, then "the firmware stopped answering MCU commands", `recover #1`, and the owner lost Wi-Fi.
+- The MCU history before it shows `roc_acquire@2634 … sniffer off / roc_abort@2969`: one ROC held **335 ms** although it was requested for about 190 ms.
+- The firmware sends no event when a ROC expires, so an extended ROC outlives its grant and the late abort (or the commands around it) kills the firmware. The §10.64 double close was the same failure.
+- **Conclusion: never extend a ROC.** Chaining stays off (default 0); do not turn it on again.
+
+**Change (native 6B413594).**
+- In the schedule (§10.62/64), the listen timer merges consecutive present EAWs on the same channel into **one window**: `awdlLsnRun`, at most `itlmt_awdl_run` EAWs (default 3, range 1-5).
+- The window's dwell is `run x 65.5 ms - 2 ms`, so there is one ROC acquire for exactly that duration (+30 ms margin, as before) and one abort before it expires.
+- This replaces the back-to-back one-EAW windows, which averaged 39 ms late (`avglate=39989us`) because the setup (about 35 ms) cannot fit in a 1.5 ms gap.
+- The iPhone's run of 3 on 149 becomes one 194 ms window instead of 3 late ones. The core is unchanged.
+
+**Undo:** `Kexts-backup/itlmt7925Native.kext.20261106-133052` (102D1566).
+
+**Next boot test:**
+1. Check the UUIDs are 25E4B5AF / 6B413594. Wi-Fi must hold with no `recover #`.
+2. Open the share sheet. Check role=2 and that the self TLV 4 matches the peer TLV 4.
+3. Read the `awdl lead:` line: `avglate` should be far below 39 ms. The `awdl phase` dwell should be up to about 190 ms.
+4. Ping the iPhone 30 times and compare with 14/30 at an average of 1.18 s.
+5. Send a photo in each direction.
+
+### 10.66 Boot 2026-11-06 13:36 (core 25E4B5AF, native 6B413594): the AP buffers our downlink in ~3 s bursts → host power-save nulls off (core 05BAA75B)
+
+**Symptom.** The AP was on ch 40. Internet was very slow: `ping 1.1.1.1` took 0.3-5.9 s, and pings to the gateway (10.0.0.1) took 3 ms to 3 s.
+- With `ping -i 0.5`, replies came back in batches about every 3 s. The RTT fell by 500 ms per packet (2982 → 2479 → 1978 → 1477 → 974 → 474 → 4 ms).
+- AWDL ran no window at all during that ping (psf/lsn counters unchanged). The whole boot had only 51 windows (about 1% airtime), and the result was the same with `ifconfig awdl0 down` (average 905 ms).
+- So this is the AP holding our downlink as for a dozing station, releasing it in bursts.
+
+**Cause (likely).** Since §10.43 the core sends its own null frames to the AP: PM=1 before every ROC and PM=0 after it. Linux mt7925 sends none around a ROC, because the firmware does that signalling itself. Two PS state machines disagreed about whether we were asleep. `ps=51/51` balanced, but the order of the frames on air relative to the firmware's own nulls is unknown.
+
+**Change (core 05BAA75B):**
+- `itl_awdlps` defaults to 0: no host PM=1 null.
+- PM=0 nulls after a window are still sent (harmless; they only say "awake").
+- Setting `itl_awdlps=0` at runtime also sends one PM=0 null right away.
+- `itl_awdlps=1` restores the old behaviour.
+
+**Native 6B413594 (runs, §10.65):** this boot had only 4 peer frames (no share sheet while measured), so it is not judged yet. `stale=67` came from PSF-tick windows submitted for an EAW that a run window already covered.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-134808` (25E4B5AF).
+
+**Next boot test:**
+1. Check the UUIDs are 05BAA75B / 6B413594.
+2. Run `ping -c 40 -i 0.5 <gateway>`: no ~3 s batches, RTT under about 20 ms.
+3. Open the share sheet, then repeat the ping plus 30 pings to the iPhone. Send a photo in each direction.
+4. If the gateway RTT is bad again, try `itlctl itl_awdlps=1` and then `=0` (the second also sends a PM=0 null) to see whether the bursts follow it.
+
+### 10.67 Boot 2026-11-06 13:58 (core 05BAA75B, native 6B413594): AirDrop HELLO works, the Ask never arrives; 5 GHz unicast TX fails → regulatory country from the AP (core 4814D0F5)
+
+**Fixed by §10.66.** The gateway ping averaged 19 ms (it was 0.9-2 s), internet 41 ms, no resets. `ps=0/1154`: no host PM=1 nulls.
+
+**AirDrop, iPhone → Mac.** The iPhone showed "Waiting…" and then declined by itself.
+- 14:01:32: sharingd accepted a QUIC (HTTP/3) connection over awdl0. It logged `Received HELLO request` and `Sending HELLO response`, so the AirDrop handshake works over our AWDL for the first time.
+- 14:01:33: the iPhone opened a second stream for the Ask, which never completed.
+- 14:02:41: `Lost BLE device`, then `Attempting Stop AirDrop … Cancelling all connections`.
+- 14:03:20: QUIC reported `No route to host` on awdl0.
+- Ping to the iPhone: 13/20 answered, average 253 ms (was 14/30 at 1.18 s).
+
+**The data, by band.**
+- `awdl txfree`: uc5 = 25 ok / 198 fail, uc24 = 25 / 2. ucheard (the peer was heard in the same window) = 27 / 147.
+- RX unicast from the iPhone: 865 frames.
+- So what we send on 149 almost never reaches the iPhone, while 2.4 GHz works.
+
+**Cause.** The firmware always received the world domain "00", in both `set_domain` and the CLC power tables. In the world domain every 5 GHz channel is no-initiate-radiation, so the firmware lets us transmit at 5 GHz only on the AP's own channel (40). Linux takes the country from the AP's Country IE (802.11d hint → `mt7925_mcu_regd_update` → domain + CLC for that alpha2).
+
+**Change (core 4814D0F5).** `regCountryFromAp()` reads element 7 from the target's IEs.
+- `set_domain` carries that alpha2.
+- The CLC tables are sent for it, falling back to the world rules when the firmware has no rule for it.
+- The power tables are re-sent when the country changes.
+- The log shows `regulatory: country XX (was 00)` and `clc XX env 1 …`.
+- An AP without a Country IE keeps "00".
+
+**Not addressed yet: BLE.** sharingd stopped the session when it lost the iPhone over BLE (a Bluetooth-side issue, the side session bt-make-bluetoothd-le-ad).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-141216` (05BAA75B).
+
+**Next boot test:**
+1. Check the UUIDs are 4814D0F5 / 6B413594. The log should have a `regulatory: country` line (or none if the AP sends no Country IE: then this is not the fix).
+2. Ping the gateway (no bursts) and the internet.
+3. Open the share sheet and send a photo. Read `awdl txfree`: uc5 ok/fail should move toward the 2.4 GHz ratio. Check sharingd for `Received ASK request`.
+
+### 10.68 Boot 2026-11-06 14:25 (core 4814D0F5, native 6B413594): a run window outlived its ROC and the late abort hung the firmware → ROC sized for the whole window, dwell clipped to the ROC deadline (core 3F4AFE7C)
+
+**What happened.**
+- The gateway stayed fine (no bursts, so §10.66 holds).
+- 14:38:41: `recover #` (the firmware stopped answering, then the chip was reset).
+- The MCU history before the reset: `roc_acquire@331 … roc_abort@695` and `roc_acquire@2837 … roc_abort@3175`, so the abort came 364 ms and 338 ms after the acquire, for a ROC of about 259 ms requested.
+- This is the same failure as the held ROC in §10.61/64. The firmware ends the ROC on its own and sends no event; an abort that arrives after that hangs it.
+- The §10.65 run windows (up to 3 EAWs = 196 ms of dwell) plus the ~25 ms grant and the AW-start wait ran past the ROC's end.
+
+**Change (core 3F4AFE7C).**
+- The ROC is requested for `dwell + 30 + 25 + 40 + ahead` ms: dwell, the grant time, the AW-start wait, and a margin.
+- After the AW-start wait the dwell is cut so that the abort is sent at least 40 ms before the ROC's deadline. The first 6 cuts are logged as `awdl: dwell N ms cut to M (ROC deadline)`.
+- Both abort sites log `awdl: roc abort N us after the ROC's end` if an abort is still late.
+- The chain stat line now has `clip=` (dwell cuts) and `lateabort=` (late aborts; should stay 0).
+
+**Not verified: the country fix (§10.67).** The recorder ring had already evicted the early lines, so there was no `regulatory: country` line; only `set_domain rc=0 st=0` remained (14:38:41, after the reset).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-144134` (4814D0F5).
+
+**Next boot test:**
+1. Check the UUIDs are 3F4AFE7C / 6B413594.
+2. Start the recorder right after login and grep early for `regulatory: country` and `clc `. If they have been evicted, use `log show --last boot | grep regulatory`.
+3. Use Wi-Fi and AirDrop for 10 min: no `recover #`, and `lateabort=0` on the chain stat line.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.69 Boot 2026-11-06 16:33 (core 3F4AFE7C, native 6B413594): late aborts come from a slow sniffer-off, not the dwell → abort first, skip an abort past the deadline (core D79C6734)
+
+**What happened.**
+- Wi-Fi was fine: gateway ping averaged 26–36 ms, and there was no `recover #` in the first 6 minutes.
+- `lateabort` reached 12 in 6 minutes: `awdl: roc abort 186–202 ms after the ROC's end`.
+- `clip=0`: the dwell was never cut, so the time before the dwell was not the cause.
+- The phase stats show `soff` (sniffer off) growing by about 200 ms each time a late abort was logged. The firmware sometimes takes about 200 ms to answer the sniffer-off command, and the abort, sent after it, reached the firmware late. The MCU command timeout is 3 s, so this is the firmware's own delay.
+- airportd reads the country from the scan results as `countryCode VN`, so the AP very likely sends a Country IE. The core's country is now on a repeating stat line, so it is no longer evicted from the ring.
+
+**Change (core D79C6734).**
+- The ROC abort is sent as soon as the dwell ends, before the sniffer-off.
+- If an abort would still be past the ROC's deadline, it is skipped: the ROC is timed and the firmware ends it on its own. The next ROC request then waits until the old one has surely ended (grant + its duration + 20 ms). This is logged as `awdl: roc abort skipped, N us past the deadline (dwell …, after it …)`.
+- A sniffer-off that takes 50 ms or more is logged as `awdl: sniffer off took N ms`.
+- The chain stat line now shows `lateabort=` (skipped aborts), `soffslow=`, `cc=` (the country sent to the firmware) and `clc=` (the country of the CLC tables).
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261106-164012` (3F4AFE7C).
+
+**Next boot test:**
+1. Check the UUIDs are D79C6734 / 6B413594.
+2. On the `awdl chain` line: `cc=VN clc=VN` (if `cc=00`, the AP's Country IE was not found). `lateabort` should stay 0 or very low, and `soffslow` shows how often the firmware is slow.
+3. Use Wi-Fi with AirDrop on for 10 min: no `recover #`.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.70 Boot 2026-11-07 09:12 (core D79C6734, native 6B413594): a skipped abort left the radio on the AWDL channel → the abort is always sent (core 6DCB589A)
+
+**What happened.** Wi-Fi was unstable and the owner switched to USB internet sharing.
+- 6 chip resets in 10 minutes (`recover #6`), each after `link lost: no beacon or data from the AP for 15 s`. The AP was on channel 56 (DFS) this time.
+- The one visible case: `awdl: roc abort skipped, 186992 us past the deadline (dwell 1101 us, after it 0 us, ch=149 grant=21 ms)`.
+- After that line the beacon count stayed at 1279 and RX stopped. Four seconds later: `postmortem silent 4s`. Fifteen seconds later the link was lost.
+- So **the firmware does not end a timed ROC by itself**. Without the abort the radio stays on the AWDL channel. The §10.69 skip was wrong.
+- In §10.69 the 12 late aborts were sent and did no harm, so a late abort is not by itself what hung the firmware at 14:38 (§10.68).
+- This late window lost its time **before** the dwell (dwell 1.1 ms after the clip): the grant was 21 ms, so it was the sniffer config or the wait for the AW start.
+
+**Change (core 6DCB589A).**
+- The ROC is always aborted. The skip and the wait for a quiet time are removed.
+- The abort is still sent before the sniffer-off.
+- A late abort is logged as `awdl: roc abort N us past the deadline (dwell …, after it …)`.
+- A sniffer config or sniffer-off that takes 50 ms or more is logged (`awdl: sniffer config took N ms` / `sniffer off took N ms`) and counted in `soffslow=`.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261107-092411` (D79C6734). The last build without §10.69 is `Kexts-backup/itlmt7925.kext.20261106-164012` (3F4AFE7C).
+
+**Next boot test:**
+1. Check the UUIDs are 6DCB589A / 6B413594.
+2. Use Wi-Fi with AirDrop on for 10 min: no `link lost` or `recover #`. Gateway ping stays under 50 ms.
+3. On the `awdl chain` line: `cc=VN clc=VN`, plus the `lateabort` and `soffslow` counts.
+4. Send a photo from the iPhone to the Mac and from the Mac to the iPhone. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.71 Boots 2026-11-07 (core 6DCB589A, native 6B413594): always-abort holds; idle AWDL took 47% of the airtime → idle duty limit (core DE2C6D63)
+
+**Always sending the abort (§10.70) holds.**
+- The 14:xx boot stayed linked for 2.5 h on channel 56 (DFS) with 142 late aborts and no firmware hang.
+- `cc=VN`: the country comes from the AP's Country IE.
+- `clc=-`: no power tables are sent, because the boot-args carry `itlmt_nopwr=1`.
+- Sending them on the live link (`itl_pwr=40`, 14:23:26) logged `clc VN env 1 encap 0: power 5 ext 5`. The firmware then went silent, the link was lost and the chip was reset (`recover #1`), reconnecting about 25 s later. **Do not send power tables on a live link.**
+- `soff` (sniffer-off) is about 55 ms on average now that it follows the abort: the firmware answers once it is back on the AP's channel. The wait keeps polling RX, so it does not cost the link.
+
+**Wi-Fi with a VPN (WARP, utun0, MTU 1280), 23:35 boot, no AirDrop going on:**
+
+| | awdl0 up (idle) | awdl0 down |
+|---|---|---|
+| gateway ping | 85 ms avg, 276 max, 5% loss | 5.6 ms |
+| 1.1.1.1 via VPN | 147 ms avg, 421 max | 41.5 ms, flat |
+| download | 1.0 MB/s | 7.4 MB/s |
+| upload | 0.47 MB/s | 1.35 MB/s |
+
+`awdl duty`: 546 s off the AP's channel in 19 min (47%), 170 ms per window, while only 15 AWDL frames were heard (`af=15`). The scheduled-window flag (§10.62) exempts every window from the 50% share rule, so with nobody to talk to the radio still spent half its time on channel 149.
+
+**Change (core DE2C6D63): idle duty.**
+- When no AWDL peer has been heard for 5 s and no AWDL data is queued, an off-channel window must be followed by `awdlIdleShare` (default 9) times its absence on the AP's channel. That is about 10% off-channel, about one window every 1.7 s. This applies to scheduled windows too.
+- A frame from a peer (action frame or data) lifts the limit at once.
+- Windows on the AP's own channel are not limited.
+- The runtime switch is `itl_awdlidle=N` (0 = off, at most 50).
+- The `awdl duty` line shows `idle=<windows skipped>/x<share>`.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261107-233909` (6DCB589A), or `itlctl itl_awdlidle=0` at runtime.
+
+**Next boot test:**
+1. Check the UUIDs are DE2C6D63 / 6B413594.
+2. With the VPN on and no AirDrop: gateway ping under 15 ms, VPN download over 5 MB/s. On the `awdl duty` line the idle count grows and off/elapsed is about 10%.
+3. Open AirDrop on the iPhone near the Mac: the Mac should appear within a few seconds (the limit lifts once the iPhone is heard).
+4. Send a photo each way. Check `awdl txfree` uc5 ok/fail, and look in sharingd for `Received ASK request`.
+
+### 10.72 Boot 2026-11-08 09:12 (core DE2C6D63, native 6B413594): Wi-Fi weak even with awdl0 down → find the root cause in one boot with runtime switches (core 645E44F5)
+
+**What the owner sees.** Wi-Fi is too weak to use; they switched to USB tethering from the phone. On the same network and in the same spot the phone gets about 50 Mb/s up, 35 ms unloaded and 136 ms loaded (fast.com).
+
+**Measured through en1 (AP on channel 36, 80 MHz):**
+
+| | awdl0 up | awdl0 down |
+|---|---|---|
+| download | 0.11–0.26 MB/s | 1.97 MB/s |
+| upload | – | 0.37 MB/s |
+| gateway ping | 36 ms avg | 115 ms avg, 390 max |
+
+- stat-log at up=459 s (AWDL running): the firmware retried every transmitted frame 1.7 times on average (`txf` fwRetry 67250 for 39406 freed) and 6.4% failed outright. 34% of the received frames were retransmissions (`rty=23442/68513`): the AP repeats its frames, most likely because it does not hear our ACKs and BlockAcks.
+- The link side is the weak one, not only the AWDL windows. On main, with the same boot-args (`itlmt_nopwr=1`), this driver measured 33–41 MB/s (docs/TEST-NATIVE-WIFI.md, round 26d).
+
+**What dev/awdl changes on the plain station link (diff against main):**
+1. `set_domain` carries the AP's country (VN), not "00" (§10.67).
+2. A second OMAC is active in the firmware (`awdl own mac (omac 1)`, DEV_INFO active=1) from the first AWDL frame on, for as long as the boot lasts.
+3. The AWDL windows themselves (ROC, sniffer, promiscuous filter).
+4. Not new, but suspect for weak uplink: with `itlmt_nopwr=1` the firmware never gets CLC or SKU power tables. Sending them on a live link hung it (§10.71). Linux sends them at init and with every regulatory change.
+
+**Change (core 645E44F5): runtime switches, so one boot separates the suspects (`build/itlctl`, root).**
+- `itl_awdloff=1`: no AWDL window, and the second OMAC is switched off again (DEV_INFO active=0). `0` turns AWDL back on.
+- `itl_ccworld=1`: `set_domain` sends "00" from the next join.
+- `itl_nopwr=0`: the CLC and SKU tables are sent at the next join, before the link is up, as Linux does.
+- `itl_lvl=6` reconnects, so the last two take effect.
+- `scripts/wifi-ab.sh` (root) runs the matrix and saves `build/wifi-ab-<time>.txt`:
+  - A: as booted
+  - B: AWDL off
+  - C: B + domain "00"
+  - D: B + country + power tables at join
+  - E: D + AWDL on
+
+  Each row records gateway ping, download and upload through en1, plus the retry counters before and after.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-093328` (DE2C6D63).
+
+**Next boot test:**
+1. Check the UUIDs are 645E44F5 / 6B413594. Turn Wi-Fi on.
+2. Run `sudo bash scripts/wifi-ab.sh` (about 4 minutes; the Wi-Fi link reconnects twice).
+3. The row that gets back toward the phone's numbers names the cause. The fix then goes into the default configuration.
+
+### 10.73 Boot 2026-11-08 11:19 (core 645E44F5, native 6B413594): data frames never reach the AP → main's driver staged to get Wi-Fi back (core F3E732F4, native 3A02974A)
+
+**What happened.** No network over Wi-Fi. The owner went back to USB tethering, then turned Wi-Fi off. They asked that nothing touch the live network until Wi-Fi works again; USB tethering has panicked this machine before.
+- AP: `ee:74:d7:57:85:bb`, channel 36, VHT only (`he=0/0`), 80 MHz (`bw=2 center=42`). The link was stepped down to fast level 3.
+- RSSI −62 to −65 dBm (CoreWLAN), noise 0; the reported rate stayed at 54.
+- Receiving works: the AP's M1 arrived 11 times.
+- Transmitting does not:
+  - Fixed-rate frames (auth, EAPOL at OFDM 6) mostly get through.
+  - The rate-adapted data frames fail. After the link came up, 52 of 65 freed data frames were reported failed, with 740 retries (about 11 per frame). DHCP and ping got no answer: 90–100% loss.
+  - EAPOL M2 failed 10 of 11 times in one join (`txFail=10`) and 0 of 2 in the next.
+- `itl_nopwr=0` + reconnect: the power tables went out at join (`clc VN env 1 … power 5 ext 5`, `txpower … rc=0`), but data TX stayed the same.
+- `itl_awdloff=1` + reconnect: no change (90% ping loss).
+- So neither AWDL nor the missing power tables explains it.
+- The data TXWI is the same as on main: `o.omac` defaults to 0 and FIXED_RATE is unchanged. The suspects now are the rate control's view of the peer (STA_REC: VHT/HT capabilities, LDPC/STBC, NSS, bandwidth), or something this AP needs that the base driver does not do.
+
+**Change.** Main's core and native (origin/main 50570a3, no AWDL code) are staged on the ESP, so the next boot gets Wi-Fi back on code that measured 33–41 MB/s.
+- The dev/awdl kexts are kept in `Kexts-backup/itlmt7925.kext.20261108-113905` (645E44F5) and `Kexts-backup/itlmt7925Native.kext.20261108-113905` (6B413594).
+- Boot-args are unchanged.
+
+**Next boot test (nothing on the live link beyond normal use):**
+1. Check the UUIDs are F3E732F4 / 3A02974A.
+2. Use Wi-Fi normally on the same AP.
+   - If it works: the regression is in dev/awdl. Bisect it offline before anything goes back on the ESP.
+   - If it fails the same way: the base driver has a TX problem with this AP. Compare STA_REC (HT/VHT/RA) with Linux mt7925.
+3. The core's `stat-log` (ioreg) shows `txf=` and `rty=` without any extra test traffic.
+
+### 10.74 Boot 2026-11-08 11:47 (main's core F3E732F4, native 3A02974A): main fails the same way → test without the Bluetooth half
+
+**What happened.** With main's driver (no AWDL code) Wi-Fi still gets no network.
+- AP `20:54:ef`, channel 149.
+- Auth, assoc and the 4-way handshake complete.
+- Then `txf=188/0/0/142/2015`: 142 of 188 data frames failed, 2015 retries (about 11 per frame).
+- The AP disassociated us (reason 3), the chip was reset (`recover #1`), and the network was no longer seen in the scan.
+
+**So the regression is not in the Wi-Fi code.** The same code measured 29–36 MB/s on 2026-10-18…26 (docs/TEST-NATIVE-WIFI.md). What has changed on the chip since then is the Bluetooth half:
+- MtkBtFw loads the MT7925 Bluetooth firmware (since 2026-11-02, 0182666).
+- BtLeDlFix turns on continuous LE advertising for AirDrop (since 2026-11-04, 59db42b).
+
+Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, rate-adapted TX failing with about 11 retries) is what a coexistence arbiter denying WLAN TX looks like. macOS reports Bluetooth `State: Off`, but the BT firmware is still loaded.
+
+**Test (owner's go-ahead, 2026-11-08 11:54).**
+- `MtkBtFw.kext` and `BtLeDlFix.kext` are disabled in config.plist (`Enabled` false; only those two lines changed).
+- Backup: `EFI/OC/config.plist.bak-20261108-115436`.
+- The kexts are still main's.
+
+**Next boot (read only, nothing run on the network without asking):**
+1. Check that MtkBtFw/BtLeDlFix are not loaded (`kextstat`).
+2. Read `stat-log` `txf=` (freed/…/failed/retries) once Wi-Fi joins on its own.
+   - If data TX works (few failures, retries well under 1 per frame): the Bluetooth bring-up is the cause. Compare it with Linux btmtk + mt7925 (WMT, coexistence/antenna setup) using REA. Then re-enable Bluetooth with the fix.
+   - If TX still fails: Bluetooth is cleared. Look next at persistent chip state (efuse/eeprom, firmware files) against the 2026-10-26 build.
+3. Undo: copy `config.plist.bak-20261108-115436` back to `config.plist`.
+
+### 10.75 Boot 2026-11-08 11:57 (main's core F3E732F4, Bluetooth kexts off, warm): our 5 GHz transmit is weak, not new → eeprom command fixed, power tables at join, Bluetooth back on (core A171AD24, native B9AE6E64)
+
+**Result of §10.74.** Without MtkBtFw/BtLeDlFix, on main's driver, TX still fails on "10.07 Cafe" (ch 36, VHT80, −63 dBm):
+- `txf=389/0/0/315/4527`: 81% of data frames failed, ~11.6 retries each (the full retry limit).
+- Fixed-rate OFDM-6 frames fail too: EAPOL M2 failed 12 of 13 (`txFail=12`), auth got no response on 4 of 8 frames.
+- So it is not rate control and not Bluetooth (only a warm reboot though; see the cold boot below). Our frames mostly do not reach the AP.
+
+**It is not a regression in time.** The October rounds were also on 5 GHz (ch 40 HE160, ch 52 DFS 160), but at −37..−40 dBm right next to the AP. Even there our TX needed 1.6–1.7 attempts per frame and the AP re-sent ~30% of its frames because it missed our ACKs (docs/TEST-NATIVE-WIFI.md round 24/26). A healthy radio at −38 dBm has almost no retries. The uplink has been short of margin all along; at −63 dBm the margin is gone. The scan shows the café's 2.4 GHz BSS at −74 dBm, so 2.4 GHz is no way around it.
+
+**Divergence from Linux found.** `mt7925_mcu_set_eeprom` sends `UNI_EFUSE_BUFFER_MODE` with `format = EE_FORMAT_WHOLE` (1). We sent 0 (`EE_FORMAT_BIN`) since 2026-10-12, although our comment said "whole". This command tells the firmware where its calibration data comes from (efuse), which includes the per-channel TX power calibration. Linux mt76_connac_mcu.h: `EE_MODE_EFUSE = 0`, `EE_FORMAT_BIN = 0`, `EE_FORMAT_WHOLE = 1`.
+
+**Checked, same as Linux or not TX-power related:** the data TXD (no power or antenna field in Linux either), `mt792x_mac_init_band` (MAC timing/MIB/RCPI registers only).
+
+**Change (one batch):**
+1. Core: the eeprom command sends format 1 (`itlmt7925_m3.cpp` `m3HwPrep`).
+2. `itlmt_nopwr=1` removed from boot-args: the CLC + SKU power tables go out at join, before the link, as Linux does at every regulatory update. They were accepted at join on 11:19 (`rc=0`); only sending them on a live link hung the firmware (§10.71).
+3. MtkBtFw + BtLeDlFix re-enabled (Bluetooth back for the owner).
+4. dev/awdl kexts back on the ESP (core A171AD24, native B9AE6E64), so the runtime switches (`itl_nopwr`, `itl_awdloff`, `itl_ccworld`) are there if needed.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-122505` (main F3E732F4), `Kexts-backup/itlmt7925Native.kext.20261108-122505` (main 3A02974A), `config.plist.bak-20261108-122505` (BT off, `itlmt_nopwr=1`).
+
+**Next boot: a cold boot.** Shut down fully (not restart), wait 10 s, power on. This also clears any Bluetooth firmware left in the chip from earlier boots.
+1. Check the UUIDs are A171AD24 / B9AE6E64 and that MtkBtFw/BtLeDlFix are loaded.
+2. Let Wi-Fi join on its own. Read `m3-log`: `eeprom(efuse) rc=0 st=0`, `clc VN env 1 …`, `txpower: … rc=0`.
+3. Read `stat-log` `txf=` (freed/…/fail/retries) and the `eapol summary` `txFail=`. Working: fails a few %, retries well under 1 per frame.
+4. If TX still fails: the calibration path is not the whole answer. Next is to compare against the firmware itself with REA (the `EFUSE_CTRL` handler, what the firmware does without SKU) and the ACPI SAR/MTCL path (`mt792x_acpi_sar.c`).
+
+### 10.76 Cold boot 2026-11-08 14:23 (core A171AD24, native B9AE6E64, Bluetooth on): data TX works again
+
+**What the log shows (read only, nothing run on the network):**
+- `eeprom(efuse) rc=0 st=0` (format WHOLE). `sar: MTDS v2 MTGS v2 -> 2g 59 5g 59` (29.5 dBm, so the world ceiling 40 = 20 dBm is the limit). `clc 00 env 1: power 6 ext 6`, `txpower: 21 commands … rc=0`.
+- AP: "Agapi 5G" `24:de:c6:11:e8:f0`, ch 44, HT40 only (`vht=0 he=0`), no Country IE (domain "00"), RSSI −56 dBm. Auth, assoc and EAPOL each went through on the first frame (`txFail=0`).
+- `stat-log` at 123 s, L6: `txf=15373/0/0/29/3722`. 0.2% failed, 0.24 retries per frame. On 11:57 (§10.75) it was 81% failed, 11.6 retries.
+- MtkBtFw + BtLeDlFix loaded, BT firmware v9736. macOS shows Bluetooth `Off` (the user toggle).
+
+**What this does and does not prove.** The owner is at a different place, so the AP and the RSSI (−56 vs −63) changed together with the fix, the power tables and the cold boot. TX working is a fact; which of the four made the difference is not separated yet (chưa xác định).
+
+**Still open:** `rty=13717/16968`: 81% of the AP's unicast frames carry the retry bit (30% in October). The AP is re-sending most of its frames, so it likely still misses many of our ACKs/BlockAcks. These control responses are sent by the hardware at a legacy rate. This is the same weak-uplink sign as before, and the next thing to trace.
+
+**Next (when the owner allows a test on the live link):**
+1. A short speed test and a gateway ping on this AP, to measure what `rty` 81% costs.
+2. Back at "10.07 Cafe" (ch 36, −63 dBm): if TX works there too, the eeprom/power fix is confirmed. If not, run `itl_nopwr=1` + reconnect there to separate the power tables from the eeprom fix.
+
+**Test on the live link (owner's go-ahead, 14:3x, everything bound to en1, the only interface up; USB tethering off):**
+
+| | result |
+|---|---|
+| gateway ping (20) | 0% loss, avg 9.2 ms, max 27.7 |
+| 1.1.1.1 ping (10) | 0% loss, avg 45.9 ms |
+| download, Cloudflare 25 MB | 5.4 MB/s (~43 Mb/s) |
+| upload, Cloudflare 20 MB | 7.4 MB/s (~59 Mb/s; the phone did ~50 Mb/s up at 10.07 Cafe) |
+
+- `stat-log` over the whole test: `txf` failures stayed at 29 of 145942 freed, retries 0.30 per frame. `noslot` rose 12014 → 13269 during the upload (TX ring full: host back-pressure, not loss).
+- `rty` stayed around 83%. It does not stop TCP here, but it is still the open uplink item (ACK/BlockAck heard by the AP).
+- The link is HT40 only (300 Mb/s PHY), so 43 Mb/s down is not yet a measure of the driver's ceiling. The owner notes the café's internet line itself is slow, so these numbers are bounded by the line, not by the Wi-Fi link.
+
+### 10.77 Boot 2026-11-08 20:26 (core A171AD24, native B9AE6E64, Bluetooth on): a strong AP, full speed; AirDrop test next
+
+**Wi-Fi, "Thanh coffee"** `9c:5d:12:89:1f:24`, ch 157, VHT80 (`bw=2 center=155`), Country IE US (`regulatory: country US`, `clc US … power 8 ext 8`, `txpower … rc=0`), RSSI −41 dBm. Test bound to en1 (owner's go-ahead), USB tethering off:
+
+| | result |
+|---|---|
+| gateway ping (20) | 0% loss, avg 2.5 ms |
+| 1.1.1.1 ping (10) | 0% loss, avg 60 ms (one 339 ms outlier) |
+| download, Cloudflare 50 MB | 26.8 MB/s (~215 Mb/s) |
+| upload, Cloudflare 40 MB | 25.6 MB/s (~205 Mb/s) |
+
+- `stat-log` across the test: `txf` 42 failed of 370401, 0.09 retries per frame. `rty=8432/261728`: the AP re-sends 3.2% of its frames (October at −38 dBm: ~30%; §10.76 on the HT40 AP: 83%).
+- So the 83% of §10.76 was tied to that link (HT40-only AP, or the line the owner called laggy), not a general uplink fault. If it comes back on an HT-only AP, trace the HT-only path (no VHT in STA_REC) against Linux.
+
+**AirDrop.** awdl0 is up, Bluetooth is on (BT firmware ready in 5.1 s, HCI reset ok), and AWDL had not run yet this boot. The §10.67 blocker was 5 GHz unicast to the iPhone failing (uc5 25 ok / 198 fail): the same 5 GHz transmit weakness that §10.75 fixed for the station link. The photo test of §10.68–§10.71 was never run because Wi-Fi was down. sharingd's `DiscoverableMode` is `Off` (AirDrop receiving off), so iPhone → Mac needs it set to Everyone first.
+
+**Test (owner, with the iPhone nearby):**
+1. AirDrop receiving on the Mac: Everyone for 10 minutes.
+2. iPhone → Mac: send one photo. Then Mac → iPhone.
+3. Read: sharingd (`Received ASK request`, `Lost BLE device`), the core's `awdl txfree` uc5 ok/fail, `awdl duty`, and no `recover #` or `link lost`.
+
+### 10.78 Same boot (20:32–20:34): AirDrop Mac → iPhone reaches the PIN step, then stalls; AWDL 5 GHz unicast still fails 71%
+
+**sharingd (log stream, owner sending a photo with the macOS 26 AirDrop PIN):**
+- 20:32:08 the Mac discovers the iPhone over AWDL (Bonjour `_airdrop._tcp`). 20:32:15 receiving switched to Everyone.
+- From 20:32:39 the Mac opens TCP + TLS to the iPhone's port 8770 over awdl0. Each connection is `ready` after 1.6–1.9 s (slow), then `DISCOVER request timeout` after 5 s, cancel, retry (C2…C7).
+- 20:33:04 one DISCOVER answer did arrive: `Decoded PIN info dictionary`, `Showing PIN pair prompt`. The owner entered the code; the iPhone stays on "loading" because the following requests time out the same way.
+- 20:32:56 `Lost BLE device` once (not the blocker here: the TLS retries continue).
+
+**Core counters (`awdl …` lines):**
+- `awdl txfree: uc5=197/492` (ok/fail): 71% of AWDL unicast at 5 GHz fails; `ucheard=193/320` (62% even when the peer was heard in that window); `uc24=126/51` (29%).
+- The station link on the same radio is clean now (0.1% fail, §10.77), so this is not the §10.75 transmit weakness: it is specific to AWDL.
+- `awdl lead: lead=35208us early=139 late=239 avglate=39454us`: our windows start on average 39 ms after the slot we aimed for. An AWDL availability window is ~16 TU, so most of our 5 GHz unicast goes out when the iPhone has already left channel 149 → no ACK. The 2.4 GHz share has a different schedule, which fits its lower loss.
+- `awdl duty: off=54200 ms in 312 windows (avg 173 ms)`, `phase … grant=21.4 ms soff=21.6 ms dwell=112.6 ms`: the ROC grant and sniffer-off alone take ~43 ms per window.
+
+**Where AirDrop stands:** discovery, BLE advertising, the TLS connection and the PIN exchange work. The data exchange after the PIN fails because AWDL unicast is lost when our windows miss the iPhone's.
+
+**Next (trace, no change yet):** measure the window start error against the iPhone's advertised schedule (AW sequence + offset in its sync parameters) per window, and find where the 39 ms comes from (ROC grant latency 21 ms + sniffer-off 22 ms, or the lead computation). Compare the ROC request timing with Linux mt7925 `mt7925_mcu_set_roc` / `abort_roc` usage.
+
+### 10.79 Why AWDL windows are 39 ms late: a channel change between back-to-back EAWs leaves no time for the setup → gap before a channel change (core BBFBA198, native 39C8FDA0)
+
+**Evidence (boot 20:26, read from the driver):**
+- The iPhone's channel sequence (`itlmt-awdl-peer-tlv4`, 16 EAWs): `157 157 149 – – – – 157 6 157 149 157 – – – 157`. Our own (`itlmt-awdl-self-tlv4`) mirrors it, as §10.64 intends. The AP is on 157.
+- A window on 157 needs no ROC (§10.58, setup ~5 ms). A window on 149 needs a ROC: `awdl phase` setup 4.8 + ROC 0.3 + grant 21.4 + sniffer config 6.7 ≈ 33 ms (learned `lead=35208us`), and its teardown costs sniffer-off 21.6 + end 5.4 ≈ 27 ms.
+- Same-channel EAWs are one window (§10.65), but 157→149 (slots 1→2, 9→10) and 149→157 (10→11) follow each other with only the 1.5 ms margin. The link thread runs one window at a time ([itlmt7925_m3.cpp:2640](../kexts/itlmt7925/itlmt7925_m3.cpp)), so the next window's setup starts only when the previous one ends: 35 ms late for 149, ~30 ms late for 157 after a 149 window. Measured: `late=239 avglate=39454us` against `early=139`.
+- An EAW is 64 TU, but the guaranteed part is the AW (16 TU) at its start. A 149 window 35–39 ms late misses all of it, which fits `uc5=197/492` (71% fail) while the station link on the same radio loses 0.1%.
+- The comment above `awdlRunMax` already recorded "avg 39 ms late" for back-to-back windows (§10.65); merging same-channel runs fixed only that case.
+
+**Change (native 39C8FDA0):** `awdlLsnArm` records the channel of the present EAW right after the run (`awdlLsnNextCh`). When it differs, `awdlLsnFire` shortens this window by `itlmt_awdl_gap` (default 40 ms, 0 = off, max 60), never below the AW + 2 ms. The next arm still finds that EAW, and the core's existing lead wait sets it up in time. `itlmt-awdl` ends with `cut=<windows shortened>/<gap ms>`.
+- Cost: a 157 run of two EAWs listens 89 ms instead of 129; a lone 149 EAW 23.5 ms instead of 63.5 (the AW is 16.4 ms). The 157 EAWs cost the AP nothing, and the 149 ones now meet their AW instead of missing it.
+
+**Instrumentation (core BBFBA198):** `awdl lead` adds `onlate=<n>/<avg us>`: late windows on the AP's channel, separated from ROC windows.
+
+**Undo:** `Kexts-backup/itlmt7925.kext.20261108-203846` (A171AD24), `Kexts-backup/itlmt7925Native.kext.20261108-203846` (B9AE6E64), or the boot-arg `itlmt_awdl_gap=0`.
+
+**Next boot test (warm reboot is enough; Wi-Fi + AirDrop):**
+1. Check the UUIDs are BBFBA198 / 39C8FDA0. Wi-Fi should behave as in §10.77 (only AWDL scheduling changed).
+2. AirDrop receiving set to Everyone, iPhone nearby. Send a photo Mac → iPhone, then iPhone → Mac, and enter the code.
+3. Read `m3-log` `awdl lead`: `late` should drop well below `early`, and `avglate` should fall far below 39 ms. Read `awdl txfree` `uc5` ok/fail (was 197/492) and `itlmt-awdl` `cut=`.
+4. sharingd: no repeated `DISCOVER request timeout`, and the transfer should get past the code step.
+5. If ROC windows are still late: the sniffer-off (21.6 ms) and the ROC grant (21.4 ms) are next, against Linux `mt7925_mcu_set_roc` / `mt7925_mcu_abort_roc` and how mt76 sets the sniffer.
+
+### 10.80 Boot 2026-11-08 20:53 (core BBFBA198, native 39C8FDA0): windows on time, but the devices no longer find each other → the gap is off; present only on the AP's channel when the peer uses it (native A2880A4E)
+
+**What the gap did.**
+- The window timing improved: `avglate` 39.5 → 9.3 ms. Late ROC windows averaged ~18 ms; late on-channel windows 4.2 ms (`onlate=121/4178us`). `cut=146/40`.
+- But AirDrop got worse: the owner saw neither device from the other. sharingd found the peer's `_airdrop` service, but every `DISCOVER` stayed `in_progress resolver` (the peer's hostname never resolved over awdl0) and timed out after 5 s.
+- Driver: `dtx=32/32/0/0/32/0`: the stack handed us only 32 frames, all multicast (mDNS), and `txfree grp=2/30`. No unicast was ever queued (`uc=0/0`), because nothing resolved.
+- We were slave (`role=2`) of `c2:cc:1f:b0:61:ad` (−33 dBm, the iPhone next to the Mac).
+
+**Cause.** The gap broke §10.62's rule: advertised presence must equal real presence. Our sequence still claimed every 149 EAW in full, but the window now left after 23.5 ms. The peer's answers in the rest of those EAWs were sent where we no longer were.
+
+**Change (native A2880A4E, core unchanged BBFBA198):**
+- `itlmt_awdl_gap` defaults to 0 (off).
+- New `awdlApOnly()` (boot-arg `itlmt_awdl_aponly`, default 1). When the followed peer's sequence contains the station's own channel (from the core's `ITL_NATIVE_STATUS`, cached for 1 s), `awdlSchedCh` keeps only those EAWs. That one function feeds both our advertised sequence (`awdlTlv4`, line ~937) and the listen windows, so the two stay identical.
+- With the AP on 157 and the iPhone's `157 157 149 – – – – 157 6 157 149 157 – – – 157`, we are present in its six 157 EAWs. These need no ROC (§10.58): no setup latency, no sniffer-off/abort, and nothing taken from the AP.
+- `itlmt-awdl` ends with `aponly=<on>/<ap ch>/<slots dropped>`.
+
+**Undo:** `Kexts-backup/itlmt7925Native.kext.20261108-205700` (39C8FDA0), or boot-arg `itlmt_awdl_aponly=0`. Native B9AE6E64 (before §10.79) is in `…20261108-203846`.
+
+**Next boot test (warm reboot):**
+1. Check the UUIDs are BBFBA198 / A2880A4E. Read `itlmt-awdl`: `aponly=1/157/<n>` with n growing, and `itlmt-awdl-self-tlv4` with 157 in the iPhone's 157 slots and 0 elsewhere.
+2. Both devices should list each other in AirDrop. Send a photo Mac → iPhone and iPhone → Mac.
+3. `awdl lead`: most windows `onch`; `awdl txfree` `uc5` ok/fail (was 197/492 in §10.78).
+4. If the iPhone does not list the Mac: it may stop treating us as reachable once our sequence overlaps its own in only 6 slots. Then the fallback is `itlmt_awdl_aponly=0`, and the next step is to make the 149 windows meet their AW (sniffer-off and ROC grant time against Linux).
+
+### 10.81 Version gate for the native front end (whole macOS 26 line), from the version-gate audit (native 206D41C8, not installed)
+
+**Request** (from the 890M session's audit, owner's rule): every ABI assumption must hold for the whole macOS 26 / Darwin 25.x line, detected at run time, fail safe (disable and log, never panic). The IO80211/Skywalk headers in `kexts/itlmt7925/io80211/*.h` were generated from 25G241 and checked only by `static_assert`s.
+
+**Change (native 206D41C8, includes §10.80's A2880A4E):**
+- `itlNativeAbiGate` (`itlmt7925_wifi.cpp`) is the module's `_realmain` (`kmod_info.c`). libkmodc++'s `_start` runs it after our metaclasses are registered and the Family is linked, and before IOKit can construct any object of this kext. A check in `start()` would come too late: `itlmt7925Wifi` is itself an `IO80211Controller` subclass, so a wrong layout is already wrong at construction.
+- For 10 classes (IO80211Controller, IO80211SkywalkInterface, IO80211InfraInterface, IO80211InfraProtocol, IO80211VirtualInterface, IO80211AWDLProtocol, IOSkywalkNetworkInterface, IOSkywalkInterface, IO80211WorkQueue, IO80211CommandGate), it compares `OSMetaClass::getMetaClassWithName(name)->getClassSize()` with `sizeof` from our headers. A missing class counts as a mismatch.
+- On a mismatch: `IOLog`, `itlmt-native-abi` = `MISMATCH (running/built): …` on the core service, and `KERN_FAILURE`, so the kext does not load and native Wi-Fi stays off without a panic. Boot-arg `itlmt_native_abiforce=1` loads anyway (debugging). On success: `itlmt-native-abi` = `ok: 10 classes match the 25G241 layouts`.
+- The diagnostics recorder (`itlmtCallers`) stored callers minus a 25G241 static address (`kWorkQueueStatic`). It now stores them relative to `IO80211WorkQueue::workQueue` itself, which is valid on any build.
+
+**Checked against the running build (25G332, macOS 26.7.2) before staging:**
+- All 10 names are registered (`ioclasscount`).
+- The size each `…::MetaClass::MetaClass()` passes to `OSMetaClass::OSMetaClass(name, super, size)` in `BootKernelExtensions.kc` equals our header value for all 10 (0x128, 0x128, 0x130, 0x130, 0x130, 0x130, 0xe0, 0xb0, 0x50, 0x18). So the gate passes on this machine.
+
+**Not covered yet:**
+- Vtable slot order. A class can keep its size and still move a virtual. Checking a few slots against symbols needs a symbol lookup at run time, which the kernel does not export to kexts.
+- `corecapture_min.h` `CCPipe::startPipe` slot +0x868.
+- The AWDL message struct sizes (`itlmt7925_awdl.cpp` 132–201) are data formats, not class layouts. They can only be checked by reading the Family's code per build.
+
+**Install:** not yet; waiting for the owner, batched with the next reboot (it carries the §10.80 AWDL change too).
+
+**Installed (owner's go-ahead, 2026-11-08 22:08):** native 206D41C8 (§10.80 + §10.81) with core BBFBA198. Undo: `Kexts-backup/itlmt7925Native.kext.20261108-220841` (A2880A4E).
+**Next boot:** `ioreg -l | grep itlmt-native-abi` → `ok: 10 classes …`; then the §10.80 AirDrop test.
+
+### 10.82 CoreCapture fault reporter on its own work loop (native 25F33563, installed)
+
+- **Report (session "iGPU trên Colbalt64", 890M thermal trace):** CCFaultReporter is woken ~600 times/s through itlmt7925's CoreCapture pipes.
+- **Cause, from BootKernelExtensions.kc:** `CCFaultReporter::initWithStreamWorkloop` creates an `IOTimerEventSource` (`spinDeferredCapture`) and calls `addEventSource` on the work loop it is given. `makeFaultReporter` passed `wq`, our IO80211 work queue: the busy loop that serves RX, AWDL timers and every Family command. The reporter's event source therefore ran on each of those wakes.
+- **Fix:** the reporter gets its own idle `IOWorkLoop::workLoop()` (`faultLoop`). In `free()` it is released after `ccFault`. The trace line `ctl:faultLoop=own|wq` shows which loop is in use. Boot-arg `itlmt_native_faultwq=1` restores the shared queue for an A/B test.
+- **Contents:** includes everything in 206D41C8 (aponly, ABI gate).
+- **Next boot:** check that the `ctl:faultLoop=own` trace is present and the ABI gate prints "ok". Then measure CCFaultReporter wakes (the same method as the 890M trace); expect close to 0 with Wi-Fi idle. Install only with the owner's approval; the peer batches installs.
+- **Installed 2026-11-08 22:13** with the owner's OK, by the iGPU session. Backup of 206D41C8: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261108-221302`. On the next boot, also run the §10.80 AirDrop test (`aponly=1/157/n`).
+
+### 10.83 Boot 2026-11-08 23:51 (native 25F33563): the ABI verdict and faultLoop were not visible → fixed properties (native A62C12D2, installed)
+
+- **Seen:** `itlmt-native-abi` was absent from ioreg. Neither the `itlmt7925Native: abi` line nor `ctl:faultLoop` was in `log show --last boot`.
+- **Why the ABI property was missing:** `abiPublish` ran from `_realmain` at module start. At that point the core `itlmt7925` service is not registered yet, so `copyMatchingService` returned null and nothing was set.
+- **Why the log lines were missing:** this boot did not keep the early IOLog lines in the unified log. The `itlmt_native_trace` ring (2 KB) had already been overwritten by AWDL entries.
+- **faultLoop on this boot:** boot-args do not set `itlmt_native_faultwq`, so the code took the own-loop path. A fault reporter that failed to start would have stopped the native start ("no fault reporter"), but Wi-Fi came up.
+- **Fix:**
+  - The gate keeps its verdict in a static.
+  - `start()` publishes `itlmt-native-abi` on the controller and on its provider (the core).
+  - `makeFaultReporter` sets a fixed `itlmt-native-faultloop` = own|wq.
+- **Next boot:** `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
+
+### 10.84 Boot 2026-11-09 09:31, "Medicomm" (160 MHz): Wi-Fi drops = the sniffer config's width code (core 2773F995, installed)
+
+**Wi-Fi drops.** The link is on "Medicomm", `34:98:b5:a2:73:44`, ch 40, `bw=3 center=50` (HE 160 MHz, rate 2402), RSSI −42 dBm. `wifi-events`: up at 19 s; at 465 s "firmware not answering MCU commands"; reset and firmware reload; up again at 491 and 506 s. `m3-log` shows where it stopped:
+
+- `awdl: sniffer off took 73 ms (ch=40)`, then `mcu hist … rx_filter:0 sniffer on:0 sniffer cfg:-110 sniffer off:-110`.
+- The timed-out command is the sniffer config of an on-channel AWDL window (AP channel 40). §10.58 gave such windows the link's real width.
+- The postmortem shows `txwm 32/29`: three commands queued that the firmware never took. The supervisor then reset the chip (`recover #2`).
+
+**Cause, compared with Linux** (`mt7925_mcu_config_sniffer`, current mcu.c):
+- The `bw` byte is the sniffer's own `ch_width` table: 20 and 40 → 0, 80 → 1, 160 → 2, 80+80 → 3, 320 → 6. sco gives the 40 MHz side, centre_ch2 is set only for 80+80.
+- We wrote `fastBw` unchanged, which is CMD_CBW_*: 0 = 20, 1 = 40, 2 = 80, 3 = 160.
+- On a 160 MHz AP the firmware got 80+80 with centre2 = 0, and stopped answering at that command.
+- On the 80 MHz APs of §10.77/§10.80 it got "160 around 155". That did not hang, but it was wrong.
+
+**Fix:** map `fastBw` through `{0, 0, 1, 2}`. Off-channel windows stay 20 MHz (0).
+
+**AirDrop on this boot (read from ioreg, no test run):**
+- `syncs=0`, and we are our own master (`top=` self).
+- Peers were heard almost only on 5 GHz: `band=3/643`, `rssi5=-93..-61`, `weak=624` of 646 frames below −70 dBm. These look like other people's devices in the café; the peer that published its sync TLV, `46:5c:f4:97:bd:e6`, runs 149 with one slot on 6.
+- sharingd ran no Bonjour DISCOVER this boot: the AirDrop sheet never reached browsing while the logs were kept.
+- Because the link kept resetting (firmware reload, every AWDL window torn down), this AirDrop result says nothing yet. Re-test with the AirDrop sheet open after the core fix: `itlmt-awdl` (syncs, role, rx and weak against the owner's iPhone address), plus sharingd `AirDropNW.Discovery`.
+- **Installed 2026-11-09 09:46** with the owner's OK. Backup of BBFBA198: `EFI/OC/Kexts-backup/itlmt7925.kext.20261109-094632`. Native stays 25F33563.
+- **Next boot:** `wifi-events` has no "firmware not answering" line; `m3-log` has no `sniffer cfg rc=-110`. Then run the AirDrop test with the sheet open on both devices.
+- **Native A62C12D2 installed 2026-11-09 09:58** (§10.83) by the iGPU session, with the owner's OK. Backup of 25F33563: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261109-095805`. Next boot also check: `ioreg -l -w0 | grep -E 'itlmt-native-(abi|faultloop)'`.
+
+### 10.85 Panic 2026-11-09 10:06 (CloudflareWARP, IOService::getMatchingServices): native/core lifecycle audit (no code change)
+
+- **Panic:** the boot of 10:03 (core 2773F995, native A62C12D2) panicked 163 s in, after the AC was unplugged.
+  - Path: `OSMetaClass::applyToInstances` ← `IOService::copyExistingServices` ← `getMatchingServices`, process CloudflareWARP.
+  - It is a GP fault: RAX = `0x656372756f736552`, which is the ASCII "Resource". The object in the instance set (`0xffffff95188d8000`, page-aligned, GEN3) had text where its vtable belongs, so it had been freed and its memory reused, or overwritten.
+- **Audit of core and native:**
+  - No IOService of ours is freed at run time. The controller, its interface, the AWDL vif, `itlmt7925Eth` and the user client are created once. They are only released on start failure (after `detach`/`detachInterface`) or in `stop`/`free`.
+  - Every `free()` override ends in `super::free()`: `itlmt7925`, `itlmt7925Eth`, `itlmt7925Wifi`, `itlmt7925WifiInterface`, `itlmt7925AwdlInterface`.
+  - Neither kext has power-state or AC code.
+  - Our subclasses of Family classes are allocated with the size the KC's metaclasses report: the §10.81 gate says `ok: 10 classes`. So no object of ours is under-allocated.
+  - Neither binary contains the string "Resource".
+- **Checked, not a bug:** `awdlRxBuffer` calls `pool->free()` on the losing pool of a creation race. `IO80211DynamicBufferPool` is not an OSObject: `free()` is its own exported destroy method (`io80211_buffer_min.h`). The pool is not in any IOService instance set either.
+- **Open:** which object it was is not known from the panic alone. Candidates are the kexts that react to AC unplug (power-source / ACPI events). Those live in the iGPU/platform session's repository.
+
+### 10.86 AirDrop test 2026-11-10 21:53 (core 2773F995, native A62C12D2): discovery reaches DISCOVER, the TCP connection to the iPhone never opens; the RSSI decoder vs Linux (core 319FC3B2, installed)
+
+AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
+
+**What worked:**
+- mDNS over awdl0: queries were sent, and responses from the iPhone arrived.
+- sharingd: "Endpoints discovered", DiscoveredPairable updated, then "Sending DISCOVER request".
+
+**What failed:**
+- Every DISCOVER timed out after 5 s.
+- `netstat`: `fe80::40bc:…:51838 → fe80::10b4:23ff:fe47:a0dd.8770 SYN_SENT`. The iPhone's AWDL MAC is `12:b4:23:47:a0:dd`.
+- `ndp -an` on awdl0 lists only our own two addresses (`3e:c4:cd:e8:5c:9c`, `42:bc:8d:c8:74:8b`, both "permanent"), and no entry for the iPhone. The Family's peer manager never installed it as a peer, so unicast to it cannot work.
+- Core `awdl txfree`: `uc24=4/9 uc5=2/97` (ok/fail).
+- The iPhone's frames are just below the peer manager's edge: a sample on ch 6 had `rssi=-71`. Native `weak=1537` of 2511 frames are below −70 dBm.
+- At Thanh coffee (§10.80) the same iPhone read −33 dBm, and §10.32 already noted "weak with the iPhone next to the Mac: check the RCPI decode".
+
+**RSSI decoder vs Linux** (`mt7925_mac_fill_rx`, `mt76_connac3_mac.h`):
+- Groups sit at RXD1 bits 16–20.
+- Group 2 is 16 bytes (`rxd += 4`). `rxRssi()` tried 8 bytes first, and with the header-gap tolerance that layout also "fitted". It read P-RXV dword 1 instead of dword 3.
+- On the probe beacons, dword 1 held RCPI-like bytes 1–2 dB lower, so this alone does not explain −71 against −33.
+- The decoder also fell back to the bit-11 group layout and to dword 1, and took chains 2/3 into account.
+- **Fix:** Linux's layout only (rxv[3], RCPI0/1, max over the two chains).
+- **New, for the next test:** `awdl-rssi-raw` on the core is a ring of 8 AWDL action-frame samples (every 40th frame): sender, channel, d1, header offset, P-RXV dword 3, and the decoded value. It shows whether the iPhone's frames really carry RCPI around 0x46, or whether the vector is read from the wrong place.
+
+**Next test:**
+- Keep the iPhone next to the Mac and open AirDrop on both.
+- Read `awdl-rssi-raw` (the iPhone's `12b42347a0dd` rows or its new MAC) and `itlmt-awdl` `weak=`.
+- Check `ndp -an | grep awdl0` for a peer entry, and look for DISCOVER responses.
+- **Installed 2026-11-10 22:04** with the owner's OK. Backup of 2773F995: `EFI/OC/Kexts-backup/itlmt7925.kext.20261110-220437`. Native stays A62C12D2.
+
+### 10.87 Boot 2026-11-11 18:49, Mac ↔ Mac at "Ariyana Convention Centre" (open network, ch 149 VHT80): first DISCOVER response over awdl0
+
+- **Build:** the owner's build of `dev/open-wifi` (core 5E4A1B60, native 52A0E786). It contains §10.84 (sniffer width), §10.86 (Linux RXD layout, `awdl-rssi-raw`) and the open-network join (bc2b07b). `dev/awdl` was fast-forwarded to it (31c65e1).
+- **RSSI:** `awdl-rssi-raw` decodes cleanly: chains 2/3 = 0xff, RCPI0/1 present, for example `v3=ffff7e70` → −47 dBm. The peers read −44…−47 dBm on 149. `weak=90` of 1482 frames.
+- **Peers:** the peer manager installed them. `ndp -an` on awdl0 has `0a:9d:cd:86:be:5e` (the other Mac) and `3a:62:64:31:60:2e` as permanent entries; on 2026-11-10 only our own addresses were there.
+- **Data:**
+  - A TCP connection to `fe80::89d:cdff:fe86:be5e.8770` was in SYN_SENT at 18:55:51 and ESTABLISHED by 18:56:15 (two connections).
+  - awdl0 counters: 152 packets in, 152 out.
+  - Native `dtx` went 15 → 117 and `drx` went to 1550 (in) / 128 (up).
+- **sharingd:**
+  - "Sending DISCOVER request" at 18:56:16, then "Got DISCOVER response … Finished DISCOVER" at 18:56:20.
+  - "Adding discovered endpoint", "Endpoint discovered".
+  - One earlier attempt still ended in "failed discovery".
+- **Next:** send a file Mac → Mac and the other way. Watch `dtx`/`drx`, `awdl lead`/late windows and throughput, and any stalls like §10.79.
+
+### 10.88 First completed AirDrop transfer, Mac → Mac (2026-11-11 18:58–18:59, same boot as §10.87)
+
+**sharingd send state machine** (`AirDrop.6F1730A9`):
+- `START` 18:58:25.
+- `Pin Pairing START` 18:58:25; PIN stored and received 18:58:34; `Pin Pairing END` 18:59:29 (**64 s**).
+- `ASK START` 18:59:29 → `ASK END` 18:59:37 (8 s).
+- `UPLOAD START` 18:59:37 → `UPLOAD END` 18:59:38 (small file).
+- `END` 18:59:38.
+- The owner saw the sheet stuck on "loading" after the PIN, and then the send went through.
+
+**awdl0:** 1319 packets / 1.04 MB out, 929 packets / 273 KB in since boot.
+
+**Driver while it ran:**
+- Native: `dtx=1566/1239/327/0/1239/0`. 327 times the core's AWDL TX ring was full; those packets waited in the stack.
+- Core `awdl txs`: `uc=224/0 uc5=329/0` (TXS: unicast acknowledged, 0 failed).
+- Core `awdl txfree`: `uc=0/203 ucheard=0/591 uc5=0/794` (every TXFREE counted as a failure).
+  - The two counters contradict each other. TXS (the hardware's ACK status) says the unicast frames went through. The TXFREE ok/fail classification is probably wrong and needs checking against `mt7925_mac_tx_free`.
+- Windows: all on the AP channel 149 (`slots=149+multi`; self TLV4 is 149 in 15 of 16 slots, the peer is 149 in all but one slot, which is on 6). `aponly=1/149/25667`.
+- `awdl lead`: `late=1301` of 1308 on-channel windows, `avglate=4687us`.
+- `awdl txs guard=247 drain=145/3993ms`.
+
+**What is slow:**
+1. The 64 s PIN phase and the 8 s ASK. Both are small TLS exchanges. They wait on the core's TX ring, which only drains inside windows: data goes on ALTX0 at a fixed rate, with no rate adaptation and no BA. The 10 ms guard and 25 ms drain cut each window short.
+2. Almost every on-channel window starts about 4.7 ms late.
+
+**Next:**
+- Measure where the PIN phase spends its time: per-window frames sent, ring depth, TCP retransmits (`netstat -s -p tcp` before and after).
+- Compare the data TX path with how Linux sends to a peer on the same channel (normal data queue, rate control).
+- Check the TXFREE classification.
+
+### 10.89 The slow PIN phase: AWDL data drains only inside windows → on-channel data goes out between windows too (core B9E6878A, installed)
+
+**Cause of §10.88's 64 s PIN phase and 8 s ASK:**
+- The AWDL data TX ring (16 slots) is drained only by `awdlDwell()`, inside a window. Frames go on ALTX0 at the fixed OFDM 6 Mb/s rate and stop 10 ms before the end of the window.
+- On 2026-11-11 the core ran ~1.8 windows/s: `awdl stat try=1300` in ~11 min, `posted=1071` of `eaws=4225` on the native side.
+- So at most ~30 data frames/s left the Mac. The stack hit a full ring 327 times, and each TLS round trip of the PIN exchange waited for the next window.
+- Yet the schedule was entirely on the AP channel. Self TLV4 is 149 in 15 of 16 slots; the peer is 149 in 15 of 16 slots, 6 in one. The radio was already on the peer's channel between windows.
+
+**Fix:**
+- The link loop (`m3 link` `for (;;)`) also drains the ring when all of these hold:
+  - the link is up;
+  - a window on `tgtCh` ran in the last 500 ms (`awdlLastOnChWinMs`, set by the window code when `ch == tgtCh`);
+  - no ROC is held on another channel.
+- This runs on the link thread between windows, so `awdlTxBuf2`, the MIF staging buffer used by `awdlDataFlush`, is not in use.
+- Counter: `awdl lead … ontx=<flush calls>/<frames>`.
+- Boot-arg `itlmt_awdl_onchtx=0` restores windows-only.
+
+**TXS vs TXFREE (open):**
+- Our TXFREE parse matches `mt7925_mac_tx_free`: header BIT(30), count 27:24, stat 29:28.
+- Our TXS ACK test matches `MT_TXS0_ACK_ERROR_MASK` (18:16).
+- Still, on 2026-11-11 TXS reported 329 of 329 unicast frames acknowledged, while TXFREE reported every AWDL frame as stat≠0 with about 16 tries (`tries=12795` for 794 frames).
+- The AWDL data frames use the AP's wcid (1) on ALTX0. Check whether the TXFREE header that precedes them is the AP wcid's, not theirs.
+- The transfer itself succeeded, so TXS is the one that matches what happened on the air.
+
+**Next test:**
+- AirDrop Mac → Mac again. Compare the PIN/ASK durations with 64 s / 8 s.
+- Read `ontx=` and `dtx` full-ring counts (`dtx=in/queued/full/...`).
+- **Installed 2026-11-11 19:03** with the owner's OK. Backup of 5E4A1B60: `EFI/OC/Kexts-backup/itlmt7925.kext.20261111-190331`. The build includes the open-network join. Native stays 52A0E786.
+
+### 10.90 Boot 2026-11-23 13:15 (core B9E6878A, native 52A0E786), "laon" ch 36 VHT80: AirDrop Mac → a nearby MacBook (a known contact)
+
+- **Discovery:** AirDrop window opened at 13:40:17; "Endpoints discovered / Adding discovered endpoint" at 13:40:22 (5 s). The peer `72:9d:5e:a9:bf:87` became a permanent ndp entry, and the Finder window showed the contact by name.
+- **Send** (`AirDrop.36DAA487`, a 1-line text file):
+  - `START` 13:42:31.459.
+  - No PIN phase: the receiver is a contact.
+  - `ASK START` 13:42:31.483 → `ASK END` 13:42:47.119 (15.6 s). This includes the receiver clicking Accept, so it is not a pure network time.
+  - `UPLOAD START` → `UPLOAD END` 13:42:47.119 → 13:42:48.132 (1.0 s).
+  - `END` 13:42:48.140.
+- **awdl0 during the send:** 97 packets / 34 KB in, 126 packets / 47 KB out.
+- **TCP:** no retransmits (0 data packets retransmitted, 0 retransmit timeouts).
+- **Driver:**
+  - Native `dtx=214/214/0/…`: the core's AWDL TX ring was **never full**; on 2026-11-11 it was full 327 times.
+  - `awdl lead … ontx=44/54`: §10.89's between-window drain ran 44 times and sent 54 frames.
+  - On-channel windows still start late: `onlate=2355/2083us`.
+  - TXFREE still counts every AWDL unicast frame as failed (`uc5=0/148`), while the transfer and TCP show no loss: the open question of §10.89.
+- **Not yet measured:**
+  - A PIN-paired transfer (non-contact) to compare with §10.88's 64 s.
+  - A larger file, for throughput.
+
+### 10.91 The 15.6 s ASK of §10.90 is not the receiver: AWDL group frames went out without `MT_TXD3_BCM` (core 61F8DB1B, not installed)
+
+The owner corrected §10.90: the receiver accepted as soon as the prompt appeared, so the 15.6 s ASK is a network bottleneck.
+
+**ASK timeline (`build/ask-1342.txt`, sharingd + mDNSResponder + IO80211Family):**
+
+| Time | Event | Gap |
+|---|---|---|
+| 31.483 | `ASK START`; `C1` app_svc resolution (`com.apple.sharingd.AirDrop`) | |
+| 34.178 | resolver `dns_stall @2.0 s`, then `start_bonjour @2.68 s` | 2.7 s |
+| 34.179 | `Starting blocking AWDL trigger browser` `_asquic._udp.local`; Family `updateLocalRequests: Adding PTR` | |
+| 34.250 / 34.351 | our mDNS queries out on awdl0 (36 B, 288 B) | |
+| 34.4 – 40.98 | **no multicast received on awdl0 at all** | |
+| 40.990 / 41.091 | our queries again | |
+| 41.990 | `AWDL trigger browse found endpoint` | **7.8 s** |
+| 42.013 | QUIC + TLS to the peer over awdl0 | |
+| 47.119 | `ASK END` | 5.1 s |
+
+The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 41.990–41.995, and pairs at 42.587 and 43.104.
+
+**Driver counters (same boot, `m3-log` / `itlmt-awdl`):**
+- `awdl txfree: grp=10/58 tries=5656`. AWDL multicast data is reported failed, and AWDL frames average about 15 attempts each.
+- `drx=1471/280/0/0/1191`: 81 % of the data frames the peer sent us were 802.11 retries of a frame already delivered.
+- `rxstat … full=0`: the core's AWDL RX ring never overflowed. The native side drains it every 5 ms, so the bursts are not created on our receive path.
+
+**Cause (from the code, checked against Linux `mt7925_mac_write_txwi_80211`).**
+- Linux sets `MT_TXD3_BCM` (TXD3 bit 4) whenever addr1 is group-addressed:
+  `txwi[3] |= FIELD_PREP(MT_TXD3_BCM, multicast)` with `multicast = is_multicast_ether_addr(hdr->addr1)`.
+- `m3Tx` never set it. Its comment assumed every group frame is a station ToDS frame (RA = BSSID, group DA in addr3). That holds for infrastructure, not for AWDL. In AWDL:
+  - every PSF and MIF is an action frame to `ff:ff:ff:ff:ff:ff`;
+  - mDNS and other multicast data carry `33:33:…` in addr1.
+- So the MAC waited for an ACK that a group frame never gets. It sent each of these frames up to `REM_TX_COUNT` (15) more times at 6 Mb/s, with the backoff doubling each time.
+- All of them go out on ALTX0, the same queue as AWDL unicast data. Each window therefore opened with our own PSF/MIF retrying for tens of ms. The mDNS queries and the QUIC/TLS unicast waited behind them, and often for the next window.
+- Peers also received every PSF/MIF up to 16 times.
+
+**Fix (core):** `m3Tx` raises `MT_TXD3_BCM` when addr1 is group-addressed, as Linux does.
+- Infrastructure frames are unchanged: their addr1 is the BSSID.
+- Broadcast management frames (PSF, MIF, deauth) and AWDL multicast data now go out once.
+
+**Open:** the 81 % RX retries (the peer gets no ACK from us for its unicast) are a separate question.
+- §10.39 had brought them down to about 30 % with OMAC 1.
+- Linux binds a second OMAC with `BSS_INFO_UPDATE` basic after `DEV_INFO` (`mt76_connac_mcu_uni_add_dev`). We send only the `DEV_INFO`.
+- Check this after the BCM fix, because the retries may also be the peer's frames colliding with our retry bursts.
+
+**Check after install:**
+1. `awdl txfree: grp=` is mostly ok, and `tries` per frame is about 1 for group frames.
+2. `drx` dup share.
+3. Send AirDrop to the nearby MacBook again and measure `ASK START` → `ASK END`, the trigger-browse wait (`Blocking resolve` → `found endpoint`), and `UPLOAD`.
+
+| Kext | UUID | Replaces |
+|---|---|---|
+| core | `61F8DB1B-6FE5-39A4-BD49-2728E6E90C73` | `B9E6878A` |
+| native | unchanged `52A0E786` | — |
+
+- **Installed 2026-11-23 13:53** with the owner's OK. Backup of B9E6878A: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
+- **Undo:** `cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.bad91 && mv Kexts-backup/itlmt7925.kext.20261123-135320 Kexts/itlmt7925.kext`
+
+### 10.92 Boot 2026-11-23 14:3x (core 61F8DB1B): group frames go out once, but the nearby MacBook flickers and the PIN never shows → runtime A/B switch `itl_awdlbcm` (core D2CAADD0, not installed)
+
+**The fix itself works.** `awdl txfree: grp=31/0 tries=31`, later `grp=56/0`: each group frame now goes out once and is reported ok. Before the fix it was about 15 attempts and fail.
+
+**But AirDrop got worse.**
+- The owner saw the MacBook appear and disappear in the AirDrop window, even with "Everyone" set.
+- A send waited a long time and the PIN prompt never appeared.
+- Log `build/ask-1091.txt`: the Family posts `Peer Presence` for `52:08:0C:19:04:CB`, then `Peer Absence` 7–20 s later, again and again:
+
+  | Presence | Absence |
+  |---|---|
+  | 46:21.45 | 46:42.0 |
+  | 46:47.59 | 46:57.0 |
+  | 47:00.16 | 47:07.0 |
+  | 47:09.07 | 47:16.0 |
+  | 47:18.50 | … |
+
+  Each re-add starts from `SUI 0 → 1185`, so the peer entry is recreated each time. mDNSResponder follows it with `D2DServiceLost` / `D2DServicePeerLost`.
+- `runElection` keeps us as our own master every ~3 s (`New P:DA:FB:F4:DE:22:64`, our awdl0 address).
+
+**Counters, this boot vs §10.90:**
+
+| Counter | §10.90 | This boot |
+|---|---|---|
+| `rx` (action frames) | 3855 in ~26 min, `weak=12` | 616 in ~13 min, `weak=518` |
+| `pm` (peers naming us master) | `us=451` | `pm=470/10/136`: `us=10`, `other=136` |
+| `syncs` | — | 0 |
+
+- The MacBook's own frames (RSSI −54) reach us far less often than before.
+- The peers mostly follow another master, and we never take that master's timeline (`syncs=0`).
+- This boot also has more Apple devices around: `a6:00:5b:…` (2.4 GHz only) and `02:78:b7:…`. So the effect of the fix and the change in the room cannot be told apart from this boot.
+
+**Hypothesis to test, not a conclusion.** With BCM, our PSF/MIF goes out once per window instead of up to 16 times over tens of ms. A peer that is not yet synced to us is less likely to catch one, so it follows another master. Its windows then drift away from ours, and we miss its frames.
+
+**Round (core D2CAADD0):** `itl_awdlbcm` (itlctl, run time) selects which group frames carry `MT_TXD3_BCM`:
+
+| Value | Meaning |
+|---|---|
+| 3 | default: all, as Linux |
+| 1 | management only (PSF/MIF) |
+| 2 | data only |
+| 0 | none: the old behaviour |
+
+The `awdl txfree` line prints `bcm=`. With this, A and B can be compared in one boot, with the same devices in the room.
+
+**Plan:**
+1. In one boot, alternate `sudo itlctl itl_awdlbcm=3` and `=2`, about 2 minutes each with AirDrop open.
+2. Each time, count `Peer Presence` / `Absence` for the MacBook and read the `pm=` and `rx` deltas.
+3. Send a file in each setting.
+4. If `=2` holds the peer and `=3` does not, the real fix is presence or sync, not retrying broadcasts. Our windows must line up with the tree the peers actually follow:
+   - adopt the other master's timeline (`syncs`);
+   - or keep the sniffer up longer on the AP channel.
+
+   The BCM fix stays, because Linux sets it.
+
+- **Installed 2026-11-23 14:51** with the owner's OK. Backup of 61F8DB1B: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-145106`. The last build before BCM (B9E6878A) stays at `Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
+
+### 10.93 A/B of `itl_awdlbcm`, boot 2026-11-25 10:40 (core D2CAADD0), AP on ch 44: PSF/MIF retries brought the MacBook back; the trees do not merge
+
+Same boot, same room. The peer is `72:9D:5E:A9:BF:87`, the MacBook of §10.90. Log: `build/ab-1125.txt`; counters: `build/ab-1125-marks.txt`.
+
+| Phase | `bcm` | Δrx | Δweak | non-weak | Δdrx in/up | Δpm us/other | Presence / Absence of the MacBook |
+|---|---|---|---|---|---|---|---|
+| A 10:43:41–10:45:41 | 3 (all) | 346 | 335 | **11** | 1/1 | 0/77 | 0 / 1 (10:45:13) |
+| B 10:45:50–10:47:50 | 2 (data only) | 550 | 333 | **217** | 38/30 | 9/70 | 3 / 3 |
+
+- **Presence returns at once.** The MacBook was posted present at 10:45:51, one second after the switch to `bcm=2`. It then flickers: absent at 46:35, present at 46:53, absent at 47:06, present at 47:09, absent at 47:28.
+- **A is contaminated.** Our AirDrop browse stopped at 10:44:56 ("No AirDrop browse clients present"), halfway through A.
+- **The trees do not merge.**
+  - The far device `B2:33:07:BE:2E:CB` (−76..−79) is `Not Routable` 130–143 times per phase.
+  - `pm` says the peers mostly name another master (`other`), and we stay our own master (`syncs=0`).
+
+**Reading.** The MacBook follows another tree's master. Our windows are on our own timeline, so its frames and ours meet only by chance. The 15 retries of each PSF/MIF without BCM (§10.91) spread every frame over tens of ms and raised that chance. That is why the old behaviour "worked" and the Linux-correct one flickers.
+
+The retries are not the fix. The fix is to be in the same tree: we must take the timeline of the master the MacBook follows, or the MacBook must take ours.
+
+**Next (trace, no change yet):**
+1. Why the Family's election keeps us as master while the MacBook names `other`.
+   - Read the MacBook's election TLV (`itlmt-awdl-peer-el`): which master it names, and with what metric and hop count.
+   - Check whether we hear that master at all, and whether `isPeerQualifiedForElection` rejects it on RSSI or for the "bubble".
+2. Whether our own election TLV, as the peers see it, would let them choose us (metric 529 vs theirs).
+3. Until then `itl_awdlbcm=2` is the setting that keeps the peer. It is a run-time choice, not the default.
+
+### 10.94 Same boot, 11:00–11:03, with an iPhone next to the Mac (AirDrop open): who the peers follow
+
+**The nearby devices follow a far master, not us.**
+- The iPhone (`66:B1:B2:A2:55:32`) and the MacBook (`72:9D:5E:A9:BF:87`) are each posted `Peer Absence` and removed: the iPhone at 11:02:18, the MacBook at 11:02:41. No `Peer Presence` was posted during the capture.
+- `itlmt-awdl-peer-el`: the master they follow is `92:13:b0:fe:5c:8b`. It names itself (hop 0) with:
+  - metric 0x1fe (510);
+  - v2 counter 0x01289f (75935).
+- We hear that master only at −83..−87 dBm on ch 149.
+- Our own election TLV:
+  - metric 529, higher than its 510;
+  - v2 counter 0x1a9 (425), far lower than its 75935.
+- Our Family keeps electing ourselves (`New P:CA:F1:4E:9C:17:EA`, our awdl0 address) every 3.15 s, so we are a one-node tree. The devices next to us live on the other tree's timeline.
+
+**The Family believes awdl0 carries no traffic.**
+- `AWDLStateDump: AWDL on for more than 30 seconds with no TX (1274772 ms) or RX (1274772 ms)`. That is the whole uptime, although `drx`/`dtx` count frames.
+- Meanwhile the schedule stays `Low Power`: `[6 0 149 0 0 0 0 0 6 0 149 0 …]`, which means we are present in 4 of 16 slots.
+
+**Questions for the next round (REA on IO80211Family, no network changes):**
+1. `runElection` / `isPeerQualifiedForElection`:
+   - what decides between a peer's tree and our own (metric, v2 counter, RSSI or "bubble");
+   - why a −85 dBm master is not adopted, when the devices next to us do adopt it.
+2. Which driver report feeds the "no TX / no RX" timestamps. If it is our data path's statistics, the Family may hold a low-power schedule for that reason.
+3. RSSI level check: the MacBook read −45 at "laon" (§10.90) but −54..−77 on later boots. Compare our RCPI decode on the AWDL path with the station path for the same AP.
+
+### 10.95 IO80211Family (25G332) election and link-activity rules; the Family never saw awdl0 traffic → unicast activity reported (native 149441A4, not installed)
+
+Source: disassembly of the IO80211Family fileset entry from this Mac's `BootKernelExtensions.kc` (25G332, original vmaddrs, read-only). REA's decompilers were unavailable, so `objdump` was used with the symbol table.
+
+**Link activity (the "no TX / no RX" of §10.94).**
+- `AWDLStateDump` (0x…222fe28) logs the idle message from `IO80211PeerManager::getLastUnicastTxLinkActivity` / `…RxLinkActivity` (0x…22647da / 0x…2264208). Both return `mach_absolute_time` stamps held in the manager.
+- Writers of the **RX** stamp:
+  - `IO80211PeerManager::skywalkInputPacket`, reached only through `IO80211VirtualInterface::inputPacket`;
+  - `setLastUnicastRxLinkActivity(u64)`.
+- Writers of the **TX** stamp:
+  - `IO80211VirtualInterface::logSkywalkTxReqPacket(…, true)` (vtable 0xb60), which the driver must call;
+  - `setUnicastTxQueueTimestamp()`;
+  - `setLastUnicastTxLinkActivity(u64)`.
+- Nothing inside the Family calls the TX ones.
+- Our AWDL data goes straight through the Skywalk queues, so both stamps stayed at the AWDL enable time.
+- `monitorAWDLState` treats > 2000 ms (mgr+0x9144) without TX and RX as idle. It then:
+  - drops the AirDrop NAN override;
+  - leaves real time with "Transitioning back to InfraAssist mode".
+
+  So during an AirDrop transfer the Family could treat awdl0 as idle.
+
+**Election (`runElection` 0x…21e9064, `runParentElection` 0x…21f12cc).**
+- **TLV 0x18 body:**
+
+  | Offset | Field |
+  |---|---|
+  | +0 | root |
+  | +6 | parent |
+  | +0xc | RLFC (master counter) |
+  | +0x10 | HC |
+  | +0x14 | RMet |
+  | +0x18 | SMet |
+  | +0x1c | election ID (must be equal, 0 by default) |
+  | +0x24 | self counter |
+
+  Ours and the remote's both carry ID 0. The "75935" of §10.94 is the remote's RLFC and self counter; neither is ever compared with ourselves.
+- **Candidate choice:**
+  - between different roots: the higher RMet wins, then the larger root MAC;
+  - against ourselves: our SMet > best RMet means "I am Root Node".
+
+  With 529 against 510, we are the correct root. The nearby peers should adopt us, but only if we qualify at their end.
+- **`isPeerQualifiedForElection` (0x…21efea8):**
+  1. An action frame from the peer within the last **3000 ms**.
+  2. Equal election ID.
+  3. Reachability:
+     - ROUTABLE qualifies;
+     - OBSERVED needs RSSI ≥ −65 (dual-band, 5 GHz) or ≥ −45 (2.4 GHz only);
+     - anything else does not qualify.
+- **`isPeerSafeForElection`:**
+  - version ≥ 0x33;
+  - RLFC ≠ 0;
+  - no loop through us;
+  - AW parameters 16/16/16;
+  - a stale-root blacklist with a 9999 ms grace.
+- **Reachability (`isPeerRoutable`):**
+  - 2.4 GHz only and below −45 dBm: "outside bubble".
+  - OBSERVED → ROUTABLE: ≥ 2 action frames, then either RSSI ≥ −55, or the per-type threshold (−60/−55/−65) held for 1 s.
+  - NO ROUTE → ROUTABLE: ≥ −62.
+- **Peer expiry (`shouldRemovePeerFromNDP`):** a ROUTABLE peer goes after **6000 ms** without action frames. "No Action frames for" is logged past 2000 ms.
+
+**What this explains.**
+- The flicker of §10.92–§10.94 is the 6 s expiry on our side and the 3 s qualification window on theirs.
+- We and the nearby devices run on different timelines, so frames meet only by chance. Our PSF/MIF went out up to 16 times before §10.91, and that raised the chance (§10.93).
+- The proper outcome under these rules is that the nearby devices adopt us. That needs our action frames to reach them at least every 3 s and enough of them to make us ROUTABLE, on the channels and at the times they listen.
+
+**Change (native 149441A4).**
+- Unicast awdl0 data in either direction calls `IO80211PeerManager::setLastUnicastRxLinkActivity` / `setLastUnicastTxLinkActivity(mach_absolute_time())` on the AWDL peer manager (`[[this+0x120]+0x28]`).
+- Both are exported, non-virtual and resolved against this Mac's KC (`tools/check_kext_links.py`).
+- Boot-arg `itlmt_awdl_act=0` turns it off.
+- `itlmt-awdl` gains `act=<rx>/<tx>`.
+
+**Check after install:** during an AirDrop send, `act=` grows, and `AWDL on for more than 30 seconds with no TX … or RX …` no longer appears. The time from ASK to transfer should not get worse.
+
+**Open (the flicker itself):** our presence on the peers' timelines. Find where our PSF/MIF actually go out (channel and time) against the nearby peers' sequences; the next instrument is a per-window TX log. `itl_awdlbcm=2` stays available as a run-time fallback.
+
+- **Installed 2026-11-25 11:23** with the owner's OK. Backup of native 52A0E786: `EFI/OC/Kexts-backup/itlmt7925Native.kext.20261125-112355`. Core stays D2CAADD0.
+- **Undo:** `cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925Native.kext Kexts-backup/itlmt7925Native.kext.bad95 && mv Kexts-backup/itlmt7925Native.kext.20261125-112355 Kexts/itlmt7925Native.kext`

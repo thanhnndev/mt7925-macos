@@ -15,6 +15,66 @@ struct ItlNativeTx { const uint8_t *bytes; uint32_t length; int result; };
 #define ITL_NATIVE_TX "itlmt-native-tx-v1"
 #define ITL_NATIVE_MAC "itlmt-native-mac-v1"
 
+// ITL_NATIVE_AWDL_SYNC, p1 = ItlNativeAwdlSync*: hand one AWDL PSF (sync) frame to the core's link thread. It holds the radio
+// on `channel` (a UNI_ROC window), hands the frame to the firmware, and returns to the infrastructure channel afterwards.
+// The firmware has no AWDL channel sequencing of its own, so this off-channel slot is the driver's half of the AWDL sync
+// (docs/ROADMAP-AWDL.md phase 3). The call only copies the frame into the core's mailbox; it never blocks on the chip.
+struct ItlNativeAwdlSync {
+    uint32_t version;
+    const uint8_t *frame;     // complete 802.11 frame (the Family's sync frame template)
+    uint32_t len;
+    uint8_t channel;          // AWDL channel; 6 is the 2.4 GHz social channel
+    uint32_t dwellMs;         // ROC window that covers the transmission
+    // v2: the AWDL timeline, so the core can stamp the synchronisation parameters TLV (type 4) of the frame with the values
+    // that hold at the moment the frame really leaves (docs/ROADMAP-AWDL.md §10.28). awBaseUs is the host uptime in
+    // microseconds at which availability window number awBaseSeq starts; windows are awPeriodUs long (16 TU = 16384 us).
+    uint64_t awBaseUs;
+    uint16_t awBaseSeq;
+    uint16_t flags;           // bit 0: the TLV's AW sequence number names the *next* window (default: the current one)
+                              // bit 1: scheduled window - the AP's time is in the advertised sequence (§10.62)
+    uint32_t awPeriodUs;
+    // v3 (docs/ROADMAP-AWDL.md §10.29): frames up to ITL_NATIVE_AWDL_FRAME_MAX bytes, and an optional second frame (the master
+    // indication frame) sent right after the first in the same ROC window, its sync TLV stamped the same way. len2 0 = none.
+    const uint8_t *frame2;
+    uint32_t len2;
+    // v4 (docs/ROADMAP-AWDL.md §10.32): frame == nullptr, len == 0 and len2 == 0 is a listen-only window: the radio is parked on
+    // `channel` for dwellMs with the sniffer on, so the interface can sit in a peer's availability window without sending.
+    // v5 (docs/ROADMAP-AWDL.md §10.56): host uptime in microseconds at which the window's AW starts (0 = now). The interface
+    // hands the window over ahead of time; the core starts its setup early enough to be on the channel at startUs and sends
+    // the frames there. A window more than half its dwell late is dropped.
+    uint64_t startUs;
+};
+#define ITL_NATIVE_AWDL_FRAME_MAX 1600
+#define ITL_NATIVE_AWDL_SYNC "itlmt-native-awdl-sync-v1"
+
+// ITL_NATIVE_AWDL_RX, p1 = ItlNativeAwdlRx*: pop one AWDL action frame the radio heard while it was parked on the social
+// channel, so the AWDL interface can hand it to IO80211AWDLPeerManager::actionFrameInput. The firmware has no AWDL receive
+// path: it only delivers ordinary frames, and the driver is the one that knows they belong to the peer manager
+// (docs/ROADMAP-AWDL.md phase 3, receive half). `len` is 0 when the queue is empty.
+// Version 2 (docs/ROADMAP-AWDL.md §10.26) adds the signal and the receive time: the peer manager only creates a peer from a
+// frame whose RSSI is non-zero and at or above its edge threshold. A version-1 caller gets the v1 fields only.
+struct ItlNativeAwdlRx {
+    uint32_t version;         // 1 or 2
+    uint8_t *buf;
+    uint32_t cap;
+    uint32_t len;             // out
+    uint32_t channel;         // out: the social channel the frame was heard on
+    int32_t  rssi;            // out (v2): dBm from the RX vector, 0 when the vector could not be decoded
+    uint32_t rxTimeUs;        // out (v2): host uptime in microseconds when the RX path saw the frame
+};
+#define ITL_NATIVE_AWDL_RX "itlmt-native-awdl-rx-v1"
+// Since §10.33 the same queue also carries AWDL *data* frames (802.11 data, no DS bits, BSSID 00:25:00:ff:94:73, LLC/SNAP
+// 00:17:f2 / 0x0800): the caller tells them apart by the frame control byte.
+
+// ITL_NATIVE_AWDL_DATA_TX, p1 = ItlNativeAwdlDataTx*: queue one complete 802.11 AWDL data frame. The core's link thread sends
+// it inside the next AWDL radio window (docs/ROADMAP-AWDL.md §10.33). kIOReturnNoResources when the queue is full.
+struct ItlNativeAwdlDataTx {
+    uint32_t version;         // 1
+    const uint8_t *frame;
+    uint32_t len;
+};
+#define ITL_NATIVE_AWDL_DATA_TX "itlmt-native-awdl-data-tx-v1"
+
 // ---- scan / join control (all calls come from the interface's work queue; none blocks on the chip) -------------------------
 // Information elements are kept whole-element up to this many bytes (a beacon's own IEs; the rest is cut at an element boundary).
 #define ITL_NATIVE_IE_MAX 512
@@ -56,11 +116,14 @@ struct ItlNativeNets {
 
 // ITL_NATIVE_JOIN, p1 = ItlNativeJoin*: connect to `ssid` with a ready pairwise master key (the supplicant of Apple's design
 // runs in userland; the 4-way handshake still runs in the core). The core wipes its copy; the caller wipes this one.
+// Version 2 adds `open`: an open network (no key, no RSN, no handshake). The native side sends version 2 only for open
+// networks, so a core that knows only version 1 refuses them instead of running a PSK join with a zero key.
 struct ItlNativeJoin {
     uint32_t version;
     uint8_t ssidLen;
     char ssid[33];
     uint8_t pmk[32];
+    uint8_t open;             // version >= 2
 };
 #define ITL_NATIVE_JOIN "itlmt-native-join-v1"
 // ITL_NATIVE_LEAVE, p1 unused: leave the network / abort a join in progress.

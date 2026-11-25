@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <libkern/libkern.h>
+#include <kern/clock.h>
 
 #define ITL_TIMEOUT -110
 #define ITL_EIO     -5
@@ -110,7 +111,7 @@ static bool rxIsFrame(const uint8_t *p, uint32_t len)
 
 // ---------------------------------------------------------------------------------------------
 int itlmt7925::uniSend(uint8_t cid, const void *payload, size_t plen, bool query, uint8_t *evOut, size_t evMax,
-                       uint32_t *evLen, uint32_t timeoutMs)
+                       uint32_t *evLen, uint32_t timeoutMs, bool noWait)
 {
     if (48 + plen > 4096) return ITL_EINVAL;
     uint8_t seq = ++mcuSeq & 0xf;
@@ -132,6 +133,9 @@ int itlmt7925::uniSend(uint8_t cid, const void *payload, size_t plen, bool query
 
     if (evLen) *evLen = 0;
     if (!txKick(txWm, total)) return ITL_TIMEOUT;
+    // Fire-and-forget, as Linux mt7925 sends UNI_ROC acquire / abort (wait_resp = false): the reply is consumed later by
+    // whichever wait loop sees it, and m3Event() acts on the ROC events by tag and token (§10.59).
+    if (noWait) return 0;
 
     itl_ring &r = rxEvt;
     for (uint32_t us = 0; us < timeoutMs * 1000; us += 50) {
@@ -164,9 +168,111 @@ int itlmt7925::uniSend(uint8_t cid, const void *payload, size_t plen, bool query
 // ---------------------------------------------------------------------------------------------
 // Beacon / probe response parsing
 // ---------------------------------------------------------------------------------------------
+// Where the 802.11 frame starts inside an RX buffer. The firmware prepends 32 bytes of RXD and then, depending on the flags
+// in RXD1/RXD2, the optional groups: GROUP_4 (fc/seq), GROUP_1 (IV), GROUP_2 (timestamp), GROUP_3 (P-RXV) each 16 bytes,
+// GROUP_5 (C-RXV, only with GROUP_3) another 24, plus RXD2.HDR_OFFSET (mt76_connac2_mac.h MT_RXD1_NORMAL_GROUP_*, and
+// mt7925_mac_fill_rx(), which pulls exactly these). In station mode the firmware sends frames without any group, which is why
+// a fixed offset of 32 was right for the data and beacon paths - but with the sniffer on, GROUP_4 shows up and a fixed 32
+// lands on the group instead of the frame (docs/ROADMAP-AWDL.md §10.19).
+static uint32_t rxHdrOff(const uint8_t *p, uint32_t len)
+{
+    if (len < 32) return len;
+    uint32_t rxd1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+    uint32_t rxd2 = (uint32_t)p[8] | ((uint32_t)p[9] << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
+    uint32_t off = 32;
+    if (rxd1 & (1u << 14)) off += 16;                       // GROUP_4
+    if (rxd1 & (1u << 11)) off += 16;                       // GROUP_1
+    if (rxd1 & (1u << 12)) off += 16;                       // GROUP_2
+    if (rxd1 & (1u << 13)) {                                // GROUP_3
+        off += 16;
+        if (rxd1 & (1u << 15)) off += 24;                   // GROUP_5 (C-RXV)
+    }
+    off += 2 * ((rxd2 >> 14) & 3);                          // HDR_OFFSET, in 2-byte units (mt7925_mac_fill_rx: hdr_gap =
+                                                            // rxd - skb->data + 2 * remove_pad)
+    return off <= len ? off : 32;
+}
+
+// Searches a buffer for a byte pattern. Used by the AWDL RX forensics: the question "is there an AWDL frame in this buffer, and
+// where" has to be answered by the content, not by a computed offset (docs/ROADMAP-AWDL.md §10.22).
+static bool rxFind(const uint8_t *p, uint32_t len, const uint8_t *pat, uint32_t n, uint32_t *off)
+{
+    if (!p || len < n) return false;
+    for (uint32_t i = 0; i + n <= len; i++) {
+        if (memcmp(p + i, pat, n) == 0) { if (off) *off = i; return true; }
+    }
+    return false;
+}
+
 void itlmt7925::rxParseFrame(const uint8_t *p, uint32_t len)
 {
+    if (awdlRocActive) {                                     // diagnostics for the AWDL receive half (docs §10.13)
+        awdlRocFrames++;
+        if (p[13] == awdlRocCh) awdlRocOnCh++;               // RXD3 CH_FREQ says the radio really was on the parked channel
+        if (awdlRxDumped < 6 && (awdlRocFrames <= 3 || (awdlRocFrames % 100) == 1)) {   // periodic, so the last one survives in the m3-log ring
+            uint32_t o = rxHdrOff(p, len);
+            if (o + 12 <= len) {
+                awdlRxDumped++;
+                m3log("awdl rx hdr off=%u rxd=%08x %08x %08x %08x | %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x (roc=%u)",
+                      o, le32(p), le32(p + 4), le32(p + 8), le32(p + 12),
+                      p[o], p[o + 1], p[o + 2], p[o + 3], p[o + 4], p[o + 5], p[o + 6], p[o + 7],
+                      p[o + 8], p[o + 9], p[o + 10], p[o + 11], awdlRocFrames);
+            }
+        }
+        // What the firmware actually hands the host inside a ROC window, by frame class. The question this answers is not
+        // "did we hear an AWDL frame" but "does this firmware forward management frames from other devices at all" - if the
+        // histogram is beacons and data only, no amount of AWDL work will ever see a peer.
+        uint32_t hdr = rxHdrOff(p, len);
+        uint8_t fcSeen = 0;
+        bool haveFc = false;
+        for (uint32_t off = hdr; off + 24 <= len && off < hdr + 8; off++) {
+            uint8_t fc = p[off];
+            if ((fc & 0x3) != 0 || p[off + 1] != 0) continue;            // protocol version 0, duration 0
+            const uint8_t *a2 = p + off + 10;
+            if ((a2[0] & 1) || !(a2[0] | a2[1] | a2[2] | a2[3] | a2[4] | a2[5])) continue;
+            fcSeen = fc; haveFc = true;
+            break;
+        }
+        if (haveFc && fcSeen == 0x80) { awdlBcn++; awdlRxFc[0]++; }
+        else if (haveFc && ((fcSeen & 0xf0) == 0x40 || (fcSeen & 0xf0) == 0x50)) awdlRxFc[1]++;
+        else if (haveFc && (fcSeen & 0x0c) == 0) awdlRxFc[fcSeen == 0xd0 ? 2 : 3]++;
+        else awdlRxFc[4]++;
+
+        // Forensics: does the buffer the firmware handed us contain an AWDL frame at all? The classifier above can only say
+        // "some frame with fc 0xd0 arrived", which a false positive in a data payload also satisfies. These three patterns are
+        // unambiguous: Apple's OUI (00:17:f2) anywhere, the AWDL action header (7f 00 17 f2 08) and AWDL's BSSID
+        // (00:25:00:ff:94:73). If the OUI shows up but the header does not, the frame is there and the offset is wrong; if
+        // neither shows up, the firmware is not delivering AWDL frames on this interface at all.
+        {
+            static const uint8_t kOui[3] = { 0x00, 0x17, 0xf2 };
+            static const uint8_t kSig[5] = { 0x7f, 0x00, 0x17, 0xf2, 0x08 };
+            static const uint8_t kBss[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+            uint32_t oOui = 0, oSig = 0, oBss = 0;
+            bool hOui = rxFind(p, len, kOui, sizeof(kOui), &oOui);
+            bool hSig = rxFind(p, len, kSig, sizeof(kSig), &oSig);
+            bool hBss = rxFind(p, len, kBss, sizeof(kBss), &oBss);
+            if (hOui) awdlOuiHits++;
+            if (hSig) awdlSigHits++;
+            if (hBss) awdlBssidHits++;
+            if ((awdlForensics < 4 || (awdlRocFrames % 250) == 1) && (hOui || hSig || hBss || awdlForensics < 4)) {
+                awdlForensics++;
+                m3log("awdl rx fx len=%u hdr=%u oui=%u@%u sig=%u@%u bss=%u@%u", len, hdr, hOui ? 1 : 0, oOui,
+                      hSig ? 1 : 0, oSig, hBss ? 1 : 0, oBss);
+                char h1[3 * 24 + 1];
+                uint32_t n1 = len - hdr; if (n1 > 24) n1 = 24;
+                for (uint32_t i = 0; i < n1; i++) snprintf(h1 + i * 3, 4, "%02x ", p[hdr + i]);
+                h1[n1 ? n1 * 3 - 1 : 0] = 0;
+                m3log("awdl fx hdr@%u: %s", hdr, h1);
+                if (hSig && oSig + 32 <= len) {
+                    char h2[3 * 32 + 1];
+                    for (uint32_t i = 0; i < 32; i++) snprintf(h2 + i * 3, 4, "%02x ", p[oSig + i]);
+                    h2[32 * 3 - 1] = 0;
+                    m3log("awdl fx sig@%u: %s", oSig, h2);
+                }
+            }
+        }
+    }
     if (txPool && len >= 8 && (le32(p) >> 27) == 6) { m3TxFree(p, len); return; }           // TXRX_NOTIFY: buffers the firmware is done with
+    if (len >= 40 && (le32(p) >> 27) == 0) { m3Txs(p, len); return; }                        // TXS: was our frame ACKed
     if (m3dataOn && m3RxData(p, len)) return;
     if (m3dataOn && lvl >= 1 && m3RxCtl(p, len)) return;                                     // Block Ack action frame / BlockAckReq
     if (m3wantFc && m3RxMgmt(p, len)) return;
@@ -190,6 +296,9 @@ void itlmt7925::rxParseFrame(const uint8_t *p, uint32_t len)
     }
     // 802.11 mgmt header (24) + beacon fixed fields (12) + at least one IE; the frame sits after the RXD groups,
     // so look for "FC=beacon/probe-resp, addr2 == addr3" instead of decoding the group flags.
+    // The scan path must keep the plain station-mode offset: this is the live link's scan/associate path and a frame that
+    // is missed here costs the association (docs/ROADMAP-AWDL.md §10.20). Only the AWDL probes use rxHdrOff().
+    if (awdlRocActive && awdlRxData(p, len)) return;
     if (len < 32 + 36 + 2) return;
     uint32_t chfreq = p[13];                           // RXD3 CH_FREQ
     for (uint32_t off = 32; off + 36 + 2 <= len && off < 160; off++) {
@@ -219,8 +328,147 @@ void itlmt7925::rxParseFrame(const uint8_t *p, uint32_t len)
         apSeen(p, len, off, ssid, ch);
         return;
     }
+    // Phase 3 RX probe (docs/ROADMAP-AWDL.md): management Action frames heard during the ROC window on the social channel.
+    // An AWDL action frame is 24-byte header + the awdl_action prefix: category 0x7f, Apple OUI 00:17:f2, type 8, version 1.0,
+    // subtype 0 (PSF) / 3 (MIF), then TLVs (OWL src/frame.h, and the Family's parser checks the same 0x17/0xf2/8). The header
+    // is validated first because data frames contain 0xd0 too.
+    // The frame is searched for by signature rather than by a computed offset: the sniffer buffer's layout (groups, padding)
+    // is not yet pinned down, and a wrong offset silently discards every real AWDL frame. A match requires the full AWDL
+    // signature, so group words and data frames cannot masquerade as action frames. The whole buffer is scanned, not just the
+    // first 160 bytes: the sniffer adds RXD groups and the frame can sit behind them (docs/ROADMAP-AWDL.md §10.22).
+    for (uint32_t off = 32; off + 40 <= len; off++) {
+        if (p[off] != 0xd0 || p[off + 1] != 0) continue;
+        const uint8_t *a1 = p + off + 4, *a2 = p + off + 10, *a3 = p + off + 16;
+        if ((a1[0] & 1) && (a1[0] & a1[1] & a1[2] & a1[3] & a1[4] & a1[5]) != 0xff) continue;
+        if ((a2[0] & 1) || !(a2[0] | a2[1] | a2[2] | a2[3] | a2[4] | a2[5])) continue;
+        if ((a3[0] & 1) || !(a3[0] | a3[1] | a3[2] | a3[3] | a3[4] | a3[5])) continue;
+        if (p[off + 2] != 0 || p[off + 3] != 0) continue;
+        bool awdlAf = p[off + 24] == 0x7f && p[off + 25] == 0x00 && p[off + 26] == 0x17 && p[off + 27] == 0xf2 &&
+                      p[off + 28] == 0x08;
+        if (!awdlAf) {
+            // A vendor-specific action frame that is not AWDL's: dump it, so a near miss can be recognised (a Block Ack request
+            // from the AP, a vendor frame of the infra BSS, or an AWDL frame whose header is not where we think it is).
+            awdlNearMiss++;
+            if (awdlNearMiss <= 6) {
+                char hex[3 * 40 + 1];
+                uint32_t n = len - off; if (n > 40) n = 40;
+                for (uint32_t i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", p[off + i]);
+                hex[n ? n * 3 - 1 : 0] = 0;
+                m3log("awdl af near miss off=%u sa=%02x%02x%02x%02x%02x%02x %s", off, a2[0], a2[1], a2[2], a2[3], a2[4],
+                      a2[5], hex);
+            }
+            continue;
+        }
+        awdlAfSeen++;
+        awdlAfBand[awdlRocCh > 14]++;
+        awdlPeerHeard(a2);                                   // the peer is on this channel in this window
+        // The peer manager needs the signal: it creates a peer only from a frame whose RSSI is non-zero and at or above its
+        // edge threshold (docs/ROADMAP-AWDL.md §10.26). Same RX-vector decoder as the beacons; 0 when the layout is not known.
+        int8_t afRssi = rxRssi(p, len, off);
+        if ((awdlAfSeen % 40) == 1) {           // §10.86: what the RX vector said for this peer's frame (ring of 8)
+            static const uint32_t kN = 8, kW = 78;
+            uint32_t slot = awdlRssiRawN++ % kN;
+            char e[kW + 1];
+            snprintf(e, sizeof(e), "%02x%02x%02x%02x%02x%02x c%u d1=%08x o%u v3=%08x r%d;", a2[0], a2[1], a2[2], a2[3], a2[4],
+                     a2[5], (unsigned)awdlRocCh, le32(p + 4), off, lastRxv, (int)afRssi);
+            size_t el = strlen(e);
+            memset(awdlRssiRaw + slot * kW, ' ', kW);
+            memcpy(awdlRssiRaw + slot * kW, e, el < kW ? el : kW);
+            awdlRssiRaw[kN * kW] = 0;
+            for (uint32_t i = 0; i < kN * kW; i++) if (!awdlRssiRaw[i]) awdlRssiRaw[i] = ' ';
+            setProperty("awdl-rssi-raw", awdlRssiRaw);
+        }
+        {                                    // queued for the peer manager (the AWDL interface drains this ring)
+            uint32_t head = awdlRxHead;
+            if ((head - __atomic_load_n(&awdlRxTail, __ATOMIC_ACQUIRE)) >= kAwdlRxSlots) awdlRxRingFull++;
+            else {
+                AwdlRxSlot &s = awdlRxRing[head % kAwdlRxSlots];
+                uint32_t n = len - off; if (n > sizeof(s.data)) n = sizeof(s.data);
+                memcpy(s.data, p + off, n);
+                s.len = n;
+                s.ch = awdlRocCh;                          // the channel the frame was heard on
+                s.rssi = afRssi;
+                {
+                    uint64_t t = 0, ns = 0;
+                    clock_get_uptime(&t);
+                    absolutetime_to_nanoseconds(t, &ns);
+                    s.tUs = (uint32_t)(ns / 1000);
+                }
+                __atomic_store_n(&awdlRxHead, head + 1, __ATOMIC_RELEASE);
+            }
+        }
+        if (awdlAfDumped < 10) {
+            awdlAfDumped++;
+            char hex[3 * 48 + 1];
+            uint32_t n = len - off; if (n > 48) n = 48;
+            for (uint32_t i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", p[off + i]);
+            hex[n ? n * 3 - 1 : 0] = 0;
+            // d1 (RXD1: the group bits) and the header offset tell whether rxRssi() found the RX vector in this layout.
+            m3log("awdl af rx len=%u awdl=1 ch=%u cat=%02x type=%02x sub=%02x sa=%02x%02x%02x%02x%02x%02x rssi=%d d1=%08x "
+                  "off=%u %s",
+                  len - off, awdlRocCh, p[off + 24], p[off + 28], p[off + 30],
+                  a2[0], a2[1], a2[2], a2[3], a2[4], a2[5], (int)afRssi, le32(p + 4), off, hex);
+        }
+        return;
+    }
     rxOther++;
     if (m3dataOn) szOther[szClass(len > 120 ? len - 120 : 0)]++;
+}
+
+// AWDL data frames (docs/ROADMAP-AWDL.md §10.33): 802.11 data / QoS data with neither DS bit, addr3 = AWDL's BSSID
+// 00:25:00:ff:94:73, then LLC/SNAP aa aa 03 + Apple's OUI 00:17:f2 + protocol 0x0800 and AWDL's 8-byte data header (03 04,
+// sequence, 2 pad bytes, ethertype). Queued whole for the AWDL interface, which turns it into an Ethernet frame.
+bool itlmt7925::awdlRxData(const uint8_t *p, uint32_t len)
+{
+    static const uint8_t kBss[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+    static const uint8_t kSnap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00 };
+    // The 802.11 header is found by its AWDL BSSID (addr3), not at rxHdrOff(): with the sniffer on, the buffer carries RX
+    // vector groups that rxHdrOff() does not account for, and the header sits ~130 bytes later (the action-frame path saw
+    // hdr=52 but the frame at 184). Looking only at rxHdrOff() + 0..7 is why no AWDL data frame was ever received (§10.36).
+    uint32_t hdr = rxHdrOff(p, len);
+    for (uint32_t off = 32; off + 24 + 8 + 8 <= len; off++) {
+        if (p[off + 16] != 0x00 || memcmp(p + off + 16, kBss, 6) != 0) continue;
+        uint8_t fc0 = p[off], fc1 = p[off + 1];
+        if ((fc0 & 0x0c) != 0x08 || (fc0 & 0x03) || (fc1 & 0x03)) {              // data, version 0, no DS bits
+            if ((fc0 & 0x0c) == 0x08) awdlDataRxHdr[2]++;
+            continue;
+        }
+        if (fc0 & 0x40) return true;                                         // null data: no payload, nothing for the stack
+        uint32_t hl = (fc0 & 0x80) ? 26 : 24;
+        if ((fc0 & 0x80) && (fc1 & 0x80)) hl += 4;                           // QoS +HTC
+        if (off + hl + 16 > len || memcmp(p + off + hl, kSnap, 8) != 0) continue;
+        awdlDataRxHdr[off == hdr ? 0 : 1]++;
+        // The destination is checked by the AWDL interface, which knows its own address.
+        awdlDataRx++;
+        if (!(p[off + 10] & 1)) awdlPeerHeard(p + off + 10);
+        if (!(p[off + 4] & 1)) {
+            awdlDataRxUc++;
+            if (memcmp(p + off + 4, awdlOwnAddr, 6) == 0) awdlDataRxUcMine++;
+            if (awdlDataRxUc <= 4)
+                m3log("awdl data rx uc len=%u ch=%u da=%02x%02x%02x%02x%02x%02x sa=%02x%02x%02x%02x%02x%02x", len - off, awdlRocCh,
+                      p[off + 4], p[off + 5], p[off + 6], p[off + 7], p[off + 8], p[off + 9], p[off + 10], p[off + 11],
+                      p[off + 12], p[off + 13], p[off + 14], p[off + 15]);
+        }
+        uint32_t head = awdlRxHead;
+        if ((head - __atomic_load_n(&awdlRxTail, __ATOMIC_ACQUIRE)) >= kAwdlRxSlots) { awdlRxRingFull++; return true; }
+        AwdlRxSlot &s = awdlRxRing[head % kAwdlRxSlots];
+        uint32_t n = len - off; if (n > sizeof(s.data)) n = sizeof(s.data);
+        memcpy(s.data, p + off, n);
+        s.len = n;
+        s.ch = awdlRocCh;
+        s.rssi = rxRssi(p, len, off);
+        uint64_t t = 0, ns = 0;
+        clock_get_uptime(&t);
+        absolutetime_to_nanoseconds(t, &ns);
+        s.tUs = (uint32_t)(ns / 1000);
+        __atomic_store_n(&awdlRxHead, head + 1, __ATOMIC_RELEASE);
+        if (awdlDataRx <= 6)
+            m3log("awdl data rx len=%u ch=%u fc=%02x%02x da=%02x%02x%02x%02x%02x%02x sa=%02x%02x%02x%02x%02x%02x et=%02x%02x",
+                  n, awdlRocCh, fc0, fc1, p[off + 4], p[off + 5], p[off + 6], p[off + 7], p[off + 8], p[off + 9], p[off + 10],
+                  p[off + 11], p[off + 12], p[off + 13], p[off + 14], p[off + 15], p[off + hl + 14], p[off + hl + 15]);
+        return true;
+    }
+    return false;
 }
 
 void itlmt7925::rxFrameDump(const uint8_t *p, uint32_t len)

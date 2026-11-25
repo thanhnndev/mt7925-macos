@@ -101,12 +101,16 @@ private:
     CCStream *dataStream = nullptr;         // a CCDataStream (options type 1)
     bool faultPipeStarted = false;          // ditto for the fault pipe; without it the first fault flush panics corecapture
     CCFaultReporter *ccFault = nullptr;
+    IOWorkLoop *faultLoop = nullptr;        // §10.82: the reporter's own idle loop (its timer event source lives there)
     IO80211FaultReporter *fault = nullptr;
     itlmt7925WifiInterface *iface = nullptr;
 };
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(itlmt7925Wifi, IO80211Controller)
+
+// §10.83: the ABI gate's verdict, kept for start() to publish (the core service is not registered yet at module start).
+static char gItlAbiText[600] = "not run";
 
 namespace {
 
@@ -209,8 +213,18 @@ bool itlmt7925Wifi::makeFaultReporter(IOService *owner)
             itlmtTrace(this, "ctl:faultPipe=%u", (unsigned)(faultPipeStarted ? 1 : 0));
             if (!faultPipeStarted) IOLog(LOGT "fault pipe start failed (fault flushes will panic)\n");
         }
+        // §10.82: CCFaultReporter::initWithStreamWorkloop adds an IOTimerEventSource (spinDeferredCapture) to the loop it is
+        // given. On our IO80211 work queue - the busy loop that serves RX, AWDL timers and every Family command - that event
+        // source ran with each of its wakes (the 890M session's thermal trace: CCFaultReporter ~600 wakes/s). It only needs a
+        // loop for that timer, so it gets its own idle one. Boot-arg itlmt_native_faultwq=1: the shared queue as before.
+        uint32_t shared = 0;
+        PE_parse_boot_argn("itlmt_native_faultwq", &shared, sizeof(shared));
+        if (!shared) faultLoop = IOWorkLoop::workLoop();
+        IOWorkLoop *fl = faultLoop ? faultLoop : (IOWorkLoop *)wq;
+        itlmtTrace(this, "ctl:faultLoop=%s", faultLoop ? "own" : "wq");
+        setProperty("itlmt-native-faultloop", faultLoop ? "own" : "wq");   // §10.83: a fixed property; the trace ring rolls over
         if (dataStream)
-            ccFault = CCFaultReporter::withStreamWorkloop((CCDataStream *)dataStream, (IOWorkLoop *)wq);
+            ccFault = CCFaultReporter::withStreamWorkloop((CCDataStream *)dataStream, fl);
         if (ccFault)
             fault = IO80211FaultReporter::allocWithParams(ccFault);
         ok = fault != nullptr;
@@ -229,6 +243,9 @@ bool itlmt7925Wifi::start(IOService *provider)
     }
     itlmtCallInit();
     itlmtTrace(this, "ctl:start");
+    // §10.83: publish the ABI verdict here, on this controller and on the core (provider); _realmain runs too early for a lookup.
+    setProperty("itlmt-native-abi", gItlAbiText);
+    if (provider) provider->setProperty("itlmt-native-abi", gItlAbiText);
     itlmtTrace(this, "ctl:createWorkQueue begin");
     if (!createWorkQueue()) {
         IOLog(LOGT "no work queue\n");
@@ -550,6 +567,7 @@ void itlmt7925Wifi::free()
     dropInterface();
     rel(fault);       fault = nullptr;
     rel(ccFault);     ccFault = nullptr;
+    rel(faultLoop);   faultLoop = nullptr;    // after the reporter whose timer it holds
     rel(dataStream);  dataStream = nullptr;
     rel(dataPipe);    dataPipe = nullptr;
     rel(logStream);   logStream = nullptr;
@@ -645,10 +663,26 @@ static bool commandAllowed(int cmd)
     // round 27: NSS is polled about once a second while linked and was refused until the handler existed (512 refusals in one
     // 10-minute boot); getNSS answers with the core's negotiated stream count
     case 0x161:
+    // AWDL §10.29: HT_CAPABILITY (getHT_CAPABILITY, slot 481 of the infrastructure interface). configureValidAWDLChannels and
+    // the AWDL HT/VHT capability TLVs read it; refused here it came back as ret 58 and the peer manager logged invalid HT caps
+    case 0x9a:
         return true;
     // AWDL phase 2: VIRTUAL_IF_CREATE is let through only with the AWDL front end enabled (boot-arg itlmt_awdl=1); with the
     // boot-arg absent the ioctl stays refused exactly as before
     case 0x5e:
+        return itlmtAwdlEnabled();
+    // AWDL phase 3: the Family drives the whole AWDL protocol through these ioctls (apple80211{get,set}AWDL_*, LLW_PARAMS,
+    // COMPANION_SKYWALK_IF_CREATE, OS_ELIGIBILITY). The numbers are the indices of the Family's route tables
+    // (0xffffff800247cea0 get / 0xffffff800247e0f0 set, 25G241) plus one; every name below has a handler in one of them.
+    // Refusing them is what the AWDL peer manager reports as "unable to get AWDL channel sequence ret=58" - 0x3a is
+    // kProhibited, i.e. this gate - and it means the ioctl never reaches the interface's IO80211AWDLProtocol slots.
+    case 0x74: case 0x75: case 0x76: case 0x77: case 0x78: case 0x7a: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+    case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87: case 0x88: case 0x8a:
+    case 0x8b: case 0x8f: case 0x94: case 0x95: case 0x97: case 0x9b: case 0x9e: case 0xa2: case 0xa3: case 0xa4:
+    case 0xa7: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xd0: case 0xd5: case 0xd9: case 0xdb:
+    case 0xdc: case 0xdf: case 0xe0: case 0xe1: case 0xe2: case 0xe5: case 0xe9: case 0xf4: case 0xf6: case 0xf7:
+    case 0xf9: case 0xfd: case 0x106: case 0x107: case 0x125: case 0x152: case 0x155: case 0x156: case 0x157: case 0x158:
+    case 0x15f: case 0x172: case 0x1a0: case 0x1a1: case 0x1b0: case 0x1d3: case 0x23f:
         return itlmtAwdlEnabled();
     default:
         return false;
@@ -723,7 +757,10 @@ IOReturn itlmt7925Wifi::getHARDWARE_VERSION(IO80211SkywalkInterface *, apple8021
 // function reports without consulting chip state: (a) the stores of constants at +4/+5/+6/+9/+0xc/+0xd, (b) the two unconditional
 // ORs (+7 |= 4, +0xa |= 4), (c) the two bits it sets when BCM firmware feature flags 1 and 7 are *absent* (+6 |= 0x10|0x02, +9 |= 1),
 // which is literally true here because there is no BCM feature table. Every bit that Apple derives from a firmware feature flag,
-// chip revision or radio state (about 100 bits) stays clear: we claim nothing we cannot back.
+// chip revision or radio state (about 100 bits) stays clear: we claim nothing we cannot back - with one exception the hardware
+// backs: +7 bit 5 (capability 29). Apple sets it from BCM feature flag 0x1c, and the Family reads it back as "dual band"
+// (IO80211AWDLPeerManager::configureValidAWDLChannels tests controller ivars +0xb37 & 0x20, the loaded capability array, and
+// otherwise logs "Dual band not supported" and zeroes every 5 GHz AWDL channel). The MT7925 is a 2.4/5/6 GHz radio.
 IOReturn itlmt7925Wifi::getCARD_CAPABILITIES(IO80211SkywalkInterface *, apple80211_capability_data *data)
 {
     itlmtCall(this, 'C', 0x0c);
@@ -735,7 +772,13 @@ IOReturn itlmt7925Wifi::getCARD_CAPABILITIES(IO80211SkywalkInterface *, apple802
     d[0x04] = 0x6f;                             // word 0xe66f at +4
     d[0x05] = 0xe6;
     d[0x06] = 0x61 | 0x10 | 0x02;               // constant 0x61, + flags 1 and 7 absent
-    d[0x07] = 0x04;                             // unconditional OR
+    d[0x07] = 0x04 | 0x20;                      // unconditional OR; 0x20: dual band (below)
+    // Capability 32 (userland array byte 4 bit 0 = d[0x08] bit 0): AWDL. Userland gets the array without the version word
+    // (RawGet 0xc returns d[4..]), and wifip2pd's interface create tests exactly this bit for "AWDL" (byte 9 bit 0 for "NAN")
+    // before it ever sends VIRTUAL_IF_CREATE: with it clear it logged "Cannot create AWDL interface because the device is
+    // missing the capability" on every boot and awdl0 had to be created by hand (docs/ROADMAP-AWDL.md §10.45). This driver
+    // implements the AWDL interface, so the bit is backed. NAN stays clear.
+    d[0x08] = 0x01;
     d[0x09] = 0x40 | 0x01;                      // constant 0x40, + flag 1 absent
     d[0x0a] = 0x04;                             // unconditional OR
     d[0x0c] = 0x01;                             // word 0x0201 at +0xc
@@ -814,4 +857,78 @@ IOReturn itlmt7925Wifi::newUserClient(task_t task, void *securityID, UInt32 type
     IOReturn r = super::newUserClient(task, securityID, type, properties, handler);
     itlmtCall(this, 'u', (type << 16) | ((uint32_t)r & 0xffff));
     return r;
+}
+
+// ---------------------------------------------------------------------------------------------
+// ABI gate (docs/ROADMAP-AWDL.md §10.81). The IO80211 / Skywalk class layouts in ../itlmt7925/io80211/*.h were generated from
+// 25G241 and are checked only by static_asserts at build time. Every class of this kext derives from them, so a later macOS 26
+// build whose Family changed a layout would be wrong from the first constructor on. This runs as the module's _realmain:
+// after libkmodc++ registered our metaclasses (the Family is linked by then) and before IOKit can create any object of this
+// kext. A mismatch logs, publishes `itlmt-native-abi` on the core and fails the load: no native Wi-Fi, no panic.
+// Boot-arg itlmt_native_abiforce=1 loads anyway (debugging only).
+// ---------------------------------------------------------------------------------------------
+#include "../itlmt7925/io80211/IO80211InfraInterface.h"
+#include "../itlmt7925/io80211/IO80211VirtualInterface.h"
+#include "../itlmt7925/io80211/IO80211AWDLProtocol.h"
+#include "../itlmt7925/io80211/IO80211SkywalkInterface.h"
+#include "../itlmt7925/io80211/IOSkywalkNetworkInterface.h"
+#include "../itlmt7925/io80211/IOSkywalkInterface.h"
+#include "../itlmt7925/io80211/IO80211CommandGate.h"
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
+#include <libkern/c++/OSString.h>
+#include <IOKit/IOService.h>
+#include <mach/kmod.h>
+
+namespace {
+struct AbiClass { const char *name; uint32_t built; };
+const AbiClass kAbiClasses[] = {
+    { "IO80211Controller",         (uint32_t)sizeof(IO80211Controller) },
+    { "IO80211SkywalkInterface",   (uint32_t)sizeof(IO80211SkywalkInterface) },
+    { "IO80211InfraInterface",     (uint32_t)sizeof(IO80211InfraInterface) },
+    { "IO80211InfraProtocol",      (uint32_t)sizeof(IO80211InfraProtocol) },
+    { "IO80211VirtualInterface",   (uint32_t)sizeof(IO80211VirtualInterface) },
+    { "IO80211AWDLProtocol",       (uint32_t)sizeof(IO80211AWDLProtocol) },
+    { "IOSkywalkNetworkInterface", (uint32_t)sizeof(IOSkywalkNetworkInterface) },
+    { "IOSkywalkInterface",        (uint32_t)sizeof(IOSkywalkInterface) },
+    { "IO80211WorkQueue",          (uint32_t)sizeof(IO80211WorkQueue) },
+    { "IO80211CommandGate",        (uint32_t)sizeof(IO80211CommandGate) },
+};
+
+void abiPublish(const char *text)
+{
+    IOService *core = IOService::copyMatchingService(IOService::serviceMatching("itlmt7925"));
+    if (!core) return;
+    OSString *s = OSString::withCString(text);
+    if (s) { core->setProperty("itlmt-native-abi", s); s->release(); }
+    core->release();
+}
+}
+
+extern "C" kern_return_t itlNativeAbiGate(kmod_info_t *, void *)
+{
+    char out[512];
+    size_t used = 0;
+    int bad = 0;
+    out[0] = 0;
+    for (const AbiClass &c : kAbiClasses) {
+        const OSSymbol *sym = OSSymbol::withCStringNoCopy(c.name);
+        const OSMetaClass *m = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+        if (sym) sym->release();
+        uint32_t real = m ? (uint32_t)m->getClassSize() : 0;
+        if (real != c.built) {
+            bad++;
+            if (used < sizeof(out))
+                used += (size_t)snprintf(out + used, sizeof(out) - used, "%s%s=%#x/%#x", bad > 1 ? " " : "", c.name, real, c.built);
+        }
+    }
+    uint32_t force = 0;
+    PE_parse_boot_argn("itlmt_native_abiforce", &force, sizeof(force));
+    char text[600];
+    if (!bad) snprintf(text, sizeof(text), "ok: %u classes match the 25G241 layouts", (unsigned)(sizeof(kAbiClasses) / sizeof(kAbiClasses[0])));
+    else snprintf(text, sizeof(text), "MISMATCH (running/built): %s%s", out, force ? " - loaded anyway (itlmt_native_abiforce)" : " - native Wi-Fi not loaded");
+    IOLog("itlmt7925Native: abi %s\n", text);
+    strlcpy(gItlAbiText, text, sizeof(gItlAbiText));
+    abiPublish(text);
+    return (bad && !force) ? KERN_FAILURE : KERN_SUCCESS;
 }

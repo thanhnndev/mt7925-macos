@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" width="880" height="300" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <title>MT7925 on macOS: the Wi-Fi half on PCIe and the Bluetooth half on USB, each with its kexts</title>
+  <rect width="880" height="300" rx="16" fill="#0f172a"/>
+  <text x="32" y="44" fill="#f8fafc" font-size="22" font-weight="600">MediaTek MT7925 on macOS 26 Tahoe</text>
+  <text x="32" y="68" fill="#94a3b8" font-size="14">One card, two devices. Tested on one ASUS ROG Zephyrus G14 GA403WM.</text>
+
+  <!-- Wi-Fi row -->
+  <rect x="32" y="96" width="190" height="72" rx="10" fill="#1e293b" stroke="#38bdf8"/>
+  <text x="127" y="126" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">Wi-Fi 7 (PCIe)</text>
+  <text x="127" y="148" fill="#94a3b8" font-size="13" text-anchor="middle">14c3:7925</text>
+  <rect x="262" y="96" width="330" height="72" rx="10" fill="#1e293b" stroke="#38bdf8"/>
+  <text x="427" y="126" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">itlmt7925 + itlmt7925Native</text>
+  <text x="427" y="148" fill="#94a3b8" font-size="13" text-anchor="middle">firmware, 802.11, WPA2 / IO80211 + Skywalk</text>
+  <rect x="632" y="96" width="216" height="72" rx="10" fill="#0c4a6e" stroke="#38bdf8"/>
+  <text x="740" y="126" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">Wi-Fi menu</text>
+  <text x="740" y="148" fill="#bae6fd" font-size="13" text-anchor="middle">works (v2.0-beta.1)</text>
+  <path d="M222 132 H258 M592 132 H628" stroke="#38bdf8" stroke-width="2"/>
+
+  <!-- Bluetooth row -->
+  <rect x="32" y="196" width="190" height="72" rx="10" fill="#1e293b" stroke="#a78bfa"/>
+  <text x="127" y="226" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">Bluetooth (USB)</text>
+  <text x="127" y="248" fill="#94a3b8" font-size="13" text-anchor="middle">0489:e11e</text>
+  <rect x="262" y="196" width="330" height="72" rx="10" fill="#1e293b" stroke="#a78bfa"/>
+  <text x="427" y="226" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">MtkBtFw + BtLeDlFix</text>
+  <text x="427" y="248" fill="#94a3b8" font-size="13" text-anchor="middle">firmware load / bluetoothd LE patch (Lilu)</text>
+  <rect x="632" y="196" width="216" height="72" rx="10" fill="#3b0764" stroke="#a78bfa"/>
+  <text x="740" y="226" fill="#f8fafc" font-size="15" text-anchor="middle" font-weight="600">Bluetooth</text>
+  <text x="740" y="248" fill="#ddd6fe" font-size="13" text-anchor="middle">works (bt-v1.1)</text>
+  <path d="M222 232 H258 M592 232 H628" stroke="#a78bfa" stroke-width="2"/>
+</svg>

@@ -64,6 +64,46 @@ IOReturn itlmt7925::setProperties(OSObject *props)
         grpWcid19 = v ? 1 : 0;                               // 0: group TX on the AP wcid (default, proven); 1: mt76's BSS wcid 19 (+ its records at the next reconnect)
         snprintf(log + strlen(log), sizeof(log) - strlen(log), "grp19=%u ", grpWcid19);
     }
+    if (ctlNum(d, "itl_awdlbcm", &v)) {
+        awdlBcm = (uint8_t)(v & 3);                          // §10.91 A/B: which group frames go out with MT_TXD3_BCM
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlbcm=%u ", awdlBcm);
+    }
+    if (ctlNum(d, "itl_awdlomac", &v)) {
+        awdlOmac1 = v ? 1 : 0;                               // AWDL data TX from OMAC 1 (the AWDL address) or OMAC 0
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlomac=%u ", awdlOmac1);
+    }
+    if (ctlNum(d, "itl_awdlps", &v)) {
+        awdlHostPs = v ? 1 : 0;                              // host power-save null frames around AWDL ROCs (default off)
+        if (!awdlHostPs) awdlApPsWake = 1;                   // the link loop sends one PM=0 null so the AP stops buffering
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlps=%u ", awdlHostPs);
+    }
+    if (ctlNum(d, "itl_awdloff", &v)) {
+        awdlOff = v ? 1 : 0;                                 // §10.72: AWDL windows and the second OMAC off (1) / on (0)
+        ctlAwdlReq = v ? 1 : 2;
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdloff=%u ", awdlOff);
+    }
+    if (ctlNum(d, "itl_nopwr", &v)) {
+        noPwr = v != 0;                                      // §10.72: 0 = CLC + SKU tables sent at the next join (itl_lvl)
+        if (!noPwr) clcCc[0] = 0;
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "nopwr=%u ", noPwr ? 1 : 0);
+    }
+    if (ctlNum(d, "itl_ccworld", &v)) {
+        regForceWorld = v ? 1 : 0;                           // §10.72: set_domain "00" from the next join (itl_lvl reconnects)
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "ccworld=%u ", regForceWorld);
+    }
+    if (ctlNum(d, "itl_awdlidle", &v)) {
+        awdlIdleShare = v > 50 ? 50 : (uint8_t)v;            // AP time per off-channel ms while no AWDL peer is heard (0 = off)
+        if (!awdlIdleShare) awdlIdleUntilMs = 0;
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlidle=%u ", awdlIdleShare);
+    }
+    if (ctlNum(d, "itl_awdlchain", &v)) {
+        awdlChainMs = v > 200 ? 200 : v;                     // ms a held ROC may extend the absence by (0 = one ROC per window)
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdlchain=%u ", awdlChainMs);
+    }
+    if (ctlNum(d, "itl_awdllead", &v)) {
+        awdlLeadOn = v ? 1 : 0;                              // AWDL windows set up ahead of their AW start (v5) or when due
+        snprintf(log + strlen(log), sizeof(log) - strlen(log), "awdllead=%u ", awdlLeadOn);
+    }
     if (!log[0]) return kIOReturnBadArgument;
     evLog("ctl: %s", log);
     return kIOReturnSuccess;
@@ -78,6 +118,12 @@ void itlmt7925::ctlPoll()
         clcCc[0] = 0;                                        // m3PowerSetup sends the CLC tables again as well
         m3PowerSetup();
         evLog("ctl: power tables sent, ceiling %u rc=%s", p, clcCc[0] ? "ok" : "failed");
+    }
+    uint8_t aw = ctlAwdlReq;
+    if (aw) {
+        ctlAwdlReq = 0;
+        if (aw == 1) awdlOwnMacClear();                      // windows stop in awdlSyncTx; the OMAC goes here, on the link thread
+        evLog("ctl: awdl %s", aw == 1 ? "off" : "on");
     }
     uint32_t l = ctlLvl;
     if (l) {

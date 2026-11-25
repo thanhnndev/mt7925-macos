@@ -18,6 +18,15 @@ standard HCI controller, but only after its RAM code has been downloaded; macOS 
 > reproduced; one data point, so it stays open. Not measured in this session: re-pairing the BLE mouse, headphones and keyboard
 > (they need a person and the devices).
 
+> **Check 2026-11-03 23:49, after a restart (second data point, controller dead this time):** `bt-state` = `error`, `bt-log` =
+> `chip 7925 fw_ver 00004200; ... section 0: already loaded; section 1: already loaded; wmt op 1 flag 2: no event; section 2: block
+> 49 failed; failed in 7913 ms, 106 interrupt packets dropped`. Unlike the 2026-10-12 note the controller does **not** work:
+> System Information shows the placeholder (BCM_4350C2, Address NULL, State Off). The chip stopped answering WMT events in the
+> middle of section 2 (block 49 of 166), and the loader gives up on the first missing event: it has no retry and no
+> subsystem reset (Linux `btmtk_usb_subsys_reset` / `btmtk_reset_sync`). The boot before it had AWDL active (heavy ROC on the
+> shared radio, docs/ROADMAP-AWDL.md §10.29); whether that matters is not known. Recovery: a full shutdown (cold boot) reloads
+> all sections.
+
 ## Status (2026-10-11, first boot with it)
 
 Works as a controller: `bt-state` = ready after 5.2 s (sections 0-2 downloaded: 74 176 + 332 224 + 41 472 bytes, 0 dropped
@@ -72,13 +81,384 @@ needs root) to see which command or event bluetoothd is waiting for.
 Side note: this boot `bt-state` was `error` (`wmt op 1 flag 0: no event`: a warm reboot with the firmware already running),
 yet the controller works; `MtkBtFw` should treat "no answer to the first PATCH_DWNLD query" differently from a real failure.
 
+## LE advertising never starts (macOS 26.7.1 / 25G241, found 2026-11-04)
+
+AirDrop needs the Mac's BLE AirDrop advertisement (docs/ROADMAP-AWDL.md §10.39, §10.41). `bluetoothd` scans fine but sends
+no advertisement: every request ends in `[Server.LE.Advertise] Stack is not started, updateAdvertisement returning`.
+
+**Cause (log of boot 2026-11-04 14:38 + disassembly of the x86_64 slice of `/usr/sbin/bluetoothd` 25G241).** No HCI command
+is rejected by the controller. bluetoothd chooses the advertising path from its own chipset table:
+
+* `[bm3_usb] Found external Bluetooth dongle -- setting chipset to THIRD_PARTY_DONGLE` stores chipset **0**.
+* Right after `Stack Did Start` the advertise module calls `LE_InitMultipleAdvertising`. With BT 5.0 advertising sets off it
+  takes the legacy multi-advertising path, which needs chipset ≠ 0 and a per-chipset vendor (Broadcom VSC) table; for
+  chipset 0 it returns status 152: `LE_InitMultipleAdvertising failed with status STATUS 152`. The advertise module then
+  stays `Idle stack:OFF` for the whole boot (81× `Stack is not ready, waiting for the stack to start`).
+* The other path, BT 5.0 advertising sets (standard HCI LE Extended Advertising commands), is enabled by
+  `BT chip support for BT Spec advertisingsets`. That answer comes from one chipset-number whitelist (true for chipsets
+  0x13-0x19, 2001-3999 and ≥ 5000), so chipset 0 gets `support for BT 5.0 advertising sets is disabled` /
+  `enableBTSpecAdvertisingSets=0`.
+
+So for any third-party USB controller bluetoothd has no working advertising path. The MT7925 itself supports extended
+advertising: its HCI supported-commands mask has octets 36-37 = `FF FF` (LE Set Advertising Set Random Address ... LE Clear
+Advertising Sets) and the LE features (`FD FD FF FF BE ...`) have bit 12 (LE Extended Advertising) set.
+
+**Fix: second patch in `kexts/BtLeDlFix`.** In the page of bluetoothd being validated, the one call site of that whitelist
+(`__text+0x40fcb4`, the only `call [rcx+0x9c0]` in the binary) becomes `mov eax, 1; nop`:
+
+```
+48 8b 08 48 89 c7 ff 91 c0 09 00 00 41 89 c6   ->   48 8b 08 48 89 c7 b8 01 00 00 00 90 41 89 c6
+```
+
+The check before it (DeviceClass == "Mac") and the `DisableSpecSets` defaults override after it are unchanged. With spec
+sets on, `LE_InitMultipleAdvertising` takes the advertising-sets path (no chipset table) and the advertise module can start.
+Boot-arg `-btledlfxnoadv` turns only this patch off. Pattern unique in 25G241, inside one 4 KB page. After a macOS update the
+pattern may not match: nothing breaks, the log simply shows `advertising sets is disabled` again; re-derive from the string
+`BT chip support for BT Spec advertisingsets : %s` (its function's chipset call).
+
+Side finding (corrected 2026-11-05): the 15.8.1 LE data length pattern does not occur in 25G241, but the same check exists
+there in a different form (`cmp eax, 8; setne al; and al, r12b`, `__text+0x213915`). The build that was on the ESP at
+14:38 / 17:30 (v1.1.0, backup `...-152640`) patched it; its source was never committed, so every build from this branch
+(v1.0.0) dropped it. See "BLE mouse connected but dead" below.
+
+Staged 2026-11-04 15:26 (backup `Kexts-backup/BtLeDlFix.kext.20261104-152640`).
+
+**Result, cold boot 2026-11-04 15:52:** `BT Spec advertisingsets : enabled`, `enableBTSpecAdvertisingSets=1`, the advertise
+module starts (`stack:ON`), but advertising flaps ~20×/s: in 5 min 6290× `Advertising failed to start with result 718` and
+6287× `Advertising failed to stop with result 766`, so nothing stays on air.
+
+**Second cause.** bluetoothd's `STATUS 7xx` is 700 + the HCI error code (`701` = 0x01 Unknown Command for VSC 0xFD3C).
+* 718 = 0x12 *Invalid HCI Command Parameters*, from `multipleAdvStartCb`: the callback of command index 0xcf sent with
+  (Enable 1, Num_Sets 1, handle, Duration 0, Max events 0), i.e. **LE Set Extended Advertising Enable**. The set being
+  started advertises from a random address (`address: DB:9D:83:0E:07:AE type:1`). Core spec: Enable on a set whose own
+  address type is random and whose random address was never set returns 0x12.
+* The random address is written by `OI_HCI_CMD_LE_SetAdvertisingSetRandomAddress` (command index 0xcb, function
+  `__text+0x1f713b`), which sends nothing (and returns success) unless a flag is 1. That flag defaults to 1 and initCoreStack
+  clears it for chipset ≤ 3 (`cmp [chip+0x334], 3; ja; xor edi,edi; call set` at `__text+0x510e9e`). Chipset 0 → the
+  address is never written → every Enable fails.
+* 766 = 0x42 *Unknown Advertising Identifier*, from `setMultipleAdvertisingDataCompleteCb` right after `Halting advertising
+  and resetting states`: the clean-up after the failed Enable removes the set, and the restart then writes data to it.
+  A follow-on of 718.
+* `Read LE Advertising TX power failed STATUS 712` (0x0C Command Disallowed) once at start: the legacy LE Read Advertising
+  Physical Channel Tx Power after extended advertising commands, which the spec forbids mixing. Harmless (power 127 =
+  unknown).
+
+**Fix: third patch in `kexts/BtLeDlFix`:** the `call` that clears the flag becomes a 5-byte NOP, so the flag stays 1 and the
+stack sends LE Set Advertising Set Random Address before Enable. The `chipset == 0` block right after it is unchanged.
+
+```
+83 b8 34 03 00 00 03 77 2a 31 ff e8 3e 6b ce ff   ->   ... 31 ff 0f 1f 44 00 00
+```
+
+Pattern unique in 25G241, inside one page. `-btledlfxnoadv` turns off both advertising patches. Staged 2026-11-04 16:07:
+`/Volumes/ESP/EFI/OC/Kexts/BtLeDlFix.kext`; previous build (advertising sets only) in
+`Kexts-backup/BtLeDlFix.kext.20261104-160722`. **Untested on hardware.**
+
+**Result, boot 2026-11-04 16:52 (f7d0263), and revert.** 766 is gone but advertising still fails: 5578×
+`Advertising failed to start with result 718` in 12 min (~9/s), one `Started advertising successfully`. The kernel log has
+no `btledl` lines, so whether the third patch matched could not be confirmed. **Regression:** the BLE mouse connects
+(`Outgoing LE Connection complete ... status 0`, encryption on, GATT connected) and shows Connected, but the pointer does
+not move. The 14:38 boot without the advertising patches had a working mouse; the only difference seen in the log is the
+continuous stream of failing LE extended advertising commands, so the flood is the prime suspect (not proven).
+(The `primaryPHY:0` lead written here first was wrong: the parameter builder turns 0 into 1, and the trace below shows
+Primary PHY 01, Secondary PHY 02.)
+
+Reverted 2026-11-04 17:07 (`Kexts/BtLeDlFix.kext` = the build from before the advertising patches, from
+`Kexts-backup/BtLeDlFix.kext.20261104-152640`; the f7d0263 build kept as `Kexts-backup/BtLeDlFix.kext.20261104-170738-f7d0263`).
+The owner asked for the cause to be found and fixed instead of the revert.
+
+**Third cause, from an HCI trace (2026-11-04 evening).** Method, no reboot needed: AMFI is off on this Mac
+(`amfi_get_out_of_my_way=0x1`), so a copy of the x86_64 slice of bluetoothd with the patches applied as bytes, ad-hoc
+signed with the original entitlements, can replace the system job until the next reboot (`launchctl bootout
+system/com.apple.bluetoothd`, then `launchctl bootstrap` a copy of its plist pointing at the copy). HCI file traces are
+turned on by `/Library/Preferences/com.apple.MobileBluetooth.debug.plist` = `HCITraces = {StackDebugEnabled, HCIFileTraces,
+HIDTrace = true}`; bluetoothd then writes `/private/var/root/Library/Logs/Bluetooth/bluetoothd-hci-latest.pklg`
+(PacketLogger format: u32 BE length, u64 BE time, u8 type 0 cmd / 1 evt / 2-3 ACL, payload).
+
+With patches 2 and 3 the trace shows:
+
+```
+CMD 2035 00 76e8f9096c56   st=42   set random address, set 0  - sent at stack start, before set 0 exists
+CMD 2035 02 9a5f1f117168   st=42   set random address, set 2  - same
+... Finder AirDrop opened ...
+CMD 2036 02 1000 ... 01 ...         st=00   ext adv parameters, set 2, own address type 1 (random)
+CMD 2037 02 03 01 1b 02011a17ff4c000512...  st=00   AirDrop data (4C 00 05)
+CMD 2039 01 01 02 0000 00           st=12   enable set 2 -> 718
+CMD 2039 00 00 (x3), 2036, CMD 2037 00 ... st=42 (set 0 gone) -> 766, and again, ~3 loops per ms burst
+```
+
+Before Enable the stack compares the set's address with a 7-byte-per-set cache (`__text+0x1f7a1d`, table at
+`0x100b2fe40`) and sends 0x2035 only when they differ. The completion callback (`__text+0x1f7ad3`) ignores the status, so
+the 0x42 answers at stack start still fill the cache; when set 2 is created and enabled later the cache matches, the
+address is never written to it and Enable fails with 0x12. Set 3 works because its 0x2035 comes after its 0x2036.
+In one minute with AirDrop open: 2304× 718, 2299× 766, each loop ~8 HCI commands including disable-all. (That flood was first blamed
+for the dead BLE mouse; wrong, see "BLE mouse connected but dead" below.)
+
+**Fix: fourth patch in `kexts/BtLeDlFix`:** drop the "address unchanged" branch, so 0x2035 is sent after the set exists,
+before every Enable (one extra command per enable; the set is disabled then, so the command is allowed):
+
+```
+44 33 84 08 0e 0d 00 00 8b 54 3a 03 33 94 08 11 0d 00 00 44 09 c2 0f 84 80 00 00 00
+                                                  -> ... 44 09 c2 66 0f 1f 44 00 00
+```
+
+Pattern unique in 25G241, inside one page; `-btledlfxnoadv` turns off all three advertising patches.
+
+**Live result (swapped bluetoothd with patches 2-4, 2026-11-04 23:37).** Every 0x2035 / 0x2036 / 0x2037 / 0x2039 after
+stack start answers 0x00 (only the two early 0x2035 still get 0x42, harmless now). The AirDrop set is enabled:
+`2037 02 ... ff4c0005 ...` st=00, `2035 02 ...` st=00, `2039 010102000000` st=00. No `result 718` / `result 766` in the log;
+after the first seconds the HCI command rate drops to scan on/off only (~3 commands / 10 s). The mouse could not be checked
+this way: the ad-hoc-signed copy is refused the System keychain item that holds the pairing keys (`Failed to query keychain
+for device Public C6:54:32:2F:69:01 with result -25308`); the kext patches the signed system binary, so that does not
+apply after a reboot.
+
+Staged 2026-11-04 23:43: `Kexts/BtLeDlFix.kext` = patches 1-4; the build that was there (no advertising patches) is
+`Kexts-backup/BtLeDlFix.kext.20261104-234307-preadv`.
+
+**Boot 2026-11-05 10:24 (bbac9e0): advertising works, mouse dead.** No 718 / 766; every advertising command st=00. The
+mouse connects and encrypts and sends HID notifications (908 ATT notifications on handle 0x001d in the HCI trace), but the
+Mac sends nothing back except a rejected connection-parameter request: no MTU exchange, no service discovery.
+
+### BLE mouse connected but dead (found 2026-11-05)
+
+`log show` per boot, `LinkReady took` after `Remote Features:`: present only on the 17:30 boot (no advertising patches),
+missing on 15:53, 16:53 and 2026-11-05 10:28 (all builds from this branch). Without LE Link Ready bluetoothd never sends
+BTLEServer the connection-ready event, so no GATT discovery runs; the mouse's GATT database was not cached this boot, so
+every notification is dropped (`No database exists for device`). On earlier no-adv boots the database was cached and the
+link became ready anyway.
+
+Cause: the link-ready step after LE Read Remote Features waits for an LE Data Length Change event when both sides
+support EDL and the chipset is not 8. The MT7925 never sends that event. The 25G241 code is `call chipset;
+cmp eax, 8; setne al; and al, r12b; mov [rbp-0x41], al`. The working ESP build v1.1.0 turned `cmp eax, 8` into
+`cmp eax, eax; nop` (seen in its binary and in the bluetoothd pages it patched); its source was never committed, so the
+advertising builds (v1.0.0 from this branch) lost it. The advertising patches themselves are not involved.
+
+**Fix (v1.2.0):** the 25G241 pattern is back in `BtLeDlFix` next to the 15.8.1 one:
+
+```
+83 f8 08 0f 95 c0 44 20 e0 88 45 bf   ->   39 c0 90 0f 95 c0 44 20 e0 88 45 bf
+```
+
+Unique in 25G241. Staged 2026-11-05 10:36: `Kexts/BtLeDlFix.kext` = v1.2.0 (length wait 15.8.1 + 26, advertising patches
+2-4); the bbac9e0 build is `Kexts-backup/BtLeDlFix.kext.20261105-103645-bbac9e0`.
+
+**Result, boot 2026-11-05 10:42 (v1.2.0, 29db2ea): BLE mouse works** (owner confirmed). Log: `btledlfix (1.2.0)` loaded,
+`LinkReady took 180ms from connectionComplete`, no `No database exists`, `enableBTSpecAdvertisingSets=1`, 0× 718 / 766,
+6× `Started advertising successfully`.
+
+**On air, 2026-11-05 10:54 (nRF Connect, Android):** `57:8F:05:5D:57:87`, -37 dBm, 31 ms interval, Apple data
+`05 12 40 F5 4A 8E 00 00 00 00 00 03 21 1B C9 E4 88 83 08 0E 00` (AirDrop). Same bytes as the Mac's
+`CMD 2037 02 … ff4c00051240f54a8e…` in the HCI trace, and the address is the one written by `CMD 2035 02 87575d058f57`.
+Also on air: `74:14:C0:D8:50:09` with `09 08 12 02 C0 A8 01 B5 …` (set 0, `4C 00 09`). The Mac's BLE AirDrop advert works.
+Next: iPhone ↔ Mac AirDrop.
+
+### Next-boot test
+
+1. BLE mouse: move it; the pointer must follow, with Finder > AirDrop open and closed. Log check (expect `LinkReady took`
+   and `LE Link Ready` after `Remote Features:`, no `No database exists`):
+   ```
+   /usr/bin/log show --last boot --style compact --predicate 'process == "bluetoothd" AND (eventMessage CONTAINS "LinkReady took" OR eventMessage CONTAINS "Remote Features:" OR eventMessage CONTAINS "No database exists")' | tail -5
+   ```
+2. Bluetooth log (expect `enableBTSpecAdvertisingSets=1` and 0 for 718 / 766):
+   ```
+   /usr/bin/log show --last boot --style compact --predicate 'process == "bluetoothd"' | grep -E "BT Spec advertisingsets|enableBTSpecAdvertisingSets|InitMultipleAdvertising|Stack is not started" | head
+   /usr/bin/log show --last 5m --style compact --predicate 'process == "bluetoothd"' | grep -o -E "result 718|result 766|Started advertising successfully" | sort | uniq -c
+   ```
+3. `kextstat | grep btledl` shows 1.2.0.
+4. Open Finder > AirDrop ("Everyone for 10 minutes"). On Android, nRF Connect scanner, filter manufacturer `0x004C`, RSSI
+   ≥ -60: the Mac (random address, changes) must show `4C 00 05 …` (AirDrop).
+5. Then retry AirDrop iPhone ↔ Mac (AWDL side: docs/ROADMAP-AWDL.md §10.38-10.41).
+
+The HCI trace is still on (`/Library/Preferences/com.apple.MobileBluetooth.debug.plist`); read it with `sudo cp
+/private/var/root/Library/Logs/Bluetooth/bluetoothd-hci-latest.pklg ~/x.pklg`. Remove the plist to stop tracing.
+
+Undo: boot-arg `-btledlfxnoadv` (advertising patches off, length patches stay on), or
+`rm -rf /Volumes/ESP/EFI/OC/Kexts/BtLeDlFix.kext && cp -R /Volumes/ESP/EFI/OC/Kexts-backup/BtLeDlFix.kext.20261104-152640 /Volumes/ESP/EFI/OC/Kexts/BtLeDlFix.kext`
+(the v1.1.0 build: mouse works, no advertising), then reboot.
+
+## bluetoothd restart loop after a warm reboot (macOS 26.7.2 / 25G332, found 2026-11-08)
+
+**Symptom.** `bluetoothd` restarts every ~15 s (100+ PIDs in 30 min), each one leaves an `ExcUserFault_bluetoothd-*.ips`
+(EXC_GUARD, `os_fault_with_payload`) and ReportCrash parses them at 11-13 % of a core at idle. System Information shows the
+placeholder (BCM_4350C2, Address NULL, State Off, Transport UART). MtkBtFw says `bt-state` = `ready`.
+
+**Chain of events (unified log, 2026-11-08).**
+1. First `bluetoothd` of the boot finds the USB controller (`[bm3_usb] Found external Bluetooth dongle -- setting chipset to
+   THIRD_PARTY_DONGLE`) and sends HCI Reset. The controller does not answer (`HCI expected event 14 with opcode
+   OI_DHCI_RESET_OPCODE timedout`), and meanwhile ~9 600 packets arrive on the ACL pipe (`OI_HCIIfc_DataReceived, HCI not
+   initialized - discarding ACL packet`): the firmware's coredump/log stream (Linux btusb routes ACL handles 0xfc6f, 0x05ff,
+   0x05fe, 0x2efd to the diag channel).
+2. `ERROR -- Third Party USB Bluetooth dongle failed initialization. Switching to internal Bluetooth module`. bluetoothd writes
+   NVRAM `bluetoothExternalDongleFailed` = `01`.
+3. Every later `bluetoothd` of that boot reads the flag, says `External Bluetooth dongle was not found -- setting chipset to
+   default BCM_4350C2`, picks the board's UART transport (`FindTransportType -- UART Transport`, `H4BC`, from the
+   MacBookPro16,2 board id), waits 15 s for `/dev/cu.BLTH`, fails (`Transport layer initialization failed`) and restarts. That is
+   the loop; it lasts until the next boot (OpenCore's NVRAM Delete/Add resets the flag to `00`, which works).
+
+**Why the controller did not answer.** A warm reboot (restart, or the 17:33 hard reset) does not power-cycle the chip. The
+Bluetooth firmware of the previous session had hung and its watchdog had fired. Read on the live system with
+`tools/mtkbtctl regs` (UHW registers, answered by the USB hardware): `WDT status 00000001`, and every firmware register read
+(vendor request 0x63) and HCI command on the control endpoint stalled (`e0004051`). MtkBtFw did not notice: on a warm reboot
+the chip reports sections 0-1 as already loaded, section 2 and FUNC_CTRL went through, and MtkBtFw never checked HCI.
+A cold boot cuts power to the chip and clears this, which is why it "always fixes it". Boots that day: 11:57 (MtkBtFw
+disabled for §10.74, no firmware: same NVRAM path), 12:14 and 17:33 failed; 14:23 (cold), 14:51, 15:04 worked.
+
+Linux has the same case: commit b3078bb2ee12 "Bluetooth: mt7925: trigger reset on WMT timeout" (2026-08) says the MT7925 "can
+enumerate successfully after a warm reboot while the WMT function-control command remains unresponsive", and recovers through
+`btmtk_reset_sync` → `btusb_mtk_reset` → `btmtk_usb_subsys_reset` + firmware reload. Linux 6.12 did the subsystem reset before
+every download; that was removed upstream (33634e2ab7c6, other USB devices failed to enumerate on Linux 6.11+) in favour of a
+reset on failure.
+
+**Live recovery 2026-11-08 18:2x (no reboot).** `tools/mtkbtctl recover fw/BT_RAM_CODE_MT7925_1_1_hdr.bin`: CONNV3 subsystem
+reset (`reset done`, dev id 7925), all three sections downloaded again (0 and 1 were no longer "already loaded"), FUNC_CTRL,
+HCI Reset → `0e 04 01 03 0c 00`. Then NVRAM `bluetoothExternalDongleFailed=%00` and one `launchctl kickstart -k
+system/com.apple.bluetoothd`: `Stack Did Start`, System Information `Address DC:56:7B:34:81:D6, State On, THIRD_PARTY_DONGLE,
+v9736 c4881`. (The first try needed the kickstart because a Command Complete of a test HCI Reset was still queued in the chip and
+bluetoothd took it as an orphan event; MtkBtFw always consumes its own event.)
+
+**Fix: MtkBtFw 0.2.0.**
+* Before the download: the device id via vendor request 0x63; the firmware version register and UHW `WDT status` (0x740003A0).
+  A stalled read or a set watchdog → subsystem reset first.
+* After FUNC_CTRL: HCI Reset on the control endpoint, Command Complete read on the interrupt endpoint (2 s).
+* Any failure → `btmtk_usb_subsys_reset` (MT7925: CONNV3 0x70028610 bits 5, 13, 0; EP reset option; UDMA_INT_STA[1] = 0xff;
+  poll BT_MISC bit 8, 1 s) and the whole bring-up once more.
+* `bt-log` shows `wdt`, `subsys reset: done`, `HCI Reset complete, status 0`.
+
+Undo: `rm -rf /Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext && cp -R /Volumes/ESP/EFI/OC/Kexts-backup/MtkBtFw.kext.20261108-183128
+/Volumes/ESP/EFI/OC/Kexts/MtkBtFw.kext` (0.1.0).
+
+`tools/mtkbtctl` (build: `clang -O2 -Wall -framework IOKit -framework CoreFoundation -o mtkbtctl tools/mtkbtctl.c`, no root
+needed) works only while no one has interface 0 open, i.e. while bluetoothd sits on the UART fallback: `regs` (read only),
+`probe` (HCI Reset + counts coredump packets), `recover <fw>`.
+
+## LE advertising loop again on 26.7.2 (25G332), found 2026-11-08 20:53: BtLeDlFix 1.3.0 masks build-specific bytes
+
+**Symptom.** Boot 20:52: `bluetoothd` at 15-29 % CPU, ~17 000 log lines/s, ~180×/s `failed to start advertising instance 1
+with status STATUS 718`. The controller itself was fine (MtkBtFw 0.2.0 had recovered a hung firmware on this warm boot:
+`wmt op 1 flag 0: no event; bring-up failed, subsystem reset and full reload; ... HCI Reset complete, status 0`).
+
+**HCI trace** (`bluetoothd-hci-latest.pklg`, 31 580 records in ~2 min): an endless `2036` (ext adv parameters, set 0, own
+address type random) st=00 → `2037` (data) st=00 → `2039 01 01 00 ...` (enable) **st=0x12** → `2039 00 00` (disable all), and
+no `2035` (LE Set Advertising Set Random Address) at all: the second cause above, back again.
+
+**Why.** bluetoothd's page cache shows which BtLeDlFix patches were applied on 25G332: LE length (26), advertising sets and
+the random-address resend are patched; the random-address flag patch is not. Its pattern held the rel32 of the `call` it
+NOPs: `83 b8 34 03 00 00 03 77 2a 31 ff e8 3e 6b ce ff` in 25G241, `... e8 1e 6c ce ff` in 25G332. So with the flag cleared
+the stack never writes the set's random address and every Enable fails.
+
+**Fix (1.3.0).** The macOS 26 patterns describe the instruction sequence and mask what changes between builds (call / jump
+displacements, struct field offsets, the stack slot and the register of the length flag), via Lilu
+`findAndReplaceWithMask`; the replace mask writes only the changed instruction:
+
+| patch | find (`??` masked) | becomes |
+|---|---|---|
+| LE length (26) | `83 f8 08 0f 95 c0 44 20 ?? 88 45 ??` | `39 c0 90` (cmp eax,eax; nop) |
+| random-address flag | `83 b8 ?? ?? ?? ?? 03 77 ?? 31 ff e8 ?? ?? ?? ??` | call → `0f 1f 44 00 00` |
+| random-address resend | `44 33 84 08 ?? ?? ?? ?? 8b 54 3a 03 33 94 08 ?? ?? ?? ?? 44 09 c2 0f 84 ?? ?? ?? ??` | je → `66 0f 1f 44 00 00` |
+
+Each is unique in the 25G332 x86_64 slice (checked on the file with the applied patches reverted) and covers the 25G241
+bytes. The advertising-sets patch keeps its exact bytes: its only build-dependent part is the vtable slot `0x9c0`, which is what
+identifies the call (masked, the sequence occurs 1 137 times). The kext's OS gate stays Monterey..Tahoe (kernel major), not a
+build. Staged 2026-11-08 21:49 on the ESP, previous build in `Kexts-backup/BtLeDlFix.kext.20261108-214939` (1.2.0).
+
+Next boot check: 0 lines of
+`/usr/bin/log show --last 5m --style compact --predicate 'process == "bluetoothd"' | grep -c "STATUS 718"`, `bluetoothd`
+CPU near 0, and in the HCI trace `2035 <set> <addr>` st=00 before each `2039 01 01 <set>` st=00. The HCI file trace
+(`/Library/Preferences/com.apple.MobileBluetooth.debug.plist`) is still on for that check; remove the plist afterwards (it
+rotates a 5 MB file every ~2 min while advertising loops).
+
+### Verified, boot 2026-11-08 21:51, and an audit for the whole macOS 26 line
+
+* MtkBtFw 0.2.0: the firmware was hung again after the warm reboot (`wmt op 1 flag 0: no event`); MtkBtFw reset the subsystem,
+  reloaded all sections, `HCI Reset complete, status 0`. Controller On, NVRAM flag stays `00`.
+* BtLeDlFix 1.3.0: 0× `STATUS 718`, `Started advertising successfully`, bluetoothd 0.9-1.9 % CPU (was 15-29 %).
+* `tools/btledl-check.py` (new): reads `/usr/sbin/bluetoothd` (the page cache shows BtLeDlFix's patched pages) and prints, per
+  patch, `applied` / `will-match` / `MISSING`. On 25G332 all four macOS 26 patches are `applied`. Run it after every macOS
+  update; `will-match` or `applied` for all four means Bluetooth LE keeps working on that build.
+
+Audit (owner's rule: gates and patterns hold for all of macOS 26 / Darwin 25.x, never one build):
+
+| item | how it is bound | outcome if a future 26.x changes it |
+|---|---|---|
+| BtLeDlFix load range | Lilu `KernelVersion::Monterey..Tahoe` (Darwin 21-25, major only); config `MinKernel 21.0.0` | macOS 27: plugin off, no patches |
+| LE length (26) | masked sequence, unique | miss: BLE devices that need the length step stall at connect |
+| advertising sets check | exact bytes incl. vtable slot `0x9c0`; the slot is the identity (masked, the same sequence occurs 24-62× for other capability checks) | miss: spec sets off, no LE advertising, no loop |
+| random-address flag / resend | masked sequences, unique | miss with the sets check applied: the 718 loop (this incident); `btledl-check` shows it |
+| MtkBtFw | matches USB 0489:e11e interface 0; no OS check; IOUSBHostFamily KPI | independent of macOS builds |
+| BlueToolFixup 2.7.2 | upstream acidanthera | upstream's own patterns |
+| NVRAM `bluetoothExternalDongleFailed` | OpenCore Delete+Add every boot | flag can only last one boot |
+
+**BtLeDlFix 1.4.0 (staged on the ESP 2026-11-08 22:03, owner OK; backup `Kexts-backup/BtLeDlFix.kext.20261108-220308` = 1.3.0):** per-patch hit counters, read on demand with `sysctl debug.btledlfix`
+(`len15=0 len26=1 advsets=1 randaddr=1 resend=1 adv=on` expected on 26.x once bluetoothd runs). Only increments happen in the
+page-validation path. A macOS 26 counter at 0 after bluetoothd started = that pattern misses on this build.
+Masking the advertising-sets slot was tested and rejected: masked, the sequence matches 24-62 sites (one per capability check).
+
+The one combination that is not fail-safe is "sets check applied, random-address patches missed". The patches are applied per
+page as pages are validated, so the kext cannot make one depend on another; `btledl-check.py` is the guard.
+
+Remaining boot-time cost: on a warm boot that needs the subsystem reset, MtkBtFw takes ~9.7 s and the first bluetoothd
+(~15 s after boot) probes the interface while MtkBtFw still holds it, finds no Bluetooth interfaces, falls back to UART once
+and restarts 15 s later on USB (one ExcUserFault per such boot; the NVRAM flag is not set). Cold boots and warm boots with a
+healthy firmware (1.7 s) are not affected.
+
+The HCI file trace plist was removed 2026-11-08 21:5x (tracing stops at the next bluetoothd start).
+
+## bluetoothd faults 15 s into every boot: race with the firmware load (found 2026-11-23, MtkBtFw 0.3.0)
+
+**Symptom.** An `ExcUserFault_bluetoothd` report on 9 of 10 boots (2026-11-18..23). It is a simulated EXC_GUARD (namespace 18,
+"Application Triggered Fault"): bluetoothd's own fault after `UART open(/dev/cu.BLTH) port failed to appear after 15
+seconds`. launchd relaunches it, the new instance picks USB and is `STACK_READY` within 0.3 s. Bluetooth works, about 15 s
+late, plus one ReportCrash run per boot.
+
+**Cause (log + 25G332 bluetoothd binary).** bluetoothd's start-up, in order:
+1. `IOKitWaitQuiet()` with a 240 s timeout (`main`, `mach_timespec` {240, 0} at 0x100031dc8).
+2. `FindTransportType`: `BT_HCI_TRANSPORT` unset -> board-id Mac-5F9802EFE386AA28 -> UART (H4BC).
+3. One scan for USB dongles (`[bm3_usb][Found_USB_Dongle]`). If `FoundBluetoothInterfaces()` fails it stays on UART and
+   waits 15 s for `/dev/cu.BLTH`. There is no second USB scan: on 11-23 13:15 the load finished at 13:15:30.8 and
+   bluetoothd still waited until 13:15:42.6.
+
+MtkBtFw 0.2.0 loads from a kernel thread with the interface opened exclusively for 5.2 s, but it did not keep IOKit busy.
+The registry went quiet 1.4-2.4 s after `BT_ACL_If` was published (13:15:25.66 -> 27.07; 12:23:08.27 -> 09.70; 11-22
+14:15:42.72 -> 45.10), in the middle of the download, so step 3 met `provider is already opened for exclusive access by
+MtkBtFw`. The one clean boot (11-22 09:12) was quiet only 5.5 s after the publish (50.69 -> 56.18), after the load.
+
+**Fix (MtkBtFw 0.3.0).** `start()` takes one busy count (`adjustBusy(1)`) before `registerService()`. The worker drops it
+after `intf->close()`. A 30 s thread-call cap drops it if the load hangs. The busy count propagates to the registry root,
+so bluetoothd's `IOKitWaitQuiet` returns only after the interface is closed again. No bluetoothd patch and no transport
+change are needed. Off switch: boot-arg `mtkbtbusy=0` (name checked against every kext on the ESP and in
+/Library/Extensions: unused). Property `bt-busy`: `held`, `released after the load`, `dropped by the 30 s cap, load still
+running`, or `off (mtkbtbusy=0)`.
+
+**First boot, check:**
+```
+ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-busy"|"bt-log"'     # ready / released after the load / "ready in ~5200 ms"
+/usr/bin/log show --last boot --predicate 'process == "bluetoothd"' | grep -E 'IOKitWaitQuiet|Transport is set|Found_USB|failed to appear'
+ls /Library/Logs/DiagnosticReports | grep ExcUserFault_bluetoothd   # no new report for this boot
+```
+Expected: "Done waiting for IOKitWaitQuiet()" after MtkBtFw's load (about 5 s after `BT_ACL_If` is published), then
+`HCI Transport is set to USB` from the first bluetoothd PID, no `failed to open BT_ACL_If`, no UART timeout. Cost: anything
+else that waits for IOKit quiet in that window waits up to about 5 s longer (bounded at 30 s).
+
+**Side effect to measure.** configd's InterfaceNamer also waits for IOKit quiet: on the 11-23 13:15 boot it logged
+`*QUIET*` at 13:15:27.070, the same instant bluetoothd's wait ended. en0 (RMNE) and en1 (Wi-Fi) are named before that
+(23.23 / 23.34) and are not delayed; `*QUIET&NAMED*` moves with the busy hold, about +3.7 s (5.2 s load minus the
+1.4-2.4 s it used to take to go quiet). Commands for the first boot (60 s window from kern.boottime, compact output):
+```
+B=$(sysctl kern.boottime | awk -F'[ ,]+' '{for(i=1;i<=NF;i++) if($i=="sec") print $(i+2)}'); S=$(date -r $B '+%Y-%m-%d %H:%M:%S'); E=$(date -r $((B+60)) '+%Y-%m-%d %H:%M:%S')
+/usr/bin/log show --start "$S" --end "$E" --style compact --predicate '(process == "loginwindow" AND eventMessage CONTAINS "LoginwindowUIShown") OR category == "InterfaceNamer" OR (process == "bluetoothd" AND (eventMessage CONTAINS "IOKitWaitQuiet" OR eventMessage CONTAINS "Transport is set" OR eventMessage CONTAINS "failed to appear")) OR (process == "kernel" AND eventMessage CONTAINS "BT_ACL")'
+```
+Read: `LoginwindowUIShown` minus T0 (T0 = kern.boottime - `machdep.tsc.nanotime.tsc_base` / `machdep.tsc.frequency`; baseline
+14.4 s), `addTimestamp: en0` / `en1` (naming), `*QUIET*` and `*QUIET&NAMED*` (should now follow MtkBtFw's load).
+
+**Undo:** the 0.2.0 kext from `EFI/OC/Kexts-backup`, or boot once with `mtkbtbusy=0`.
+
 ## Pieces
 
 | Piece | What it does |
 |---|---|
-| `kexts/MtkBtFw` | Matches interface 0 of 0489:e11e, opens it, downloads `fw/BT_RAM_CODE_MT7925_1_1_hdr.bin` (embedded) and turns the Bluetooth function on, then closes the interface again. The procedure is Linux `drivers/bluetooth/btmtk.c` (`btmtk_usb_setup`, `btmtk_setup_firmware_79xx`, `btmtk_usb_hci_wmt_sync`): WMT commands as HCI vendor command 0xfc6f on the control endpoint, WMT events polled with a vendor IN request (bRequest 1, wValue 0x30), sections in 250-byte blocks, endpoint reset option 0x74011890 = 0x00010001, WMT FUNC_CTRL 1. Sections the chip reports as already loaded (warm reboot from Windows/Linux) are skipped. |
+| `kexts/MtkBtFw` | Matches interface 0 of 0489:e11e, opens it, downloads `fw/BT_RAM_CODE_MT7925_1_1_hdr.bin` (embedded) and turns the Bluetooth function on, then closes the interface again. The procedure is Linux `drivers/bluetooth/btmtk.c` (`btmtk_usb_setup`, `btmtk_setup_firmware_79xx`, `btmtk_usb_hci_wmt_sync`): WMT commands as HCI vendor command 0xfc6f on the control endpoint, WMT events polled with a vendor IN request (bRequest 1, wValue 0x30), sections in 250-byte blocks, endpoint reset option 0x74011890 = 0x00010001, WMT FUNC_CTRL 1. Sections the chip reports as already loaded (warm reboot from Windows/Linux) are skipped. Since 0.2.0 it checks the result with an HCI Reset and, if the firmware of the previous session is dead or the check fails, resets the Bluetooth subsystem and loads everything again (see the restart loop section above). |
 | `BlueToolFixup.kext` 2.7.2 | From [acidanthera/BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM/releases) (needs Lilu). Required on macOS 12+ so `bluetoothd` accepts a non-Apple controller. Not in this repository; copy it from the release zip. |
-| `kexts/BtLeDlFix` | Lilu plugin, binary patch of `bluetoothd` so a BLE link does not wait for an HCI LE Data Length Change event the MT7925 never sends (see above). Install: `EFI/OC/Kexts/BtLeDlFix.kext` + a `Kernel/Add` entry after Lilu. |
+| `kexts/BtLeDlFix` | Lilu plugin, binary patches of `bluetoothd`: a BLE link does not wait for an HCI LE Data Length Change event the MT7925 never sends (macOS 15), and BT 5.0 advertising sets are enabled for the third-party controller, with each set's random address written before it is enabled, so LE advertising (AirDrop, Nearby) works (macOS 26, see above). Install: `EFI/OC/Kexts/BtLeDlFix.kext` + a `Kernel/Add` entry after Lilu. |
 | NVRAM `7C436110-...:bluetoothExternalDongleFailed` = `00`, `bluetoothInternalControllerInfo` = 14 x `00` | Also listed in NVRAM/Delete so OpenCore writes them every boot (BrcmPatchRAM README: needed for non-Broadcom controllers). |
 
 ## Checking it

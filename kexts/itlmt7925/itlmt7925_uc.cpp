@@ -273,12 +273,16 @@ IOReturn itlmt7925::nativeScanReq(uint32_t *started)
 IOReturn itlmt7925::nativeJoin(const ItlNativeJoin *j)
 {
     if (!m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
-    if (!j || j->version != 1 || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    if (!j || (j->version != 1 && j->version != 2) || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    bool open = j->version >= 2 && j->open;
     IOLockLock(cmdLock);
     bzero(&reqNet, sizeof(reqNet));
     memcpy(reqNet.ssid, j->ssid, j->ssidLen);
-    memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
-    reqNet.hasPmk = true;
+    if (open) reqNet.open = true;
+    else {
+        memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
+        reqNet.hasPmk = true;
+    }
     reqNet.native = true;
     njFail = 0;
     njState = ITL_NATIVE_CONNECTING;
@@ -304,6 +308,7 @@ static uint32_t failCode(const char *stage)
     if (!strncmp(stage, "auth-fail", 9)) return 4;
     if (!strncmp(stage, "assoc-fail", 10)) return 5;
     if (!strncmp(stage, "hs-fail", 7)) return 6;
+    if (!strncmp(stage, "sec-mismatch", 12)) return 8;
     return 7;
 }
 
@@ -406,6 +411,7 @@ void itlmt7925::nativeNets(ItlNativeNets *out)
 // the signal is "unknown" (0). The first samples go to the registry (rssi-probe) to pin the layout down.
 int8_t itlmt7925::rxRssi(const uint8_t *p, uint32_t len, uint32_t hdrOff)
 {
+    lastRxv = 0;
     if (len < 36) return 0;
     uint32_t d1 = le32p(p + 4);
     if (rssiProbeN < 4 && ((d1 >> 18) & 1) && hdrOff + 4 <= len) {
@@ -417,32 +423,25 @@ int8_t itlmt7925::rxRssi(const uint8_t *p, uint32_t len, uint32_t hdrOff)
         rssiProbeN++;
         setProperty("rssi-probe", rssiProbe);
     }
-    static const uint8_t g1bit[2] = { 16, 11 }, g2len[2] = { 8, 16 }, dw[2] = { 3, 1 };
-    for (int h = 0; h < 2; h++) {
-        uint32_t b = g1bit[h];
-        bool g1 = (d1 >> b) & 1, g2 = (d1 >> (b + 1)) & 1, g3 = (d1 >> (b + 2)) & 1, g4 = (d1 >> (b + 3)) & 1,
-             g5 = (d1 >> (b + 4)) & 1;
-        if (!g3) continue;
-        for (int L = 0; L < 2; L++) {
-            uint32_t rxv = 32 + (g4 ? 16 : 0) + (g1 ? 16 : 0) + (g2 ? g2len[L] : 0);
-            uint32_t end = rxv + 16 + (g5 ? 96 : 0);
-            if (hdrOff < end || hdrOff > end + 16 || rxv + 16 > len) continue;
-            for (int k = 0; k < 2; k++) {
-                const uint8_t *r = p + rxv + 4 * dw[k];
-                int best = -128, n = 0, lo = 0, hi = -128;
-                for (int c = 0; c < 4; c++) {
-                    if (r[c] == 0 || r[c] == 255) continue;
-                    int dbm = ((int)r[c] - 220) / 2;
-                    if (dbm < -100 || dbm > -5) { n = -1; break; }
-                    if (dbm > best) best = dbm;
-                    if (!n || dbm < lo) lo = dbm;
-                    if (dbm > hi) hi = dbm;
-                    n++;
-                }
-                if (n > 0 && hi - lo <= 25) return (int8_t)best;
-            }
-        }
+    // §10.86: the layout is mt7925_mac_fill_rx's, exactly (connac3: groups at RXD1 bits 16..20). Base 32 bytes, then group 4
+    // (16), group 1 (16), group 2 (16 - not 8: the old loop tried 8 first, which also "fitted" the header gap and read P-RXV
+    // dword 1 instead of 3), group 3 = P-RXV (16), group 5 = C-RXV (96). RCPI0/1 of P-RXV dword 3, max over the two chains
+    // of the 2x2 antenna mask, as status->signal. The old fallbacks (groups at bit 11, dword 1, chains 2/3) are gone.
+    bool g1 = (d1 >> 16) & 1, g2 = (d1 >> 17) & 1, g3 = (d1 >> 18) & 1, g4 = (d1 >> 19) & 1, g5 = (d1 >> 20) & 1;
+    if (!g3) return 0;
+    uint32_t rxv = 32 + (g4 ? 16 : 0) + (g1 ? 16 : 0) + (g2 ? 16 : 0);
+    uint32_t end = rxv + 16 + (g5 ? 96 : 0);
+    if (hdrOff < end || hdrOff > end + 16 || rxv + 16 > len) return 0;
+    lastRxv = le32p(p + rxv + 12);
+    const uint8_t *r = p + rxv + 12;
+    int best = -128;
+    for (int c = 0; c < 2; c++) {
+        if (r[c] == 0 || r[c] == 255) continue;
+        int dbm = ((int)r[c] - 220) / 2;
+        if (dbm >= 0 || dbm < -110) continue;
+        if (dbm > best) best = dbm;
     }
+    if (best > -128) return (int8_t)best;
     return 0;
 }
 
@@ -534,9 +533,13 @@ int itlmt7925::loadPlistNets(Net *out, int max)
         snprintf(kp, sizeof(kp), i == 1 ? "itl_psk" : "itl_psk%d", i);
         OSString *s = OSDynamicCast(OSString, getProperty(ks));
         OSString *k = OSDynamicCast(OSString, getProperty(kp));
-        if (!s || !k || !s->getLength() || s->getLength() > 32 || k->getLength() < 8 || k->getLength() > 63) continue;
+        // an empty itl_psk is an open network; otherwise a WPA2 passphrase (8..63 characters)
+        if (!s || !k || !s->getLength() || s->getLength() > 32 || (k->getLength() && k->getLength() < 8) || k->getLength() > 63)
+            continue;
+        bzero(&out[n], sizeof(out[n]));                      // the caller's array is not initialised (hasPmk / native / open)
         strlcpy(out[n].ssid, s->getCStringNoCopy(), sizeof(out[n].ssid));
         strlcpy(out[n].psk, k->getCStringNoCopy(), sizeof(out[n].psk));
+        out[n].open = k->getLength() == 0;
         n++;
     }
     return n;
@@ -550,6 +553,7 @@ static const char *failText(const char *stage)
     if (!strncmp(stage, "auth-fail", 9)) return "the access point refused authentication";
     if (!strncmp(stage, "assoc-fail", 10)) return "the access point refused association";
     if (!strncmp(stage, "hs-fail", 7)) return "key handshake failed";
+    if (!strncmp(stage, "sec-mismatch", 12)) return "the network's security does not match the join request";
     return "connection failed";
 }
 
@@ -640,6 +644,11 @@ void itlmt7925::m3Supervise()
             if (recoverWanted && recoverCnt < 8) {                       // the firmware stopped answering: cold start again
                 recoverWanted = false;
                 bool ok = chipRecover();
+                for (int t = 1; !ok && t <= 2 && recoverCnt < 8; t++) {   // a failed reload is tried again, not left dead
+                    IOSleep(1000u * (uint32_t)t);
+                    ok = chipRecover();
+                }
+                recoverFailMs = ok ? 0 : (nowMs() | 1);              // still dead: the idle loop keeps trying (below)
                 bootScan = true;                                         // M2 scanned: aps[] is fresh
                 wifiNets();
                 if (njState == ITL_NATIVE_UP) njState = ITL_NATIVE_IDLE;
@@ -672,6 +681,21 @@ void itlmt7925::m3Supervise()
                 m3log("supervisor: giving up on the joined network: %s", why);
             } else {
                 wifiState(wasUp ? "connecting" : "failed", why);
+            }
+            continue;
+        }
+        // The chip is still dead after a failed recovery (the Family may have disconnected meanwhile, so no join attempt
+        // would come to retry it): reload it every 30 s, so Wi-Fi comes back without a reboot once the reset takes.
+        if (recoverFailMs && nowMs() - recoverFailMs >= 30000) {
+            if (recoverCnt < 16 && chipRecover()) {
+                recoverFailMs = 0;
+                bootScan = true;
+                wifiNets();
+                fails = 0; nextTry = 0;
+                wifiState(want ? "connecting" : "idle", "");
+                m3log("supervisor: chip back after recovery #%u", recoverCnt);
+            } else {
+                recoverFailMs = nowMs() | 1;
             }
             continue;
         }

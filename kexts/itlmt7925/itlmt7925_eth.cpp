@@ -288,6 +288,48 @@ IOReturn itlmt7925::callPlatformFunction(const OSSymbol *name, bool wait, void *
         nativeNets(n);
         return kIOReturnSuccess;
     }
+    if (name->isEqualTo(ITL_NATIVE_AWDL_SYNC)) {   // AWDL PSF frame: copied into the link thread's mailbox, never blocks here
+        ItlNativeAwdlSync *a = (ItlNativeAwdlSync *)p1;
+        if (!nativeMode || !a || a->version < 1 || a->version > 5) return kIOReturnBadArgument;
+        uint64_t startUs = a->version >= 5 ? a->startUs : 0;
+        // v4 (docs/ROADMAP-AWDL.md §10.32): a listen-only window - no frame, len 0 - parks the radio on the channel for dwellMs
+        // with the sniffer on, so the interface can be where a peer's availability window is.
+        if (a->version >= 4 && !a->frame && !a->len && !a->len2)
+            return awdlSubmit(nullptr, 0, a->channel, a->dwellMs, a->awBaseUs, a->awBaseSeq, a->awPeriodUs, a->flags, nullptr, 0,
+                              startUs)
+                       ? kIOReturnError : kIOReturnSuccess;
+        if (!a->frame || a->len < 24 || a->len > (a->version >= 3 ? ITL_NATIVE_AWDL_FRAME_MAX : 256u)) return kIOReturnBadArgument;
+        if (a->version >= 3) {                     // v3: bigger frames and an optional second frame (the MIF)
+            if (a->len2 && (!a->frame2 || a->len2 < 24 || a->len2 > ITL_NATIVE_AWDL_FRAME_MAX)) return kIOReturnBadArgument;
+            return awdlSubmit(a->frame, a->len, a->channel, a->dwellMs, a->awBaseUs, a->awBaseSeq, a->awPeriodUs, a->flags,
+                              a->len2 ? a->frame2 : nullptr, a->len2, startUs)
+                       ? kIOReturnError : kIOReturnSuccess;
+        }
+        if (a->version >= 2)                       // v2 carries the AW timeline: the core stamps the sync TLV at TX time
+            return awdlSubmit(a->frame, a->len, a->channel, a->dwellMs, a->awBaseUs, a->awBaseSeq, a->awPeriodUs,
+                              a->flags)
+                       ? kIOReturnError : kIOReturnSuccess;
+        return awdlSubmit(a->frame, a->len, a->channel, a->dwellMs) ? kIOReturnError : kIOReturnSuccess;
+    }
+    if (name->isEqualTo(ITL_NATIVE_AWDL_DATA_TX)) {   // AWDL data frame: copied into the AWDL TX ring, never blocks here
+        ItlNativeAwdlDataTx *d = (ItlNativeAwdlDataTx *)p1;
+        if (!nativeMode || !d || d->version != 1 || !d->frame || d->len < 24 || d->len > ITL_NATIVE_AWDL_FRAME_MAX)
+            return kIOReturnBadArgument;
+        int rc = awdlDataQueue(d->frame, d->len);
+        // NotReady: no AWDL radio window is running, the frame is dropped; NoResources: the ring is full, retry later.
+        return !rc ? kIOReturnSuccess : rc == -70 ? kIOReturnNotReady : kIOReturnNoResources;
+    }
+    if (name->isEqualTo(ITL_NATIVE_AWDL_RX)) {     // AWDL action frame from the radio: popped from the RX ring, no chip access
+        ItlNativeAwdlRx *r = (ItlNativeAwdlRx *)p1;
+        if (!nativeMode || !r || (r->version != 1 && r->version != 2) || !r->buf) return kIOReturnBadArgument;
+        r->len = 0;
+        r->channel = 0;
+        int8_t rssi = 0;
+        uint32_t tUs = 0;
+        if (!awdlRxFetch(r->buf, r->cap, &r->len, &r->channel, &rssi, &tUs)) return kIOReturnNoResources;   // queue empty
+        if (r->version >= 2) { r->rssi = rssi; r->rxTimeUs = tUs; }
+        return kIOReturnSuccess;
+    }
     if (name->isEqualTo(ITL_NATIVE_STATUS)) {
         ItlNativeStatus *s = (ItlNativeStatus *)p1;
         if (!nativeMode || !s) return kIOReturnBadArgument;

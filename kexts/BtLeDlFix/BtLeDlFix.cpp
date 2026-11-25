@@ -16,6 +16,56 @@
 //   45 0f b6 f6         movzx r14d, r14b
 //   b8 00 00 00 00      mov   eax, 0
 //   44 0f 44 f0         cmove r14d, eax
+// macOS 26.7.1 / 25G241 compiles the same check differently (__text+0x213915, after the chipset getter call):
+//   83 f8 08            cmp   eax, 8          -> 39 c0 90   cmp eax, eax ; nop
+//   0f 95 c0            setne al
+//   44 20 e0            and   al, r12b        (r12b = local EDL support)
+//   88 45 bf            mov   [rbp-0x41], al  ("wait for length" flag)
+// Without it a BLE mouse whose GATT database is not cached never reaches "LE Link Ready": bluetoothd never tells
+// BTLEServer the device connected, no GATT discovery runs and every HID notification is dropped ("No database
+// exists for device"). The mouse shows Connected but the pointer does not move.
+//
+// Second patch, LE advertising (macOS 26.7.1 / 25G241, bluetoothd x86_64 __text+0x40fcb4):
+// bluetoothd has two ways to advertise. The legacy multi-advertising path calls a per-chipset vendor (Broadcom VSC)
+// table; a third-party USB controller is chipset 0 ("setting chipset to THIRD_PARTY_DONGLE"), the table is empty and
+// LE_InitMultipleAdvertising fails with status 152, so the LE advertise module never leaves "stack:OFF" and every
+// request ends in "Stack is not started, updateAdvertisement returning". The other path, BT 5.0 advertising sets
+// (standard HCI LE Extended Advertising commands), is chosen from a chipset-number whitelist that leaves out chipset 0.
+// The MT7925 supports those commands (supported-commands octets 36-37 = FF FF, LE feature bit 12 set), so the plugin
+// makes that one whitelist call answer yes on a Mac:
+//   48 8b 08            mov   rcx, [rax]
+//   48 89 c7            mov   rdi, rax
+//   ff 91 c0 09 00 00   call  [rcx+0x9c0]     -> b8 01 00 00 00 90   mov eax, 1 ; nop
+//   41 89 c6            mov   r14d, eax
+// The defaults override DisableSpecSets is still honoured (it is read after this call).
+//
+// Third patch, advertising-set random address (macOS 26.7.1 / 25G241, __text+0x510ea9):
+// with advertising sets on, the stack enables each set with LE Set Extended Advertising Enable. Sets that advertise
+// from a random address (Apple's Nearby / AirDrop instances) need LE Set Advertising Set Random Address first, but
+// initCoreStack clears the "send that command" flag for chipsets <= 3 (chipset 0 = third-party controller). The
+// stack then enables a set whose random address was never written; the MT7925 rejects it as the Core spec requires
+// (Invalid HCI Command Parameters 0x12, logged "STATUS 718"), and the start/halt/restart loop flaps ~20x/s with a
+// follow-on 0x42 (766). The plugin drops that one call so the flag keeps its default (1):
+//   83 b8 34 03 00 00 03   cmp   dword [rax+0x334], 3
+//   77 2a                  ja    +0x2a
+//   31 ff                  xor   edi, edi
+//   e8 3e 6b ce ff         call  setUseAdvSetRandomAddress   -> 0f 1f 44 00 00   nop
+//
+// Fourth patch, resend the set's random address before every enable (macOS 26.7.1 / 25G241, __text+0x1f7a37):
+// before LE Set Extended Advertising Enable the stack compares the set's random address with a 7-byte-per-set cache
+// and sends LE Set Advertising Set Random Address only when they differ. At stack start it sends that command for
+// sets 0 and 2 before LE Set Extended Advertising Parameters has created them; the controller answers 0x42 (Unknown
+// Advertising Identifier), but the completion callback ignores the status and still writes the cache. Later, when the
+// set is created and enabled (AirDrop, set 2), the cache matches, the address is never written to the new set, the
+// enable fails with 0x12 (718) and the stack loops halt/disable-all/restart thousands of times a minute (traced:
+// 2304 x 718 and 2299 x 766 per minute with Finder AirDrop open, each loop several HCI commands and a disable-all).
+// Dropping the "unchanged" branch makes the stack write the address after the set exists, every time it enables it
+// (one extra command per enable; the set is disabled at that point, so the command is always allowed):
+//   44 33 84 08 0e 0d 00 00   xor   r8d, [rax+rcx+0xd0e]
+//   8b 54 3a 03               mov   edx, [rdx+rdi+3]
+//   33 94 08 11 0d 00 00      xor   edx, [rax+rcx+0xd11]
+//   44 09 c2                  or    edx, r8d
+//   0f 84 80 00 00 00         je    skip-address             -> 66 0f 1f 44 00 00   nop
 
 #include <Headers/plugin_start.hpp>
 #include <Headers/kern_api.hpp>
@@ -23,6 +73,7 @@
 #include <Headers/kern_version.hpp>
 
 #include <sys/vnode.h>
+#include <sys/sysctl.h>
 
 #define MODULE_SHORT "btledl"
 
@@ -33,7 +84,67 @@ static const uint8_t kLenPatched[] = {
     0x39, 0xC0, 0x90, 0x45, 0x0F, 0xB6, 0xF6, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x44, 0x0F, 0x44, 0xF0,
 };
 
+// Build-specific bytes (call/jump displacements, struct field offsets, stack slots, the register picked for the flag) are
+// masked out, so a pattern describes the instruction sequence and keeps matching across macOS 26.x builds. The 25G241
+// patterns were exact bytes; on 26.7.2 (25G332) the random-address patch stopped matching only because the call's rel32
+// changed, and LE advertising looped again (718 at ~180/s). Each masked pattern is unique in the 25G241 and 25G332 slices.
+
+// cmp eax, 8; setne al; and al, <reg8>; mov [rbp+disp8], al  ->  cmp eax, eax; nop; ...
+static const uint8_t kLen26Original[] = { 0x83, 0xF8, 0x08, 0x0F, 0x95, 0xC0, 0x44, 0x20, 0x00, 0x88, 0x45, 0x00 };
+static const uint8_t kLen26FindMask[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00 };
+static const uint8_t kLen26Patched[]  = { 0x39, 0xC0, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t kLen26ReplMask[] = { 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+static const uint8_t kAdvOriginal[] = {
+    0x48, 0x8B, 0x08, 0x48, 0x89, 0xC7, 0xFF, 0x91, 0xC0, 0x09, 0x00, 0x00, 0x41, 0x89, 0xC6,
+};
+static const uint8_t kAdvPatched[] = {
+    0x48, 0x8B, 0x08, 0x48, 0x89, 0xC7, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xC6,
+};
+
+// cmp dword [rax+disp32], 3; ja rel8; xor edi, edi; call rel32 (clears the "write set random address" flag)  ->  call = nop5
+static const uint8_t kAdvAddrOriginal[] = { 0x83, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x03, 0x77, 0x00, 0x31, 0xFF, 0xE8, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t kAdvAddrFindMask[] = { 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t kAdvAddrPatched[]  = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+static const uint8_t kAdvAddrReplMask[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+// xor r8d, [rax+rcx+disp32]; mov edx, [rdx+rdi+3]; xor edx, [rax+rcx+disp32]; or edx, r8d; je rel32 ("address unchanged")
+//   ->  je = nop6, so LE Set Advertising Set Random Address is sent before every Enable
+static const uint8_t kAdvResendOriginal[] = {
+    0x44, 0x33, 0x84, 0x08, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x54, 0x3A, 0x03, 0x33, 0x94,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x44, 0x09, 0xC2, 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t kAdvResendFindMask[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t kAdvResendPatched[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00,
+};
+static const uint8_t kAdvResendReplMask[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+};
+
 static mach_vm_address_t orig_cs_validate {};
+static bool advPatchEnabled = true;
+
+// Per-patch hit counts (pages of bluetoothd patched since boot; a page evicted and validated again counts again). Only plain
+// increments happen in the page-validation path; the text is built when someone reads `sysctl debug.btledlfix`. A macOS 26
+// patch at 0 after bluetoothd has started means its pattern no longer matches this build (see tools/btledl-check.py).
+enum { kHitLen15, kHitLen26, kHitAdv, kHitAddr, kHitResend, kHitCount };
+static volatile uint32_t patchHits[kHitCount];
+
+static int btledlSysctl SYSCTL_HANDLER_ARGS {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "len15=%u len26=%u advsets=%u randaddr=%u resend=%u adv=%s", patchHits[kHitLen15],
+             patchHits[kHitLen26], patchHits[kHitAdv], patchHits[kHitAddr], patchHits[kHitResend],
+             advPatchEnabled ? "on" : "off");
+    return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, btledlfix, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED, nullptr, 0, btledlSysctl,
+            "A", "BtLeDlFix patch hits");
 
 static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data,
                                      int *validated_p, int *tainted_p, int *nx_p) {
@@ -43,13 +154,36 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     static constexpr size_t dirLength = sizeof("/usr/sbin/") - 1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0) &&
         strcmp(path + dirLength, "bluetoothd") == 0) {
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLenOriginal, kLenPatched))
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLenOriginal, kLenPatched)) {
             SYSLOG(MODULE_SHORT, "patched LE data length wait in %s", path);
+            patchHits[kHitLen15]++;
+        }
+        if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kLen26Original, kLen26FindMask, kLen26Patched, kLen26ReplMask, 1, 0)) {
+            SYSLOG(MODULE_SHORT, "patched LE data length wait (macOS 26) in %s", path);
+            patchHits[kHitLen26]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAdvOriginal, kAdvPatched)) {
+            SYSLOG(MODULE_SHORT, "patched LE advertising sets check in %s", path);
+            patchHits[kHitAdv]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvAddrOriginal, kAdvAddrFindMask, kAdvAddrPatched, kAdvAddrReplMask, 1, 0)) {
+            SYSLOG(MODULE_SHORT, "patched advertising set random address flag in %s", path);
+            patchHits[kHitAddr]++;
+        }
+        if (advPatchEnabled && KernelPatcher::findAndReplaceWithMask(const_cast<void *>(data), PAGE_SIZE, kAdvResendOriginal, kAdvResendFindMask, kAdvResendPatched, kAdvResendReplMask, 1, 0)) {
+            SYSLOG(MODULE_SHORT, "patched advertising set random address resend in %s", path);
+            patchHits[kHitResend]++;
+        }
     }
 }
 
 static void pluginStart() {
     SYSLOG(MODULE_SHORT, "start");
+    sysctl_register_oid(&sysctl__debug_btledlfix);
+    if (checkKernelArgument("-btledlfxnoadv")) {
+        advPatchEnabled = false;
+        SYSLOG(MODULE_SHORT, "LE advertising patch disabled by -btledlfxnoadv");
+    }
     lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
         KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
-// Interface between itlmt7925 and user space (the ItlWiFi menu bar app). Shared by the kext and the app; keep it plain C.
+// Interface between itlmt7925 and user space (tools/itlctl). Shared by the kext and the tool; keep it plain C.
 //
 // Commands go through IOServiceOpen(itlmt7925) + IOConnectCallStructMethod. State comes back as registry properties on the
 // itlmt7925 service, readable without opening a connection (IORegistryEntryCreateCFProperty):
