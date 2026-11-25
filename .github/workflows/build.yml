@@ -3,9 +3,8 @@ name: build
 # Host tests + the four kexts (Wi-Fi: itlmt7925 core, itlmt7925Native front end; Bluetooth: MtkBtFw, BtLeDlFix), on every push and PR.
 # Kexts are built with EMPTY Wi-Fi credentials; credentials are only ever injected locally.
 # BUILD ONLY: this workflow never publishes a release. A tag "v*" is built and its kexts are kept as a workflow artifact, nothing more.
-# Releases are created by hand, with the notes in .github/release-notes/<tag>.md and the assets listed there: the Wi-Fi and
-# Bluetooth kexts that ran on the test machine come from two branches, so one CI build cannot package them (at this commit CI
-# builds MtkBtFw 0.2.0, the Bluetooth release bt-v1.1 is 0.3.1).
+# Releases are created by hand, with the notes in .github/release-notes/<tag>.md and the assets listed there (the binaries that
+# ran on the test machine, checked by hand: no Wi-Fi credentials, no build paths).
 on:
   push:
     branches: [main, dev/**, sequoia]

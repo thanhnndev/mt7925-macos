@@ -66,8 +66,9 @@ Từng bước, cách kiểm tra, sửa lỗi và quay lại: **[docs/GUIDE.vi.m
 
 | Nhánh | Nội dung |
 |---|---|
-| `main` | driver hiện tại: native trên Tahoe và các bản sửa mới nhất của lõi. Release `v2.*` build từ đây |
-| `dev/awdl` | đang làm AirDrop / AWDL (phase 3: phát đã chạy, nhận đã tới được peer manager của Apple). Chỉ chạy khi có `itlmt_awdl=1`. Có thể panic |
+| `main` | trạng thái đã phát hành: mã nguồn của `v2.0-beta.1` (Wi-Fi, merge từ `dev/awdl` ngày 2026-11-25) và `bt-v1.1` (`MtkBtFw` 0.3.1). Code AWDL có trong cây nhưng tắt nếu không có `itlmt_awdl=1` |
+| `dev/awdl` | phát triển Wi-Fi, bản đang chạy trên máy test; đang làm AirDrop / AWDL (chưa dùng được). Chỉ chạy khi có `itlmt_awdl=1`. Có thể panic |
+| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x, nguồn của `bt-v1.1` (commit `668f400`; đầu nhánh là 0.4.0, chưa từng chạy) |
 | `sequoia` | nhánh macOS 15 đã đóng băng, nguồn của `v1.0` / `v1.1` |
 
 | Release | macOS | Gồm |

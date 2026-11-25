@@ -69,8 +69,8 @@ Every step with checks, troubleshooting and how to undo it: **[docs/GUIDE.md](do
 
 | Branch | What it is |
 |---|---|
-| `main` | macOS 26 Tahoe native mode as of 2026-11-02. Behind `dev/awdl`; the merge is open (see [ROADMAP](docs/ROADMAP.md)) |
-| `dev/awdl` | What runs on the test machine: the Tahoe Wi-Fi fixes since `main`, open networks, and the AirDrop / AWDL work (only active with `itlmt_awdl=1`; may panic). Source of `v2.0-beta.1` |
+| `main` | The released state: the source of `v2.0-beta.1` (Wi-Fi, merged from `dev/awdl` on 2026-11-25) and of `bt-v1.1` (`MtkBtFw` 0.3.1). AWDL code is in the tree but off unless `itlmt_awdl=1` |
+| `dev/awdl` | Wi-Fi development; what runs on the test machine: the Tahoe Wi-Fi fixes since `main`, open networks, and the AirDrop / AWDL work (only active with `itlmt_awdl=1`; may panic). Source of `v2.0-beta.1` |
 | `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x. Source of `bt-v1.1` (commit `668f400`; the branch tip carries 0.4.0, which was never run) |
 | `sequoia` | Frozen macOS 15 line, the source of `v1.0` / `v1.1` |
 
