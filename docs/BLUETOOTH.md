@@ -403,6 +403,55 @@ healthy firmware (1.7 s) are not affected.
 
 The HCI file trace plist was removed 2026-11-08 21:5x (tracing stops at the next bluetoothd start).
 
+## bluetoothd faults 15 s into every boot: race with the firmware load (found 2026-11-23, MtkBtFw 0.3.0)
+
+**Symptom.** An `ExcUserFault_bluetoothd` report on 9 of 10 boots (2026-11-18..23). It is a simulated EXC_GUARD (namespace 18,
+"Application Triggered Fault"): bluetoothd's own fault after `UART open(/dev/cu.BLTH) port failed to appear after 15
+seconds`. launchd relaunches it, the new instance picks USB and is `STACK_READY` within 0.3 s. Bluetooth works, about 15 s
+late, plus one ReportCrash run per boot.
+
+**Cause (log + 25G332 bluetoothd binary).** bluetoothd's start-up, in order:
+1. `IOKitWaitQuiet()` with a 240 s timeout (`main`, `mach_timespec` {240, 0} at 0x100031dc8).
+2. `FindTransportType`: `BT_HCI_TRANSPORT` unset -> board-id Mac-5F9802EFE386AA28 -> UART (H4BC).
+3. One scan for USB dongles (`[bm3_usb][Found_USB_Dongle]`). If `FoundBluetoothInterfaces()` fails it stays on UART and
+   waits 15 s for `/dev/cu.BLTH`. There is no second USB scan: on 11-23 13:15 the load finished at 13:15:30.8 and
+   bluetoothd still waited until 13:15:42.6.
+
+MtkBtFw 0.2.0 loads from a kernel thread with the interface opened exclusively for 5.2 s, but it did not keep IOKit busy.
+The registry went quiet 1.4-2.4 s after `BT_ACL_If` was published (13:15:25.66 -> 27.07; 12:23:08.27 -> 09.70; 11-22
+14:15:42.72 -> 45.10), in the middle of the download, so step 3 met `provider is already opened for exclusive access by
+MtkBtFw`. The one clean boot (11-22 09:12) was quiet only 5.5 s after the publish (50.69 -> 56.18), after the load.
+
+**Fix (MtkBtFw 0.3.0).** `start()` takes one busy count (`adjustBusy(1)`) before `registerService()`. The worker drops it
+after `intf->close()`. A 30 s thread-call cap drops it if the load hangs. The busy count propagates to the registry root,
+so bluetoothd's `IOKitWaitQuiet` returns only after the interface is closed again. No bluetoothd patch and no transport
+change are needed. Off switch: boot-arg `mtkbtbusy=0` (name checked against every kext on the ESP and in
+/Library/Extensions: unused). Property `bt-busy`: `held`, `released after the load`, `dropped by the 30 s cap, load still
+running`, or `off (mtkbtbusy=0)`.
+
+**First boot, check:**
+```
+ioreg -rc MtkBtFw -l | grep -E '"bt-state"|"bt-busy"|"bt-log"'     # ready / released after the load / "ready in ~5200 ms"
+/usr/bin/log show --last boot --predicate 'process == "bluetoothd"' | grep -E 'IOKitWaitQuiet|Transport is set|Found_USB|failed to appear'
+ls /Library/Logs/DiagnosticReports | grep ExcUserFault_bluetoothd   # no new report for this boot
+```
+Expected: "Done waiting for IOKitWaitQuiet()" after MtkBtFw's load (about 5 s after `BT_ACL_If` is published), then
+`HCI Transport is set to USB` from the first bluetoothd PID, no `failed to open BT_ACL_If`, no UART timeout. Cost: anything
+else that waits for IOKit quiet in that window waits up to about 5 s longer (bounded at 30 s).
+
+**Side effect to measure.** configd's InterfaceNamer also waits for IOKit quiet: on the 11-23 13:15 boot it logged
+`*QUIET*` at 13:15:27.070, the same instant bluetoothd's wait ended. en0 (RMNE) and en1 (Wi-Fi) are named before that
+(23.23 / 23.34) and are not delayed; `*QUIET&NAMED*` moves with the busy hold, about +3.7 s (5.2 s load minus the
+1.4-2.4 s it used to take to go quiet). Commands for the first boot (60 s window from kern.boottime, compact output):
+```
+B=$(sysctl kern.boottime | awk -F'[ ,]+' '{for(i=1;i<=NF;i++) if($i=="sec") print $(i+2)}'); S=$(date -r $B '+%Y-%m-%d %H:%M:%S'); E=$(date -r $((B+60)) '+%Y-%m-%d %H:%M:%S')
+/usr/bin/log show --start "$S" --end "$E" --style compact --predicate '(process == "loginwindow" AND eventMessage CONTAINS "LoginwindowUIShown") OR category == "InterfaceNamer" OR (process == "bluetoothd" AND (eventMessage CONTAINS "IOKitWaitQuiet" OR eventMessage CONTAINS "Transport is set" OR eventMessage CONTAINS "failed to appear")) OR (process == "kernel" AND eventMessage CONTAINS "BT_ACL")'
+```
+Read: `LoginwindowUIShown` minus T0 (T0 = kern.boottime - `machdep.tsc.nanotime.tsc_base` / `machdep.tsc.frequency`; baseline
+14.4 s), `addTimestamp: en0` / `en1` (naming), `*QUIET*` and `*QUIET&NAMED*` (should now follow MtkBtFw's load).
+
+**Undo:** the 0.2.0 kext from `EFI/OC/Kexts-backup`, or boot once with `mtkbtbusy=0`.
+
 ## Pieces
 
 | Piece | What it does |
