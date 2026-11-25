@@ -3925,3 +3925,27 @@ The retries are not the fix. The fix is to be in the same tree: we must take the
    - Check whether we hear that master at all, and whether `isPeerQualifiedForElection` rejects it on RSSI or for the "bubble".
 2. Whether our own election TLV, as the peers see it, would let them choose us (metric 529 vs theirs).
 3. Until then `itl_awdlbcm=2` is the setting that keeps the peer. It is a run-time choice, not the default.
+
+### 10.94 Same boot, 11:00–11:03, with an iPhone next to the Mac (AirDrop open): who the peers follow
+
+**The nearby devices follow a far master, not us.**
+- The iPhone (`66:B1:B2:A2:55:32`) and the MacBook (`72:9D:5E:A9:BF:87`) are each posted `Peer Absence` and removed: the iPhone at 11:02:18, the MacBook at 11:02:41. No `Peer Presence` was posted during the capture.
+- `itlmt-awdl-peer-el`: the master they follow is `92:13:b0:fe:5c:8b`. It names itself (hop 0) with:
+  - metric 0x1fe (510);
+  - v2 counter 0x01289f (75935).
+- We hear that master only at −83..−87 dBm on ch 149.
+- Our own election TLV:
+  - metric 529, higher than its 510;
+  - v2 counter 0x1a9 (425), far lower than its 75935.
+- Our Family keeps electing ourselves (`New P:CA:F1:4E:9C:17:EA`, our awdl0 address) every 3.15 s, so we are a one-node tree. The devices next to us live on the other tree's timeline.
+
+**The Family believes awdl0 carries no traffic.**
+- `AWDLStateDump: AWDL on for more than 30 seconds with no TX (1274772 ms) or RX (1274772 ms)`. That is the whole uptime, although `drx`/`dtx` count frames.
+- Meanwhile the schedule stays `Low Power`: `[6 0 149 0 0 0 0 0 6 0 149 0 …]`, which means we are present in 4 of 16 slots.
+
+**Questions for the next round (REA on IO80211Family, no network changes):**
+1. `runElection` / `isPeerQualifiedForElection`:
+   - what decides between a peer's tree and our own (metric, v2 counter, RSSI or "bubble");
+   - why a −85 dBm master is not adopted, when the devices next to us do adopt it.
+2. Which driver report feeds the "no TX / no RX" timestamps. If it is our data path's statistics, the Family may hold a low-power schedule for that reason.
+3. RSSI level check: the MacBook read −45 at "laon" (§10.90) but −54..−77 on later boots. Compare our RCPI decode on the AWDL path with the station path for the same AP.
