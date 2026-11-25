@@ -3899,3 +3899,29 @@ The `awdl txfree` line prints `bcm=`. With this, A and B can be compared in one 
    The BCM fix stays, because Linux sets it.
 
 - **Installed 2026-11-23 14:51** with the owner's OK. Backup of 61F8DB1B: `EFI/OC/Kexts-backup/itlmt7925.kext.20261123-145106`. The last build before BCM (B9E6878A) stays at `Kexts-backup/itlmt7925.kext.20261123-135320`. Native stays 52A0E786.
+
+### 10.93 A/B of `itl_awdlbcm`, boot 2026-11-25 10:40 (core D2CAADD0), AP on ch 44: PSF/MIF retries brought the MacBook back; the trees do not merge
+
+Same boot, same room. The peer is `72:9D:5E:A9:BF:87`, the MacBook of §10.90. Log: `build/ab-1125.txt`; counters: `build/ab-1125-marks.txt`.
+
+| Phase | `bcm` | Δrx | Δweak | non-weak | Δdrx in/up | Δpm us/other | Presence / Absence of the MacBook |
+|---|---|---|---|---|---|---|---|
+| A 10:43:41–10:45:41 | 3 (all) | 346 | 335 | **11** | 1/1 | 0/77 | 0 / 1 (10:45:13) |
+| B 10:45:50–10:47:50 | 2 (data only) | 550 | 333 | **217** | 38/30 | 9/70 | 3 / 3 |
+
+- **Presence returns at once.** The MacBook was posted present at 10:45:51, one second after the switch to `bcm=2`. It then flickers: absent at 46:35, present at 46:53, absent at 47:06, present at 47:09, absent at 47:28.
+- **A is contaminated.** Our AirDrop browse stopped at 10:44:56 ("No AirDrop browse clients present"), halfway through A.
+- **The trees do not merge.**
+  - The far device `B2:33:07:BE:2E:CB` (−76..−79) is `Not Routable` 130–143 times per phase.
+  - `pm` says the peers mostly name another master (`other`), and we stay our own master (`syncs=0`).
+
+**Reading.** The MacBook follows another tree's master. Our windows are on our own timeline, so its frames and ours meet only by chance. The 15 retries of each PSF/MIF without BCM (§10.91) spread every frame over tens of ms and raised that chance. That is why the old behaviour "worked" and the Linux-correct one flickers.
+
+The retries are not the fix. The fix is to be in the same tree: we must take the timeline of the master the MacBook follows, or the MacBook must take ours.
+
+**Next (trace, no change yet):**
+1. Why the Family's election keeps us as master while the MacBook names `other`.
+   - Read the MacBook's election TLV (`itlmt-awdl-peer-el`): which master it names, and with what metric and hop count.
+   - Check whether we hear that master at all, and whether `isPeerQualifiedForElection` rejects it on RSSI or for the "bubble".
+2. Whether our own election TLV, as the peers see it, would let them choose us (metric 529 vs theirs).
+3. Until then `itl_awdlbcm=2` is the setting that keeps the peer. It is a run-time choice, not the default.
