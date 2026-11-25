@@ -3,7 +3,7 @@
 **Wi-Fi and Bluetooth drivers for the MediaTek MT7925 (Wi-Fi 7 card, PCI `14c3:7925` + USB `0489:e11e`) on macOS, x86 Hackintosh.**
 The two halves of the card are separate devices, so there are two sets of kexts in one repository. **Wi-Fi:** on macOS 26 Tahoe and
 15 Sequoia the card shows up as a real Wi-Fi interface (Wi-Fi menu, network list in System Settings, joining with a password; no
-password goes into the kext). **Bluetooth:** the controller works and BLE devices connect, checked on macOS 15 only so far.
+password goes into the kext). **Bluetooth:** the controller works and BLE devices connect, on macOS 26 Tahoe and 15 Sequoia.
 
 [Tiếng Việt](README.vi.md) · **[Install guide](docs/GUIDE.md)** · [Roadmap](docs/ROADMAP.md) · [Releases](https://github.com/thanhnndev/mt7925-macos/releases) · [Bluetooth](docs/BLUETOOTH.md) · [AirDrop / AWDL work](docs/ROADMAP-AWDL.md)
 
@@ -13,25 +13,26 @@ password goes into the kext). **Bluetooth:** the controller works and BLE device
 > a bug can panic or hang the machine. Back up first and always keep another way online (USB Ethernet, USB tethering).
 > No warranty, see [LICENSE](LICENSE).
 
-## Status at a glance (2026-11-02)
+## Status at a glance (2026-11-25)
 
-| | macOS 26 Tahoe (`25G241`, 26.7.1) | macOS 15 Sequoia (`24H32`, 15.8.1) |
+| | macOS 26 Tahoe (`25G332`, 26.7.2) | macOS 15 Sequoia (`24H32`, 15.8.1) |
 |---|---|---|
-| **Native mode** (Wi-Fi menu, join from System Settings) | ✅ **works**. Download 176.6 Mb/s, upload 65.0 Mb/s (`networkQuality`), HE 160 MHz 2×2, DFS channels | ✅ works: 28-36 MB/s on one TCP stream, `networkQuality` 293 Mb/s down / 45 Mb/s up |
+| **Native mode** (Wi-Fi menu, join from System Settings) | ✅ **works**, the daily driver on the test machine: WPA2-PSK and open networks. Measured on `25G241`: download 176.6 Mb/s, upload 65.0 Mb/s (`networkQuality`), HE 160 MHz 2×2, DFS channels | ✅ works: 28-36 MB/s on one TCP stream, `networkQuality` 293 Mb/s down / 45 Mb/s up |
 | **Legacy mode** (shows up as Ethernet, password injected into the kext) | not tested on Tahoe | ✅ stable, the longest-tested path |
-| Where to get it | branch `main`, release **v2.x** | branch `sequoia`, release **v1.1** |
-| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ❓ not checked on `25G241`. `BtLeDlFix` patches `bluetoothd` and its bytes were derived on 24H32, so expect it to need work | ✅ controller works; BLE mouse and classic headphones connect. Keyboard pairing not recorded |
-| AirDrop / AWDL / Continuity | 🔧 in progress on branch `dev/awdl` (off by default) | ❌ |
+| Where to get it | Wi-Fi: release **v2.0-beta.1** (branch `dev/awdl`). Bluetooth: release **bt-v1.1** (branch `fix/bt-waitquiet`) | branch `sequoia`, releases **v1.1** and **bt-v1.0** |
+| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ works on `25G332` with `MtkBtFw` 0.3.1 + `BtLeDlFix` 1.4.0: BLE mouse (2026-11-05), no advertising error loop (2026-11-08), no `bluetoothd` fault at boot (2026-11-23). `MtkBtFw` 0.3.1 delays the login window by 4 to 9 s. Keyboard pairing not recorded. `BtLeDlFix` patches `bluetoothd`: run `tools/btledl-check.py` after every macOS update | ✅ controller works; BLE mouse and classic headphones connect. Keyboard pairing not recorded |
+| AirDrop / AWDL / Continuity | 🔧 in progress (off unless `itlmt_awdl=1`). One AirDrop transfer completed (2026-11-11); peers come and go, **not usable** | ❌ |
 
-The native kext is tied to the macOS build it was written against: the Tahoe build is checked only on `25G241` and the
-Sequoia build only on `24H32`. On any other build, check it first (see [GUIDE §7](docs/GUIDE.md#7-other-macos-builds)) before loading it.
+The native kext depends on Apple's private Wi-Fi class layouts. The Tahoe build checks them when it starts and refuses to
+load on a mismatch (it covers the macOS 26 line; only `25G332` and `25G241` have been run). The Sequoia build is for `24H32` only.
+On any other build, check it first (see [GUIDE §7](docs/GUIDE.md#7-other-macos-builds)) before loading it.
 
 ## What works
 
 - **Firmware and chip bring-up:** the MediaTek firmware is embedded in the kext, and the MAC address is read from the card.
 - **Scanning:** 2.4 GHz channels 1-13 and all of 5 GHz (36-165), including the DFS channels 52-64 and 100-144. The AP table
   holds up to 128 networks, so 2.4 GHz networks are not pushed out of the list in crowded places.
-- **Security:** WPA2-PSK with CCMP, plus WPA/WPA2 mixed networks (CCMP pairwise, TKIP group). The 4-way handshake runs in the
+- **Security:** WPA2-PSK with CCMP, WPA/WPA2 mixed networks (CCMP pairwise, TKIP group), and open networks. The 4-way handshake runs in the
   driver, and in native mode macOS supplies the key.
 - **Speed:** a link ladder from level 0 to level 6 covers HT, VHT and HE, 160 MHz, 2 spatial streams and Block Ack. If a network
   fails the 4-way handshake at a high level, the driver steps down a level by itself.
@@ -45,8 +46,8 @@ Sequoia build only on `24H32`. On any other build, check it first (see [GUIDE §
 
 ## What does not work yet
 
-WPA3 / SAE, open networks, enterprise (802.1X), 6 GHz, AirDrop / AWDL (work in progress), and sleep/wake (not verified).
-Bluetooth on Tahoe is unchecked, and a warm reboot once left `bt-state` at `error` although the controller worked (not reproduced).
+WPA3 / SAE, enterprise (802.1X), 6 GHz, AirDrop / AWDL (work in progress, not usable), and sleep/wake in native mode (not verified).
+Bluetooth: keyboard pairing and re-pairing after a restart are not recorded.
 Upload is slower than download. A-MSDU receive is off on purpose. Full list and plan: **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 
 ## Quick start
@@ -66,16 +67,20 @@ Every step with checks, troubleshooting and how to undo it: **[docs/GUIDE.md](do
 
 | Branch | What it is |
 |---|---|
-| `main` | Current driver: macOS 26 Tahoe native mode plus the latest core fixes. Releases `v2.*` are built from here |
-| `dev/awdl` | AirDrop / AWDL work (phase 3: transmit works; receive reaches Apple's peer manager). Only active with `itlmt_awdl=1`. May panic |
+| `main` | macOS 26 Tahoe native mode as of 2026-11-02. Behind `dev/awdl`; the merge is open (see [ROADMAP](docs/ROADMAP.md)) |
+| `dev/awdl` | What runs on the test machine: the Tahoe Wi-Fi fixes since `main`, open networks, and the AirDrop / AWDL work (only active with `itlmt_awdl=1`; may panic). Source of `v2.0-beta.1` |
+| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x. Source of `bt-v1.1` (commit `668f400`; the branch tip carries 0.4.0, which was never run) |
 | `sequoia` | Frozen macOS 15 line, the source of `v1.0` / `v1.1` |
 
 | Release | macOS | Contents |
 |---|---|---|
 | `v1.0` | 15 Sequoia | `itlmt7925.kext` (legacy mode only), `ItlWiFi.app`. Copied from `ga403wm-hackintosh` `v1` (Wi-Fi files only) |
 | `v1.1` | 15 Sequoia | `itlmt7925.kext` + `itlmt7925Native.kext` (native front end, A-MSDU off), `ItlWiFi.app`. Copied from `ga403wm-hackintosh` `kext-v1.1` |
-| `bt-v1.0` | 15 Sequoia | Bluetooth: `MtkBtFw.kext` + `BtLeDlFix.kext`, copied unchanged from `ga403wm-hackintosh` `kext-v1.1`. Untested on Tahoe |
-| `v2.*` | 26 Tahoe | built by CI from `main` when a `v2*` tag is pushed |
+| `bt-v1.0` | 15 Sequoia | Bluetooth: `MtkBtFw.kext` + `BtLeDlFix.kext`, copied unchanged from `ga403wm-hackintosh` `kext-v1.1`. Not for Tahoe |
+| `v2.0-beta.1` | 26 Tahoe | Wi-Fi: `itlmt7925.kext` + `itlmt7925Native.kext`, pre-release. Notes: [.github/release-notes/v2.0-beta.1.md](.github/release-notes/v2.0-beta.1.md) |
+| `bt-v1.1` | 26 Tahoe | Bluetooth: `MtkBtFw.kext` 0.3.1 + `BtLeDlFix.kext` 1.4.0. Notes: [.github/release-notes/bt-v1.1.md](.github/release-notes/bt-v1.1.md) |
+
+Releases are made by hand; CI only builds and tests.
 
 ## Hardware
 
