@@ -1,5 +1,7 @@
 # mt7925-macos
 
+<p align="center"><img src="docs/images/mt7925-overview.svg" alt="MT7925 on macOS: Wi-Fi on PCIe through itlmt7925 and itlmt7925Native to the Wi-Fi menu; Bluetooth on USB through MtkBtFw and BtLeDlFix" width="760"></p>
+
 **Driver Wi-Fi và Bluetooth cho MediaTek MT7925 (card Wi-Fi 7, PCI `14c3:7925` + USB `0489:e11e`) trên macOS, Hackintosh x86.**
 Hai nửa của card là hai thiết bị riêng nên repo có hai nhóm kext. **Wi-Fi:** trên macOS 26 Tahoe và 15 Sequoia, card hiện thành
 giao diện Wi-Fi thật (menu Wi-Fi, danh sách mạng trong System Settings, nhập mật khẩu như máy Mac; không nhét mật khẩu vào
@@ -86,14 +88,42 @@ laptop khác: dùng mẫu bug report và đính kèm `scripts/native-wifi-test.s
 Card gồm hai thiết bị: Wi-Fi qua PCIe và Bluetooth qua USB, nên Wi-Fi và Bluetooth cùng nằm trong repo này, ở các kext riêng.
 Bluetooth mới kiểm tra trên GA403WM (USB `0489:e11e`); máy khác có thể dùng USB id khác, xem [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
 
+## Các repo liên quan
+
+Tất cả thuộc cùng một dự án: macOS trên một máy ASUS ROG Zephyrus G14 **GA403WM**.
+
+| Repo | Là gì | Release mới nhất |
+|---|---|---|
+| [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | Repo chính: EFI OpenCore, ACPI, ghi chú cài đặt, tình trạng và roadmap, các kext phụ | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
+| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | Wi-Fi (`itlmt7925`, `itlmt7925Native`) và Bluetooth (`MtkBtFw`, `BtLeDlFix`) cho MediaTek MT7925 | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
+| [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | App RogControl, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (chế độ hiệu năng, quạt, giới hạn sạc, chế độ GPU, Slash, phím Fn) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
+| [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork của [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | Driver màn hình và Metal cho Radeon 890M của máy này (`NMXGPU` và Metal plugin), giấy phép PolyForm Noncommercial | tag mã nguồn [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
+| [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork của [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | Hypervisor AMD-V cho Docker và Android emulator trên Ryzen, kèm các bản sửa cho máy này | tag mã nguồn [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
+| [strix-890m-macos](https://github.com/thanhnndev/strix-890m-macos) | Nghiên cứu Radeon 890M trước đây: ghi chú, kext màn hình lúc boot, trace. Đã được driver ở trên thay thế | chưa có |
+
 ## Lịch sử
 
 Driver được phát triển trong [thanhnndev/ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) tới 2026-10-26,
 rồi tách sang đây. Phần Wi-Fi được giữ nguyên lịch sử commit; phần Bluetooth được thêm vào ngày 2026-11-02 (lịch sử cũ của nó vẫn ở repo kia).
 
+## Ghi công
+
+| Dự án | Đóng góp cho repo này |
+|---|---|
+| Driver Linux [`mt76`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/wireless/mediatek/mt76) (`mt7925`, `mt76_connac`, `mt792x`), Copyright (C) MediaTek Inc. và các tác giả mt76, BSD-3-Clause-Clear | Lớp phần cứng MT7925 được viết lại theo nó: bản đồ thanh ghi, DMA ring, lệnh MCU / UNI, nạp firmware, layout TXD / RXD, đường kết nối. Một số phần port từng dòng và giữ copyright của MediaTek |
+| Firmware MediaTek từ [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek) | Firmware Wi-Fi và Bluetooth nhúng trong `itlmt7925.kext` và `MtkBtFw.kext`, theo `fw/LICENCE.mediatek` (không phải Clear BSD) |
+| Linux `btmtk` / `btusb` (`drivers/bluetooth`) | Quy trình nạp firmware Bluetooth mà `MtkBtFw` làm theo (viết lại, không chép) |
+| [acidanthera/Lilu](https://github.com/acidanthera/Lilu) (vit9696 và cộng sự, BSD-3-Clause) | `BtLeDlFix` là plugin Lilu: build với header và `plugin_start.cpp` của Lilu; cần `Lilu.kext` khi chạy |
+| [acidanthera/BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM) (`BlueToolFixup.kext`) | Cần đặt cùng các kext Bluetooth từ macOS 12 trở đi. Không kèm theo |
+| [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) | Header và thư viện kernel lúc build; không phân phối lại |
+| [OpenCore](https://github.com/acidanthera/OpenCorePkg) (acidanthera) | Boot loader nạp các kext |
+| Các bài báo AWDL của Seemoo Lab (MobiCom 2018, USENIX Security 2019), [OWL](https://github.com/seemoo-lab/owl), [OpenDrop](https://github.com/seemoo-lab/opendrop), `t4t5/owly` | Thông tin giao thức cho phần AWDL / AirDrop. Chỉ đọc lấy thông tin, không chép code |
+| [Claude](https://claude.com/claude-code) (Anthropic) | Viết phần lớn code và tài liệu, do thanhnndev chỉ đạo và test |
+
+Không dùng code của `itlwm`, `AirportItlwm` hay OpenIntelWireless. Nguồn gốc từng file: [NOTICE.md](NOTICE.md).
+
 ## Giấy phép
 
 Code: [Clear BSD](LICENSE). Lớp phần cứng MT7925 được viết lại dựa theo driver Linux `mt76` (© MediaTek, BSD-3-Clause-Clear).
 Firmware trong `fw/` theo giấy phép riêng của MediaTek. Dự án clean-room: không dùng code từ itlwm, AirportItlwm, OWL hay
-OpenDrop (GPL). Xem [NOTICE.md](NOTICE.md) và phần [Credits](README.md#credits) trong bản tiếng Anh (mt76 và firmware của MediaTek,
-Lilu, BrcmPatchRAM, MacKernelSDK, OpenCore, các bài báo AWDL của Seemoo Lab, và Claude của Anthropic, tác giả phần lớn mã nguồn).
+OpenDrop (GPL). Xem [NOTICE.md](NOTICE.md) và mục [Ghi công](#ghi-công) ở trên.

@@ -13,7 +13,8 @@ advertising starts. For macOS 15 use `bt-v1.0`.
 
 - Tag target: `668f400` on branch `fix/bt-waitquiet`. It is **not** the tip of that branch: the tip carries MtkBtFw 0.4.0,
   which was built and never run.
-- The zips are the files that ran on the test machine (boots of 2026-11-25 19:46 and 20:42), copied unchanged from its EFI.
+- The zips are the files that ran on the test machine (boots of 2026-11-25 19:46 and 20:42), copied from its EFI with the
+  debug symbol entries stripped (same UUIDs, same code and data).
 - The Wi-Fi kexts in the tree at `668f400` are older than the ones in `v2.0-beta.1`. Use this tag for Bluetooth only.
 - These notes live on the branch `release/v2.0-beta.1`, not in the tagged tree.
 
@@ -55,20 +56,21 @@ Also needed, not included and not ours: [Lilu](https://github.com/acidanthera/Li
 
 ## Assets
 
-Both kexts are the binaries that ran, byte for byte (`Info.plist` and executable compared with the EFI copies), zipped with
-`ditto -c -k --keepParent`. Their symbol tables contain the build paths of the machine that built them.
+Both kexts are the binaries that ran, with only the debug symbol entries removed (`strip -S`: they carried the build
+paths of the machine that built them). The UUIDs are unchanged, every section of both binaries (`__TEXT` and `__DATA`) is
+byte-identical to the EFI copies, and the `Info.plist` files are the ones that ran. Zipped with `ditto -c -k --keepParent`.
 
 | File | Version | Source | UUID of the binary inside | SHA-256 |
 |---|---|---|---|---|
-| `MtkBtFw.kext.zip` | 0.3.1 | `668f400` | `D173A506-D451-3CF2-A8AA-3F87414E1282` | `27e21cb36b3594bd731d68d21c809ccd611b999aa283a4ed842ac396a5a01fe6` |
-| `BtLeDlFix.kext.zip` | 1.4.0 | `0a23a6c` (same source at `668f400`) | `C6274348-4A25-36D0-84D7-2E234AF13B8B` | `a2068e900cfcefa70fa37f291827a69129c85cdb28f6056f70809f8372bd5ed9` |
+| `MtkBtFw.kext.zip` | 0.3.1 | `668f400` | `D173A506-D451-3CF2-A8AA-3F87414E1282` | `3c15a5cf51ead23611c5fdf4c8b275aa960484d6332824734ccfb8f46722432b` |
+| `BtLeDlFix.kext.zip` | 1.4.0 | `0a23a6c` (same source at `668f400`) | `C6274348-4A25-36D0-84D7-2E234AF13B8B` | `5853e63c6ae9530dbded67fc7426082ca300bf87d5dc782b2ca9afb9073eb956` |
 | `LICENSE` | n/a | `668f400` | n/a | `18ea8e404a91378ceb54eaa1514626b83d2c25a0aa6f6da3dbd2d4264e869304` |
 | `LICENCE.mediatek` | n/a | `fw/LICENCE.mediatek` | n/a | `a90d3f66704d85889945fec5525ea77622549da83aced1aac99828383f8f1805` |
 | `LICENSE.Lilu.txt` | n/a | acidanthera/Lilu `LICENSE.txt` at `0249c3a` | n/a | `74c3ca48189b796b0d262866e67de8efba77a71516667ce68dc3a8f13c2a3c57` |
 | `SHA256SUMS.txt` | n/a | the five files above | n/a | n/a |
 
-SHA-256 of the binaries inside the zips: `MtkBtFw` `2082c187267fad90bed2879b8fbb55c139c5c9f89a0d901101656afff7b8897a`,
-`BtLeDlFix` `cd2f6e0c9f70d8896b0e652ddcd1eff65ed1421f26c202348ead832f7e34802c`.
+SHA-256 of the binaries inside the zips: `MtkBtFw` `fb30cc8f978683a7e42f0439588c08b7295b20da1bd600bfee1fbf15da0d54e0`,
+`BtLeDlFix` `a1451a6c56df0733f911c84ebe9248d4f59265e9e22869a2a1b227b8bf32d0ac`.
 
 A rebuild of `668f400` gives the same loaded sections as the `MtkBtFw` that ran. For `BtLeDlFix` the rebuild differs from
 the binary that ran in two bytes: the build date in Lilu's version string (`2026-11-08` in the one that ran).

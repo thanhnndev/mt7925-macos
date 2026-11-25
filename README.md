@@ -1,5 +1,7 @@
 # mt7925-macos
 
+<p align="center"><img src="docs/images/mt7925-overview.svg" alt="MT7925 on macOS: Wi-Fi on PCIe through itlmt7925 and itlmt7925Native to the Wi-Fi menu; Bluetooth on USB through MtkBtFw and BtLeDlFix" width="760"></p>
+
 **Wi-Fi and Bluetooth drivers for the MediaTek MT7925 (Wi-Fi 7 card, PCI `14c3:7925` + USB `0489:e11e`) on macOS, x86 Hackintosh.**
 The two halves of the card are separate devices, so there are two sets of kexts in one repository. **Wi-Fi:** on macOS 26 Tahoe and
 15 Sequoia the card shows up as a real Wi-Fi interface (Wi-Fi menu, network list in System Settings, joining with a password; no
@@ -21,7 +23,7 @@ password goes into the kext). **Bluetooth:** the controller works and BLE device
 | **Legacy mode** (shows up as Ethernet, password injected into the kext) | not tested on Tahoe | ✅ stable, the longest-tested path |
 | Where to get it | Wi-Fi: release **v2.0-beta.1** (branch `dev/awdl`). Bluetooth: release **bt-v1.1** (branch `fix/bt-waitquiet`) | branch `sequoia`, releases **v1.1** and **bt-v1.0** |
 | **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ works on `25G332` with `MtkBtFw` 0.3.1 + `BtLeDlFix` 1.4.0: BLE mouse (2026-11-05), no advertising error loop (2026-11-08), no `bluetoothd` fault at boot (2026-11-23). `MtkBtFw` 0.3.1 delays the login window by 4 to 9 s. Keyboard pairing not recorded. `BtLeDlFix` patches `bluetoothd`: run `tools/btledl-check.py` after every macOS update | ✅ controller works; BLE mouse and classic headphones connect. Keyboard pairing not recorded |
-| AirDrop / AWDL / Continuity | 🔧 in progress (off unless `itlmt_awdl=1`). One AirDrop transfer completed (2026-11-11); peers come and go, **not usable** | ❌ |
+| AirDrop / AWDL / Continuity | 🔧 in progress (off unless `itlmt_awdl=1`). **Not verified as working:** one AirDrop transfer completed in a test (2026-11-11); peers come and go, not usable | ❌ |
 
 The native kext depends on Apple's private Wi-Fi class layouts. The Tahoe build checks them when it starts and refuses to
 load on a mismatch (it covers the macOS 26 line; only `25G332` and `25G241` have been run). The Sequoia build is for `24H32` only.
@@ -105,6 +107,19 @@ separate kexts. Bluetooth is checked on the GA403WM only (USB `0489:e11e`); othe
 | `abi/native-wifi/` | IO80211 / Skywalk ABI dumps for `24H32` and `25G241` |
 | `docs/` | guide, roadmap, design notes, the full hardware test log (`TEST-NATIVE-WIFI.md`) |
 | `test/` | host unit tests |
+
+## Related repositories
+
+All of these belong to one project: macOS on one ASUS ROG Zephyrus G14 **GA403WM**.
+
+| Repository | What it is | Latest release |
+|---|---|---|
+| [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | The hub: OpenCore EFI, ACPI, install notes, state and roadmap, the small helper kexts | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
+| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | MediaTek MT7925 Wi-Fi (`itlmt7925`, `itlmt7925Native`) and Bluetooth (`MtkBtFw`, `BtLeDlFix`) | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
+| [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | RogControl app, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (performance modes, fans, charge limit, GPU mode, Slash, Fn keys) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
+| [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | The Radeon 890M display and Metal driver for this laptop (`NMXGPU` and its Metal plugin), PolyForm Noncommercial | source tags [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
+| [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork of [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | AMD-V hypervisor for Docker and the Android emulator on Ryzen, with this machine's fixes | source tag [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
+| [strix-890m-macos](https://github.com/thanhnndev/strix-890m-macos) | Earlier Radeon 890M research: notes, boot-display kexts, traces. Superseded by the driver above | none |
 
 ## History
 
