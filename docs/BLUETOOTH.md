@@ -53,6 +53,21 @@ Check after a reboot with `nvram -p | grep -i bluetooth`. This diagnosis and the
 it fixed the HP card above. A warm reboot can leave the firmware half-loaded (section 2 answers `status 255`): use a cold
 boot, see the warm-reboot section below.
 
+## MT7922 (experimental, GA403UV, USB 0489:e0f6)
+
+Contributed by [hbyonly1](https://github.com/hbyonly1) (ported from ga403wm-hackintosh#7). `MtkBtFw` 0.3.3 matches
+`0489:e0f6`, accepts chip id `7922` and loads `fw/BT_RAM_CODE_MT7922_1_1_hdr.bin` instead of the MT7925 image; MT7922
+chips whose ROM asks for another suffix than `_1_1` are left alone. The MT7925 subsystem reset is never sent to an
+MT7922: if its firmware is still running from a previous session, it needs a cold boot.
+
+**Not tested on MT7922 by the maintainer** (no such hardware here). Tested by the contributor on a GA403UV (MT7922 / RZ616,
+Wi-Fi `14c3:0616`) with macOS 15.8.1, Lilu 1.7.2, BlueToolFixup 2.7.2 and BtLeDlFix 1.0.0, on the older loader the PR
+was written against: a Bluetooth mouse works; AirPods Pro 2 pair, report their information and switch listening modes.
+
+**Known issue: AirPods playback.** In the Music app, audible playback starts in about 1 of 15 attempts. In a failed
+attempt the position advances for about 2 s with no sound, then the AirPods disconnect and reconnect, in a loop. Once
+playback does start it stays stable. Cause unknown; microphone and sleep / wake not checked.
+
 ## Status (2026-10-11, first boot with it)
 
 Works as a controller: `bt-state` = ready after 5.2 s (sections 0-2 downloaded: 74 176 + 332 224 + 41 472 bytes, 0 dropped
