@@ -21,8 +21,8 @@ password goes into the kext). **Bluetooth:** the controller works and BLE device
 |---|---|---|
 | **Native mode** (Wi-Fi menu, join from System Settings) | ✅ **works**, the daily driver on the test machine: WPA2-PSK and open networks. Measured on `25G241`: download 176.6 Mb/s, upload 65.0 Mb/s (`networkQuality`), HE 160 MHz 2×2, DFS channels | ✅ works: 28-36 MB/s on one TCP stream, `networkQuality` 293 Mb/s down / 45 Mb/s up |
 | **Legacy mode** (shows up as Ethernet, password injected into the kext) | not tested on Tahoe | ✅ stable, the longest-tested path |
-| Where to get it | Wi-Fi: release **v2.0-beta.1** (branch `dev/awdl`). Bluetooth: release **bt-v1.1** (branch `fix/bt-waitquiet`) | branch `sequoia`, releases **v1.1** and **bt-v1.0** |
-| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ works on `25G332` with `MtkBtFw` 0.3.1 + `BtLeDlFix` 1.4.0: BLE mouse (2026-11-05), no advertising error loop (2026-11-08), no `bluetoothd` fault at boot (2026-11-23). `MtkBtFw` 0.3.1 delays the login window by 4 to 9 s. Keyboard pairing not recorded. `BtLeDlFix` patches `bluetoothd`: run `tools/btledl-check.py` after every macOS update | ✅ controller works; BLE mouse and classic headphones connect. Keyboard pairing not recorded |
+| Where to get it | Wi-Fi: release **v2.0-beta.1** (branch `dev/awdl`). Bluetooth: release **bt-v1.2** (`main`) | branch `sequoia`, releases **v1.1** and **bt-v1.0** |
+| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ works on `25G332` with `MtkBtFw` 0.3.3 + `BtLeDlFix` 1.4.0: firmware loads and no advertising error loop (2026-11-27, 0.3.3), BLE mouse (MOUSE_DATE), no `bluetoothd` fault at boot since 2026-11-23. `MtkBtFw` 0.3.1 delayed the login window by 4 to 9 s; not re-measured on 0.3.3. MT7922 (`0489:e0f6`): experimental, not tested on 0.3.3. Keyboard pairing not recorded. `BtLeDlFix` patches `bluetoothd`: run `tools/btledl-check.py` after every macOS update | ✅ controller works; BLE mouse and classic headphones connect. Keyboard pairing not recorded |
 | AirDrop / AWDL / Continuity | 🔧 in progress (off unless `itlmt_awdl=1`). **Not verified as working:** one AirDrop transfer completed in a test (2026-11-11); peers come and go, not usable | ❌ |
 
 The native kext depends on Apple's private Wi-Fi class layouts. The Tahoe build checks them when it starts and refuses to
@@ -69,9 +69,9 @@ Every step with checks, troubleshooting and how to undo it: **[docs/GUIDE.md](do
 
 | Branch | What it is |
 |---|---|
-| `main` | The released state: the source of `v2.0-beta.1` (Wi-Fi, merged from `dev/awdl` on 2026-11-25) and of `bt-v1.1` (`MtkBtFw` 0.3.1). AWDL code is in the tree but off unless `itlmt_awdl=1` |
+| `main` | The released state: the source of `v2.0-beta.1` (Wi-Fi, merged from `dev/awdl` on 2026-11-25) and of `bt-v1.2` (`MtkBtFw` 0.3.3). AWDL code is in the tree but off unless `itlmt_awdl=1` |
 | `dev/awdl` | Wi-Fi development; what runs on the test machine: the Tahoe Wi-Fi fixes since `main`, open networks, and the AirDrop / AWDL work (only active with `itlmt_awdl=1`; may panic). Source of `v2.0-beta.1` |
-| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x. Source of `bt-v1.1` (commit `668f400`; the branch tip carries 0.4.0, which was never run) |
+| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x. Source of `bt-v1.1` (commit `668f400`; the branch tip carries 0.4.0, which was never run). `bt-v1.2` comes from `main` |
 | `sequoia` | Frozen macOS 15 line, the source of `v1.0` / `v1.1` |
 
 | Release | macOS | Contents |
@@ -81,6 +81,7 @@ Every step with checks, troubleshooting and how to undo it: **[docs/GUIDE.md](do
 | `bt-v1.0` | 15 Sequoia | Bluetooth: `MtkBtFw.kext` + `BtLeDlFix.kext`, copied unchanged from `ga403wm-hackintosh` `kext-v1.1`. Not for Tahoe |
 | `v2.0-beta.1` | 26 Tahoe | Wi-Fi: `itlmt7925.kext` + `itlmt7925Native.kext`, pre-release. Notes: [.github/release-notes/v2.0-beta.1.md](.github/release-notes/v2.0-beta.1.md) |
 | `bt-v1.1` | 26 Tahoe | Bluetooth: `MtkBtFw.kext` 0.3.1 + `BtLeDlFix.kext` 1.4.0. Notes: [.github/release-notes/bt-v1.1.md](.github/release-notes/bt-v1.1.md) |
+| `bt-v1.2` | 26 Tahoe | Bluetooth: `MtkBtFw.kext` 0.3.3 (more MT7925 ids, experimental MT7922) + `BtLeDlFix.kext` 1.4.0. Notes: [.github/release-notes/bt-v1.2.md](.github/release-notes/bt-v1.2.md) |
 
 Releases are made by hand; CI only builds and tests.
 
@@ -115,7 +116,7 @@ All of these belong to one project: macOS on one ASUS ROG Zephyrus G14 **GA403WM
 | Repository | What it is | Latest release |
 |---|---|---|
 | [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | The hub: OpenCore EFI, ACPI, install notes, state and roadmap, the small helper kexts | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
-| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | MediaTek MT7925 Wi-Fi (`itlmt7925`, `itlmt7925Native`) and Bluetooth (`MtkBtFw`, `BtLeDlFix`) | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
+| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | MediaTek MT7925 Wi-Fi (`itlmt7925`, `itlmt7925Native`) and Bluetooth (`MtkBtFw`, `BtLeDlFix`) | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.2](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.2) |
 | [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | RogControl app, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (performance modes, fans, charge limit, GPU mode, Slash, Fn keys) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
 | [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | The Radeon 890M display and Metal driver for this laptop (`NMXGPU` and its Metal plugin), PolyForm Noncommercial | source tags [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
 | [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork of [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | AMD-V hypervisor for Docker and the Android emulator on Ryzen, with this machine's fixes | source tag [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
