@@ -37,6 +37,12 @@ else                             IOSleep(1);
 
 - kernel_task as a whole: **14.6 % of a core** (top, 30 s), and **33.6k context switches/s** (top CSW delta, 20 s). Docker stack +
   video + Claude were up.
+- Boot of 20:00 (out-54), 20:05, 30 s, Docker stack just started: **4281 RX + 321 TX frames/s**, kernel_task **14.9 %** (TIME
+  34.68 → 39.14 s), **41.6k context switches/s**.
+  - At this rate nearly every pass finds work, so the loop runs the `act` branch: `IODelay(20)`, a ~20 µs timer block plus wake
+    latency.
+  - That allows ~15-25k passes/s, not 4.5k. The pump's share grows with traffic, and it is likely the largest part of the 41.6k
+    switches/s.
 - The per-thread split of kernel_task needs root. It is `sudo ~/develop/projects/ga403wm-power/tools/kt-probe.sh 30` (`ps -M -p 0`
   plus a spindump), which names the pump thread's CPU % exactly.
 - Estimate until then:
