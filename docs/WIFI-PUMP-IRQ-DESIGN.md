@@ -132,14 +132,14 @@ This changes only the loop tail. Nothing in bring-up changes.
 ```
 if (act) { lastActive = now; backoffUs = 50; IODelay(20); }            // busy: as now
 else if (now - lastActive < 50) { IODelay(backoffUs); backoffUs = min(backoffUs * 2, 1000); }   // 50, 100, 200, 400, 800, 1000 us
-else IOSleepWithLeeway(2, 2);                                            // idle: 2 ms, timer coalescing allowed
+else IOSleepWithLeeway(1, 1);                                            // idle: 1 ms, the timer may coalesce up to 2 ms
 ```
 
 - RX ring headroom: 1536 slots ≈ 60 ms of frames at the measured peak (~25k frames/s at 36 MB/s), so a 1 ms cap cannot overflow.
 - The worst added RX latency is 1 ms after a gap. The TCP ACK clock at 360 frames/s already spaces frames ~3 ms apart.
 - Expected:
   - under the daily load, ~1-1.5k passes/s instead of ~4.5k;
-  - at rest, ~250-500 wakeups/s instead of 1000, with coalescing;
+  - at rest, ~500-1000 wakeups/s instead of 1000, with coalescing (the code uses `IOSleepWithLeeway(1, 1)`);
   - **~2-3 % of a core**, no interrupt risk.
 - Must be checked: iperf/`networkQuality` throughput (29-36 MB/s baseline), ping jitter to the AP, and the AirDrop/AWDL on-channel TX
   (§10.89).

@@ -1859,6 +1859,7 @@ int itlmt7925::m3Run1()
         stGrpTx = 0;                                         // per-session: log the first few group TX frames again
         stEcho = 0;
         m3Link();                                            // returns only when this level has to be given up (m3stepDown)
+        setProperty("itlmt_pump_passes_per_s", 0ull, 32);  // no link, no pump: do not leave the last rate in ioreg
         return ITL_EIO;
     }
     if (fastActive && lvl >= 1 && m3reachedAssoc) {         // association / handshake failed with HT/VHT: try one level lower
