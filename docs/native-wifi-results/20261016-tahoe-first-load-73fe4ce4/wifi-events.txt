@@ -4,7 +4,7 @@
 # only the fragments stored in the log; macOS itself redacts SSIDs; MACs -> <mac>, pointers -> 0x<ptr>.
 
       1.5s         IO80211SkywalkInterface::setPowerState: interface[0x<ptr>], role[1] powerStateOrdinal[1] fPowerState[2]
-      1.5s         [ik] updateMacAddress@288:role<Infrastructure> init<1> informSkywalk=<0> isInterfaceEnabled=<0> client<3> mac address changed =<<mac>>-><DE:56:7B:34:81:D5>
+      1.5s         [ik] updateMacAddress@288:role<Infrastructure> init<1> informSkywalk=<0> isInterfaceEnabled=<0> client<3> mac address changed =<<mac>>-><<mac-36>>
       6.5s         first t=5s: [IOEthernetInterface - u=-1] [IOSkywalkLegacyEthernetInterface - u=-1] [HoRNDISInterface - u=-1] | skywalk unit=-1 defer=n >IOSkywalkLegacyEthernet >IOSkywalkLegacyEthernetInterface >IONetworkStack
       7.3s         <SCNetworkInterface 0x<ptr> [0x<ptr>]> {type = Ethernet, entity_device = (null), entity_type = Ethernet, name(k) = "ether", address = <mac>, builtin = TRUE, path = IOService:/AppleACPIPlatformExpert/RMNE@0/RMNE/IOEthernetInterface, entryID = 0x<ptr>, type = 6, order = 7 (Ethernet)}
       7.3s         <SCNetworkInterface 0x<ptr> [0x<ptr>]> {type = Ethernet, entity_device = (null), entity_type = Ethernet, name = <usb-tether>, name(l) = <usb-tether>, address = <mac>, builtin = FALSE, path = IOService:/AppleACPIPlatformExpert/PCI0@0/AppleACPIPCI/GPPC@8,3/IOPP/XHC0@0/XHC0@00000000/HS02@00200000/<usb-tether>@00200000/RNDIS Communications Control@0/HoRNDIS/HoRNDISInterface, entryID = 0x<ptr>, type = 6, USB name = <usb-tether>, USB vid/pid = 8921/10090, order = 7 (Ethernet)}

@@ -282,7 +282,7 @@ tool that exercises this. After the next boot: `rc=0 bsd_name='awdl0'`, no panic
 
 `./vif_create_test en5` on the boot with `itlmt_awdl=1`: `BindToInterfaceWithService(service=0x1803, en5) rc=0` +
 `RawSet(0x5e VIRTUAL_IF_CREATE, role=6) rc=0 bsd_name='awdl0'`, no administrator rights needed. `ifconfig awdl0`:
-`flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1484`, MAC `de:56:7b:34:81:d4` (primary + locally-administered
+`flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1484`, MAC `<mac-6>` (primary + locally-administered
 bit + last byte flipped), `inet6 fe80::dc56:7bff:fe34:81d4%awdl0`. `itlmt_native_trace`: `awdl:vif started`,
 `awdl:vif up bsd=awdl0`. No panic, Wi-Fi unaffected (ping 2.9 ms, `wifi-state=connected`). The 2026-10-17 panics are
 gone.
@@ -290,7 +290,7 @@ gone.
 ### 10.2 wifip2pd adopts the interface and maps the rings
 
 Right after the create (log 16:36:03): `(IO80211) Apple80211BindToInterfaceWithService: Sanity test passed` ->
-`Found new interface awdl0 with role AWDL` -> `Created AWDLInterface<P2PController<AppleIO80211Driver>>[awdl0]<de:56:7b:34:81:d4>`
+`Found new interface awdl0 with role AWDL` -> `Created AWDLInterface<P2PController<AppleIO80211Driver>>[awdl0]<<mac-6>>`
 -> `Successfully updated awdl0 link state to Link Up` -> `(IO80211) _createMemoryMappings: ringBuffer[0x102f80000]
 ringSize[0x4b000], ringState[0x102ac0000] ringSize[0x1000]` -> then the normal power/eligibility bring-up
 (`Registering for Power State changes from wifid`, `OS Eligibility: 5G/160 answer eligible`). The one failure is
@@ -425,7 +425,7 @@ never transmits anything:
 awdl:set SYNC_FRAME_TEMPLATE len=110
 awdl:accept setAWDL_SYNC_PARAMS / setAWDL_SYNC_STATE / setAWDL_ELECTION_PARAMS
 setSyncFramePeriod::Setting PSF period to 440
-AWDLStateDump: AWDL up time: 29 Secs, DE:56:7B:34:81:D4 peers:0, cached:0(0), rtg(0)
+AWDLStateDump: AWDL up time: 29 Secs, <mac-6> peers:0, cached:0(0), rtg(0)
 AWDLStateDump: PSFDwell Support/Active: 1/0 {0ms 0ms}
 IO80211AWDLPeerManager::monitorAWEvents WARNING: Did not get AW start event ...
 ```
@@ -531,7 +531,7 @@ What this round adds:
   broadcast action frames at all (then the RX filter, not the parser, is the next suspect).
 
 Once the layout is known the transmit path becomes three lines of wrapping in `awdlSyncTx()` - 802.11 header with the AWDL MAC
-(`de:56:7b:34:81:d4`) and the peer manager's BSSID (`00:25:00:ff:94:73`), category, OUI, then `awdlFrame` - and the same
+(`<mac-6>`) and the peer manager's BSSID (`00:25:00:ff:94:73`), category, OUI, then `awdlFrame` - and the same
 parser routes received frames to the peer manager.
 
 First capture attempt (d8a7d57, core `b614d747`, native `b14c06b4`): four dumps arrived, all `apple=0`, and none of them is
@@ -578,7 +578,7 @@ so the cadence and the content both come from it.
 
 ### 10.12 Receive half: action frames go to the Family's peer manager
 
-The transmit half is now correct (`awdl:psf armed tlv=110 frame=150 fc=d0 cat=7f oui=0017f2 type=08 sa=de567b3481d4`,
+The transmit half is now correct (`awdl:psf armed tlv=110 frame=150 fc=d0 cat=7f oui=0017f2 type=08 sa=<mac-6>`,
 `awdl sync: tx ch=6 len=150 ok=1`, ROC granted every time), and the other device still shows nothing. That is expected once
 the discovery chain is looked at: AirDrop lists a device only after that device's **service** is learned, and services are
 exchanged in AWDL action frames (service request / response, MIF). The Family builds them in `IO80211AWDLPeerManager`
@@ -1174,8 +1174,8 @@ What the traces show:
 * `awdl:rx buffer pool ready`, then `awdl:rx af` on all three social channels from five AWDL addresses; the RX-vector RSSI
   decodes in the sniffer layout (`d1=80970fff`, header at 184): -55 .. -86 dBm, one frame of ~20 without a vector
   (`norssi=1`). About half the frames are below the -70 edge (`weak`), as expected for devices in other rooms.
-* **The Family accepts them.** `com.apple.p2p.awdl0` logs `pppDone: Posted Peer Presence for DE:18:B3:E8:23:30` /
-  `86:B4:13:80:4C:AF`, `actionFrameReport: no overlap slots with [ 2A:0C:B5:75:EC:C7 ]`, and election runs against the peers'
+* **The Family accepts them.** `com.apple.p2p.awdl0` logs `pppDone: Posted Peer Presence for <mac-7>` /
+  `<mac-8>`, `actionFrameReport: no overlap slots with [ <mac-9> ]`, and election runs against the peers'
   trees (`isPeerSafeForElection: Peer DE:18:... seems to be stuck at AW0 18240, current AWSeqNum 18243`). §10.26 was the
   receive blocker; receive is done.
 * `awdl:rx tail cut 2 bytes` - the RX buffer carries 2 bytes after the frame; cutting them is right.
@@ -1555,14 +1555,14 @@ trees merge.
   (`runElection: ElectionParamsChanged`, `programChipWithNewMaster`).
 * **The election did pick the iPhone, once.** At 09:12:50 the log has:
   ```
-  programChipWithNewMaster: Programming new Mst: AE:E5:E4:83:39:FB ... HC 1 met 538 my met 522
-  runElection: ... New P:AE:E5:E4:83:39:FB ... [RLFC:621 HC:1 RMet:538 SLFC:52 SMet:522]
-  topMasterChanged: Top master changed to AE:E5:E4:83:39:FB
+  programChipWithNewMaster: Programming new Mst: <mac-10> ... HC 1 met 538 my met 522
+  runElection: ... New P:<mac-101> ... [RLFC:621 HC:1 RMet:538 SLFC:52 SMet:522]
+  topMasterChanged: Top master changed to <mac-10>
   ```
   So the merge logic works: the iPhone's metric 538 beats our 522.
 * **Then the peer aged out.** Within 5 s:
   ```
-  shouldRemovePeerFromNDP: No Action frames for(2397mSec) from AE:E5:E4:83:39:FB
+  shouldRemovePeerFromNDP: No Action frames for(2397mSec) from <mac-10>
   Posted Peer Absence
   ```
   The election then went back to self, and `SYNC_INFO: AWDLSequenceNumberNotUpdated for_9_AW_Start_events` was logged
@@ -1661,7 +1661,7 @@ Open after this round:
 * **The listen windows follow the iPhone.**
   * `lsn=473/335/0 ch=149 ptl=163` means the windows run on its channels (40/149/6).
   * `rx` climbed from 25 to 164 in about a minute, where earlier boots got a few frames a minute.
-  * From 10:17:53 the Family kept the iPhone (`AE:E5:E4:83:39:FB`) as a peer continuously. There was no
+  * From 10:17:53 the Family kept the iPhone (`<mac-10>`) as a peer continuously. There was no
     `No Action frames for ...` line and no `Peer Absence`.
 * **Election.**
   * At 10:14:17 the Family elected the iPhone (`HC 1 met 516`, while our metric was still 65).
@@ -1673,7 +1673,7 @@ Open after this round:
   10:18:04.058  Add  15 local. _airdrop._tcp. 366bfda0f544
   10:18:04.593  Add  15 local. _airdrop._tcp. 6bfb34049458
   ```
-  These are the iPhone and a second Apple device (`2E:4D:39:A2:2D:4D`, also a Family peer). `ndp -an` has
+  These are the iPhone and a second Apple device (`<mac-11>`, also a Family peer). `ndp -an` has
   `fe80::ace5:e4ff:fe83:39fb%awdl0` / `fe80::2c4d:39ff:fea2:2d4d%awdl0` as permanent entries.
 * **The next blocker is the data path.**
   * sharingd sends AirDrop `DISCOVER` requests to those services: `Sending DISCOVER request` →
@@ -1742,14 +1742,14 @@ Staged 2026-11-04 10:23:
 * **Nothing received yet.** `data rx=0`, `Ipkts 0`. No AirDrop `DISCOVER` happened in this boot: sharingd removed its AirDrop
   client at 12:25:52. So the TCP exchange was never attempted, and the receive half is untested.
 * **Bonjour.** `_airdrop._tcp` over awdl0 again: `366bfda0f544` at 12:26:11.
-* **The election now picks the iPhone** (new random MAC `82:F6:FC:2E:AB:90`, metric 515 vs our 510):
+* **The election now picks the iPhone** (new random MAC `<mac-12>`, metric 515 vs our 510):
   ```
-  programChipWithNewMaster: Programming new Mst: 82:F6:FC:2E:AB:90 ... HC 1 met 515 my met 510
+  programChipWithNewMaster: Programming new Mst: <mac-12> ... HC 1 met 515 my met 510
   ```
   It holds for minutes. But the driver stayed `role=1 align=0`: `setAWDL_SYNC_STATE` carried **state 1** with the iPhone's
   address, and the driver only treated state 2 as "slave". Our clock never followed, and the Family flagged it:
   ```
-  SYNC_INFO: (v10.0:iOS)(82:F6:FC:2E:AB:90) MI AF has sequence number:(21953), current window:(6248)
+  SYNC_INFO: (v10.0:iOS)(<mac-12>) MI AF has sequence number:(21953), current window:(6248)
   ```
   It also still logs `No Action frames for(2446mSec)` now and then.
 
@@ -1810,14 +1810,14 @@ cd /Volumes/ESP/EFI/OC && mv Kexts/itlmt7925.kext Kexts-backup/itlmt7925.kext.ba
 
 **Verified on this boot.**
 * Infrastructure Wi-Fi and Bluetooth came up normally. The §10.35 recovery was not exercised: no MCU timeouts.
-* **Slave sync works (§10.34).** `role=2 master=aee5e48339fb` (the iPhone), `align=2/59`, `syncs=465`, `adj` a few
+* **Slave sync works (§10.34).** `role=2 master=<mac-10>` (the iPhone), `align=2/59`, `syncs=465`, `adj` a few
   hundred µs. The Family's sequence numbers sit next to the iPhone's (`MI AF has sequence number:(13302), current
   window:(13292)`). Election metric: iPhone 537, ours 511.
 * **Data TX works (§10.33).** Native `dtx` 96 queued / 96 done; core `tx=95/95/0`; awdl0 `Opkts 96`.
 * **wifip2pd.**
   * `AWDLBrowse _airdrop._tcp.local was started`.
   * Discovery results for the iPhone's `_applicationservicepairing` / `_appsvcprepair` at −42 dBm.
-  * `Posted peer presence for ae:e5:e4:83:39:fb on awdl0`.
+  * `Posted peer presence for <mac-10> on awdl0`.
   * `AWDLAdvertise 366bfda0f544._airdrop._tcp.local was started` (our instance).
   * sharingd: `Device in everyone mode`.
 * **No data RX.** `drx=0`, core `data rx=0`, awdl0 `Ipkts 0`. sharingd never logged a DISCOVER from the iPhone.
@@ -1863,7 +1863,7 @@ Staged 2026-11-04 13:01:
    minute, use the restart sequence above.
 3. **Check sync.** Same as §10.34: `role=2`, `align` growing.
 4. **Check data RX** (the point of this round). Open the iPhone share sheet.
-   * m3-log `awdl data rx len=... sa=aee5e48339fb` lines appear; `rxstat data rx` > 0 with `hdr=0/B`, B > 0.
+   * m3-log `awdl data rx len=... sa=<mac-10>` lines appear; `rxstat data rx` > 0 with `hdr=0/B`, B > 0.
    * Native `drx=in/up/...` with up > 0; awdl0 `Ipkts` > 0.
    * Then sharingd `Received DISCOVER` / the Mac appears on the iPhone.
 5. **If `data rx` stays 0** but the iPhone's MIFs keep arriving, the iPhone is not sending data to us. Look next at
@@ -1879,7 +1879,7 @@ Staged 2026-11-04 13:01:
 **Verified on this boot.**
 * Core `8525CBFF` and native `529071AB` loaded; infrastructure Wi-Fi joined normally.
 * **Data RX fix works.** The first AWDL data frame was found ~130 bytes past rxHdrOff (`hdr=0/1`) and reached the stack:
-  `drx=1/1`, awdl0 `Ipkts 1`. It was mDNS (`da=3333000000fb`) from a third Apple device, `62:ed:76:a2:79:0d`, not
+  `drx=1/1`, awdl0 `Ipkts 1`. It was mDNS (`da=3333000000fb`) from a third Apple device, `<mac-13>`, not
   from the iPhone.
 * **Stale-drop works.** `stale=0`, `dtx` 105/105: no retry storm.
 
@@ -1903,7 +1903,7 @@ Staged 2026-11-04 13:01:
 * The Family's own dump says `AWDL on for more than 30 seconds with no TX (...) or RX (...)`. Its counters do not see
   our data path.
 * The only peer TLV 4 we have, published once at the first frame, names the iPhone itself as master (`+21 =
-  aee5e48339fb`). Ours names us. That looks like two masters, but the copy is stale.
+  <mac-10>`). Ours names us. That looks like two masters, but the copy is stale.
 
 **Hypothesis.** The iPhone does not take our PSF/MIF into its election or its service discovery. That would explain both
 boots:
@@ -1954,7 +1954,7 @@ userland, so awdl0 exists before sharingd and mDNSResponder start.
 * **pm=271/0/1.** In every frame the iPhone names itself as master. We are master too (`role=1`, metric 537 vs the
   iPhone's ~518), so the trees are split. Even so, the iPhone sends data to us.
 * **Data RX.** `data rx=163 hdr=0/163`, `drx=163/163`, awdl0 `Ipkts 171`. Included is unicast to our awdl0 MAC
-  (`fc=8808`, i.e. QoS data with the **retry** bit, `da=de567b3481d4`, ch 149).
+  (`fc=8808`, i.e. QoS data with the **retry** bit, `da=<mac-6>`, ch 149).
 * **Data TX.** `dtx=274/274`, core `tx=273/273`.
 * **TCP over AWDL works.** A 40 s `tcpdump -i awdl0` (351 packets) shows:
   * The Mac connects to the iPhone's `_appsvcprepair` service (iPhone ports 57707/57710), with SYN → SYN-ACK → data
@@ -1990,7 +1990,7 @@ Staged 2026-11-04 13:38:
    the second OMAC must not disturb the station.
 2. **Bring AWDL up.** Same order as §10.37: vif tool, dns-sd, wait for `enabled AWDL`, AirDrop toggle, then Finder >
    AirDrop and the iPhone share sheet.
-3. **m3-log.** `awdl own mac de567b3481d4 rc=0`.
+3. **m3-log.** `awdl own mac <mac-6> rc=0`.
 4. **Capture.** Record 40 s of `tcpdump -i awdl0` (as root), then check:
    * No more bursts of identical SYN-ACKs. If some remain, compare `drx ... /dup` with the bursts.
    * Port 8770 traffic, and the Mac shown on the iPhone.
@@ -2007,7 +2007,7 @@ Staged 2026-11-04 13:38:
 **Verified.**
 * Core `A03A05D7` and native `DC024A86` loaded. Infrastructure Wi-Fi joined normally, so the second OMAC does not
   disturb the station.
-* **OMAC 1 accepted.** `awdl own mac (omac 1) rc=0 st=0` / `awdl own mac de567b3481d4 rc=0`.
+* **OMAC 1 accepted.** `awdl own mac (omac 1) rc=0 st=0` / `awdl own mac <mac-6> rc=0`.
 * **Bring-up.** vif tool, then dns-sd: `enabled AWDL` immediately (14:41:35). After the AirDrop toggle, `AWDLAdvertise
   366bfda0f544._airdrop._tcp.local was started` (14:43:27).
 * **Unicast retries are gone.** `drx=49/34/0/0/15`: 15 retries were filtered. The 45 s awdl0 capture has 57 packets and
@@ -2091,7 +2091,7 @@ Staged 2026-11-04 15:00: core `88160DDE-6965-3E99-9991-E36849B247BC`. The previo
 ### 10.41 The AirDrop blocker is Bluetooth: bluetoothd's LE advertising never becomes ready (boot 14:37, Android scan 15:08)
 
 * **The Mac asks for advertising.** sharingd: `AirDropNW.BLE Started advertising` (15:05:52) and `CBAdvertiser Activated
-  ... CA DC:56:7B:34:81:D6`. bluetoothd receives `start advertising` requests for Nearby (`0B FF 4C 00 10 …`), type 9
+  ... CA <mac-5>`. bluetoothd receives `start advertising` requests for Nearby (`0B FF 4C 00 10 …`), type 9
   (`0D FF 4C 00 09 …`) and AirDrop.
 * **bluetoothd sends nothing.** Every request ends in `[Server.LE.Advertise] Stack is not started, updateAdvertisement
   returning`. Since the core stack started (14:38:25, `STACK_READY/StackStarted`), that was 81× `Stack is not ready,
@@ -2151,7 +2151,7 @@ Connect shows `4C 00 05`, then iPhone ↔ Mac AirDrop.
 **10:42 boot (v1.2.0): BLE mouse works and advertising is clean** (LinkReady 180 ms, 0× 718/766). Next: nRF Connect
 `4C 00 05` from the Mac, then iPhone ↔ Mac AirDrop.
 
-**10:54: Mac's AirDrop BLE advert seen on air** (nRF Connect: `4C 00 05 12 40 F5 …` from 57:8F:05:5D:57:87, matching the
+**10:54: Mac's AirDrop BLE advert seen on air** (nRF Connect: `4C 00 05 12 40 F5 …` from <mac-3>, matching the
 HCI trace). The §10.41 blocker is closed. Next: iPhone ↔ Mac AirDrop over AWDL.
 
 ### 10.42 Boot 2026-11-04 16:52 (core 88160DDE): fast recovery works, but the firmware now hangs every 1-3 minutes of AWDL
@@ -2264,7 +2264,7 @@ Staged 2026-11-04 17:43: core `525C76B6-B8D5-385D-AD56-587618D32DD6`. The previo
 The owner reported unstable Wi-Fi and went back to USB tethering. AWDL was not up this boot (no awdl0), so the §10.43
 code never ran.
 
-* **The network is a different AP:** `9c:5d:12:89:1f:24`, ch 157, VHT80, SSID length 12.
+* **The network is a different AP:** `<mac-14>`, ch 157, VHT80, SSID length 12.
 * **The AP drops us.** Disassociation reason 2, then deauthentication reason 1, every 30-80 s (21:46:59, 21:48:43,
   21:49:40 ...). airportd rejoined each time, 10 s per join, and the core ran a full `recover #N: wfsys reset` for every
   drop.
@@ -2349,11 +2349,11 @@ Staged 2026-11-04 23:12: native `E1DE91CA-5A6B-30A6-81BB-B00E60FCEB10`. The prev
 ### 10.46 Boot 2026-11-04 23:32 (core B1CA2849, native E1DE91CA): awdl0 comes up by itself; a new AP drops us because M4 is lost
 
 **§10.45 verified.** At 23:32:57, 2 s after Wi-Fi came up and with no tool run, wifip2pd logged
-`Found new interface awdl0 with role AWDL`. awdl0 is up with MAC `c6:91:a2:50:20:ba`. There is no
+`Found new interface awdl0 with role AWDL`. awdl0 is up with MAC `<mac-15>`. There is no
 `missing the capability` this boot.
 
 **New AP, new failure.**
-* The AP is `02:f0:7b:79:7c:56` (ch 52, SSID length 14, CCMP/PSK, no MFP). The owner sees "Weak Security" in the Wi-Fi
+* The AP is `<mac-16>` (ch 52, SSID length 14, CCMP/PSK, no MFP). The owner sees "Weak Security" in the Wi-Fi
   menu and the network keeps dropping.
   * The label comes from ControlCenter's recommendation UI (`DISPLAY WIFI RECOMMENDATION UI`, 23:35:09). It describes the
     AP's configuration. airportd's records all say `NetworkHasWeakSecurity = 0`.
@@ -2447,7 +2447,7 @@ Staged 2026-11-05 09:09: native `59639683-12FE-3989-9689-9C44E28D4536`. The prev
 **AirDrop, both directions: the devices do not see each other.**
 * **Bluetooth works:** sharingd hears the iPhone (`Found BLE device`, `Device in everyone mode`), and the AirDrop Bonjour
   server listens on awdl0:8770.
-* **The Family keeps the iPhone unroutable.** In 83 of 83 checks: `isPeerRoutable: Peer E6:4F:AE:93:D5:E7 rssi:-80 Not
+* **The Family keeps the iPhone unroutable.** In 83 of 83 checks: `isPeerRoutable: Peer <mac-17> rssi:-80 Not
   Routable. Peer discovered(on 2.4GHz only) and is outside bubble`. With no route, nothing reaches the TCP/Bonjour stage.
 * **Why (read from 25G241, facts only).**
   * `IO80211AWDLPeer::isPeerRoutable` calls `isDualBandPeerDiscoveredOn5GHz`. That is false for a dual-band peer whose
@@ -2459,7 +2459,7 @@ Staged 2026-11-05 09:09: native `59639683-12FE-3989-9689-9C44E28D4536`. The prev
   * So the Family never received an iPhone frame tagged with a 5 GHz channel. The iPhone's sequence (TLV 4, encoding 1)
     is 157 (40 MHz, center 159), 149 (center 151), and 6. Our listen windows go to 157/149, but no frame from the iPhone
     was handed up from them.
-* **Not synchronised.** We stay our own master (`master=eeaf4d21ea44`); the iPhone follows `7e:59:0c:c9:7b:24`.
+* **Not synchronised.** We stay our own master (`master=eeaf4d21ea44`); the iPhone follows `<mac-18>`.
   `pm=473/1/62`: peers name themselves, and us only once.
 
 **Wi-Fi lost at 11:01:33.**
@@ -2535,7 +2535,7 @@ The import lists are unchanged (`nm -u` diff empty).
 **Still open.**
 * AirDrop: the devices do not see each other. `rtg(0)` (no routable peer); `peers:2`.
 * We are still master of our own cluster: `master=8e7c08617f6b` is our own (new) AWDL address, and `pm=34/0/0`, so no
-  peer names us. The iPhone (`52:28:55:00:25:36`) was heard on ch 6, 149 and 157 at -54..-61 dBm. The election not
+  peer names us. The iPhone (`<mac-19>`) was heard on ch 6, 149 and 157 at -54..-61 dBm. The election not
   converging is the next thing to read.
 * The owner switched to USB tethering at 12:34:38 (router 172.31.158.61). If that is the iPhone's Personal Hotspot,
   the iPhone may keep AWDL off while tethering. Test without it.
@@ -2570,7 +2570,7 @@ The import lists are unchanged.
 
 **1. Garbage channels come from FCS-failed frames.**
 * wifip2pd logged `Failed to parse event[48]` 8 times. The event is our `apple80211_act_frm_hdr` + action body from
-  `52:28:55:00:25:36`. Its TLV 4 is intact up to the channel sequence (`0f 01 00 03 ff ff 1d 9f`), and from there on it is
+  `<mac-19>`. Its TLV 4 is intact up to the channel sequence (`0f 01 00 03 ff ff 1d 9f`), and from there on it is
   noise (`00 80 d7 a1 32 27 00 e0 c8 fa ...`).
 * The same frames gave the listen timer channels 26, 249 and 253.
 * Cause: the window's RX filter had BIT(2) (pass FCS-failed frames) and the sniffer config `drop_err = 0`. Both were set
@@ -2589,10 +2589,10 @@ The import lists are unchanged.
 * Linux keeps the queues' memory across a reset (`mt792x_wpdma_reset`).
 
 **Also seen.**
-* The AWDL peer we talk to, `52:28:55:00:25:36`, is a **MacBook Air (2)**, not the iPhone. wifip2pd discovered its
+* The AWDL peer we talk to, `<mac-19>`, is a **MacBook Air (2)**, not the iPhone. wifip2pd discovered its
   `_airdrop._tcp`, `_appsvcprepair._tcp` and `_applicationservicepairing._tcp` and established a datapath
   (`AWDLDatapathInitiator ... datapath established`). So the AWDL path works with a real Apple device.
-* The MacBook Air names `7e:59:0c:c9:7b:24` as its master, the same master the 10:42 boot saw; that may be the iPhone.
+* The MacBook Air names `<mac-18>` as its master, the same master the 10:42 boot saw; that may be the iPhone.
   We never adopt it, and we stay master of our own cluster (`master=` our own address).
 
 **Round 20 (core).**
@@ -2613,7 +2613,7 @@ The import lists are unchanged.
 1. No `Failed to parse event` from wifip2pd, and no `awdl: no window on channel` for garbage values.
 2. No `chip reset requested`. If one comes, `recover: M1 rc=0` every time (no `ring alloc failed`).
 3. AirDrop: the MacBook Air (2) should show up in Finder → AirDrop. Then read whether we ever follow
-   `7e:59:0c:c9:7b:24`.
+   `<mac-18>`.
 4. **Undo (core):** as §10.49, with `itlmt7925.kext.20261105-125517`.
 
 ### 10.52 Boot 2026-11-05 13:03 (core 7E6BA3AE, native 13C3687D): recovery works; a stale ROC event still kills the firmware
@@ -2666,7 +2666,7 @@ The import lists are unchanged.
 
 **What works now.**
 * No stale-ROC kill: `roc event ignored` caught 3 stale events (tag `0xBEEF`, status `0xAD`) in the first 2 minutes.
-* The Mac synced as a slave to the iPhone (`role=2 master=7e590cc97b24`).
+* The Mac synced as a slave to the iPhone (`role=2 master=<mac-18>`).
 * wifip2pd discovered the iPhone's services, `_airdrop._tcp` included. sharingd logged the endpoints as passing its
   filter. A `dns_sd` browse and resolve over `awdl0` returned SRV port 8770 and a 13-byte TXT.
 
@@ -3148,7 +3148,7 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 ### 10.65 Boot 2026-11-06 12:50 (core 25E4B5AF, native 102D1566): the iPhone is master, AirDrop requests go both ways, files do not; chaining still hangs → one window per run (native 6B413594)
 
 **What works now.** The AP was on ch 40 this boot.
-- With the share sheet open, the Mac became the iPhone's **slave** (role=2, master = the iPhone's d2:e6:e3:2f:3d:af). This is the first time.
+- With the share sheet open, the Mac became the iPhone's **slave** (role=2, master = the iPhone's <mac-20>). This is the first time.
 - Our TLV 4 now carries exactly the iPhone's sequence: 149 in slots 0-2 and 9-10, ch 6 in slot 8, the rest empty.
 - Mac and iPhone see each other and AirDrop requests arrive in both directions (with the AirDrop code prompt), but no file goes through.
 - Ping to the iPhone: 14/30 answered (+18 duplicates), RTT 24 ms to 1.9 s, average 1.18 s.
@@ -3387,7 +3387,7 @@ Without chaining, back-to-back EAWs cannot all be met (setup takes about 35 ms, 
 ### 10.73 Boot 2026-11-08 11:19 (core 645E44F5, native 6B413594): data frames never reach the AP → main's driver staged to get Wi-Fi back (core F3E732F4, native 3A02974A)
 
 **What happened.** No network over Wi-Fi. The owner went back to USB tethering, then turned Wi-Fi off. They asked that nothing touch the live network until Wi-Fi works again; USB tethering has panicked this machine before.
-- AP: `ee:74:d7:57:85:bb`, channel 36, VHT only (`he=0/0`), 80 MHz (`bw=2 center=42`). The link was stepped down to fast level 3.
+- AP: `<mac-21>`, channel 36, VHT only (`he=0/0`), 80 MHz (`bw=2 center=42`). The link was stepped down to fast level 3.
 - RSSI −62 to −65 dBm (CoreWLAN), noise 0; the reported rate stayed at 54.
 - Receiving works: the AP's M1 arrived 11 times.
 - Transmitting does not:
@@ -3467,7 +3467,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 
 **What the log shows (read only, nothing run on the network):**
 - `eeprom(efuse) rc=0 st=0` (format WHOLE). `sar: MTDS v2 MTGS v2 -> 2g 59 5g 59` (29.5 dBm, so the world ceiling 40 = 20 dBm is the limit). `clc 00 env 1: power 6 ext 6`, `txpower: 21 commands … rc=0`.
-- AP: "Agapi 5G" `24:de:c6:11:e8:f0`, ch 44, HT40 only (`vht=0 he=0`), no Country IE (domain "00"), RSSI −56 dBm. Auth, assoc and EAPOL each went through on the first frame (`txFail=0`).
+- AP: "Agapi 5G" `<mac-22>`, ch 44, HT40 only (`vht=0 he=0`), no Country IE (domain "00"), RSSI −56 dBm. Auth, assoc and EAPOL each went through on the first frame (`txFail=0`).
 - `stat-log` at 123 s, L6: `txf=15373/0/0/29/3722`. 0.2% failed, 0.24 retries per frame. On 11:57 (§10.75) it was 81% failed, 11.6 retries.
 - MtkBtFw + BtLeDlFix loaded, BT firmware v9736. macOS shows Bluetooth `Off` (the user toggle).
 
@@ -3494,7 +3494,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 
 ### 10.77 Boot 2026-11-08 20:26 (core A171AD24, native B9AE6E64, Bluetooth on): a strong AP, full speed; AirDrop test next
 
-**Wi-Fi, "Thanh coffee"** `9c:5d:12:89:1f:24`, ch 157, VHT80 (`bw=2 center=155`), Country IE US (`regulatory: country US`, `clc US … power 8 ext 8`, `txpower … rc=0`), RSSI −41 dBm. Test bound to en1 (owner's go-ahead), USB tethering off:
+**Wi-Fi, "Thanh coffee"** `<mac-14>`, ch 157, VHT80 (`bw=2 center=155`), Country IE US (`regulatory: country US`, `clc US … power 8 ext 8`, `txpower … rc=0`), RSSI −41 dBm. Test bound to en1 (owner's go-ahead), USB tethering off:
 
 | | result |
 |---|---|
@@ -3560,7 +3560,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 - The window timing improved: `avglate` 39.5 → 9.3 ms. Late ROC windows averaged ~18 ms; late on-channel windows 4.2 ms (`onlate=121/4178us`). `cut=146/40`.
 - But AirDrop got worse: the owner saw neither device from the other. sharingd found the peer's `_airdrop` service, but every `DISCOVER` stayed `in_progress resolver` (the peer's hostname never resolved over awdl0) and timed out after 5 s.
 - Driver: `dtx=32/32/0/0/32/0`: the stack handed us only 32 frames, all multicast (mDNS), and `txfree grp=2/30`. No unicast was ever queued (`uc=0/0`), because nothing resolved.
-- We were slave (`role=2`) of `c2:cc:1f:b0:61:ad` (−33 dBm, the iPhone next to the Mac).
+- We were slave (`role=2`) of `<mac-23>` (−33 dBm, the iPhone next to the Mac).
 
 **Cause.** The gap broke §10.62's rule: advertised presence must equal real presence. Our sequence still claimed every 149 EAW in full, but the window now left after 23.5 ms. The peer's answers in the rest of those EAWs were sent where we no longer were.
 
@@ -3625,7 +3625,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 
 ### 10.84 Boot 2026-11-09 09:31, "Medicomm" (160 MHz): Wi-Fi drops = the sniffer config's width code (core 2773F995, installed)
 
-**Wi-Fi drops.** The link is on "Medicomm", `34:98:b5:a2:73:44`, ch 40, `bw=3 center=50` (HE 160 MHz, rate 2402), RSSI −42 dBm. `wifi-events`: up at 19 s; at 465 s "firmware not answering MCU commands"; reset and firmware reload; up again at 491 and 506 s. `m3-log` shows where it stopped:
+**Wi-Fi drops.** The link is on "Medicomm", `<mac-24>`, ch 40, `bw=3 center=50` (HE 160 MHz, rate 2402), RSSI −42 dBm. `wifi-events`: up at 19 s; at 465 s "firmware not answering MCU commands"; reset and firmware reload; up again at 491 and 506 s. `m3-log` shows where it stopped:
 
 - `awdl: sniffer off took 73 ms (ch=40)`, then `mcu hist … rx_filter:0 sniffer on:0 sniffer cfg:-110 sniffer off:-110`.
 - The timed-out command is the sniffer config of an on-channel AWDL window (AP channel 40). §10.58 gave such windows the link's real width.
@@ -3641,7 +3641,7 @@ Wi-Fi and Bluetooth share the antenna on this combo chip. The symptom (RX fine, 
 
 **AirDrop on this boot (read from ioreg, no test run):**
 - `syncs=0`, and we are our own master (`top=` self).
-- Peers were heard almost only on 5 GHz: `band=3/643`, `rssi5=-93..-61`, `weak=624` of 646 frames below −70 dBm. These look like other people's devices in the café; the peer that published its sync TLV, `46:5c:f4:97:bd:e6`, runs 149 with one slot on 6.
+- Peers were heard almost only on 5 GHz: `band=3/643`, `rssi5=-93..-61`, `weak=624` of 646 frames below −70 dBm. These look like other people's devices in the café; the peer that published its sync TLV, `<mac-25>`, runs 149 with one slot on 6.
 - sharingd ran no Bonjour DISCOVER this boot: the AirDrop sheet never reached browsing while the logs were kept.
 - Because the link kept resetting (firmware reload, every AWDL window torn down), this AirDrop result says nothing yet. Re-test with the AirDrop sheet open after the core fix: `itlmt-awdl` (syncs, role, rx and weak against the owner's iPhone address), plus sharingd `AirDropNW.Discovery`.
 - **Installed 2026-11-09 09:46** with the owner's OK. Backup of BBFBA198: `EFI/OC/Kexts-backup/itlmt7925.kext.20261109-094632`. Native stays 25F33563.
@@ -3672,8 +3672,8 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 
 **What failed:**
 - Every DISCOVER timed out after 5 s.
-- `netstat`: `fe80::40bc:…:51838 → fe80::10b4:23ff:fe47:a0dd.8770 SYN_SENT`. The iPhone's AWDL MAC is `12:b4:23:47:a0:dd`.
-- `ndp -an` on awdl0 lists only our own two addresses (`3e:c4:cd:e8:5c:9c`, `42:bc:8d:c8:74:8b`, both "permanent"), and no entry for the iPhone. The Family's peer manager never installed it as a peer, so unicast to it cannot work.
+- `netstat`: `fe80::40bc:…:51838 → fe80::10b4:23ff:fe47:a0dd.8770 SYN_SENT`. The iPhone's AWDL MAC is `<mac-26>`.
+- `ndp -an` on awdl0 lists only our own two addresses (`<mac-27>`, `<mac-28>`, both "permanent"), and no entry for the iPhone. The Family's peer manager never installed it as a peer, so unicast to it cannot work.
 - Core `awdl txfree`: `uc24=4/9 uc5=2/97` (ok/fail).
 - The iPhone's frames are just below the peer manager's edge: a sample on ch 6 had `rssi=-71`. Native `weak=1537` of 2511 frames are below −70 dBm.
 - At Thanh coffee (§10.80) the same iPhone read −33 dBm, and §10.32 already noted "weak with the iPhone next to the Mac: check the RCPI decode".
@@ -3688,7 +3688,7 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 
 **Next test:**
 - Keep the iPhone next to the Mac and open AirDrop on both.
-- Read `awdl-rssi-raw` (the iPhone's `12b42347a0dd` rows or its new MAC) and `itlmt-awdl` `weak=`.
+- Read `awdl-rssi-raw` (the iPhone's `<mac-26>` rows or its new MAC) and `itlmt-awdl` `weak=`.
 - Check `ndp -an | grep awdl0` for a peer entry, and look for DISCOVER responses.
 - **Installed 2026-11-10 22:04** with the owner's OK. Backup of 2773F995: `EFI/OC/Kexts-backup/itlmt7925.kext.20261110-220437`. Native stays A62C12D2.
 
@@ -3696,7 +3696,7 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 
 - **Build:** the owner's build of `dev/open-wifi` (core 5E4A1B60, native 52A0E786). It contains §10.84 (sniffer width), §10.86 (Linux RXD layout, `awdl-rssi-raw`) and the open-network join (bc2b07b). `dev/awdl` was fast-forwarded to it (31c65e1).
 - **RSSI:** `awdl-rssi-raw` decodes cleanly: chains 2/3 = 0xff, RCPI0/1 present, for example `v3=ffff7e70` → −47 dBm. The peers read −44…−47 dBm on 149. `weak=90` of 1482 frames.
-- **Peers:** the peer manager installed them. `ndp -an` on awdl0 has `0a:9d:cd:86:be:5e` (the other Mac) and `3a:62:64:31:60:2e` as permanent entries; on 2026-11-10 only our own addresses were there.
+- **Peers:** the peer manager installed them. `ndp -an` on awdl0 has `<mac-29>` (the other Mac) and `<mac-30>` as permanent entries; on 2026-11-10 only our own addresses were there.
 - **Data:**
   - A TCP connection to `fe80::89d:cdff:fe86:be5e.8770` was in SYN_SENT at 18:55:51 and ESTABLISHED by 18:56:15 (two connections).
   - awdl0 counters: 152 packets in, 152 out.
@@ -3768,7 +3768,7 @@ AP: ch 56, 160 MHz, link stable (up 1437 s, `fail=0`).
 
 ### 10.90 Boot 2026-11-23 13:15 (core B9E6878A, native 52A0E786), "laon" ch 36 VHT80: AirDrop Mac → a nearby MacBook (a known contact)
 
-- **Discovery:** AirDrop window opened at 13:40:17; "Endpoints discovered / Adding discovered endpoint" at 13:40:22 (5 s). The peer `72:9d:5e:a9:bf:87` became a permanent ndp entry, and the Finder window showed the contact by name.
+- **Discovery:** AirDrop window opened at 13:40:17; "Endpoints discovered / Adding discovered endpoint" at 13:40:22 (5 s). The peer `<mac-31>` became a permanent ndp entry, and the Finder window showed the contact by name.
 - **Send** (`AirDrop.36DAA487`, a 1-line text file):
   - `START` 13:42:31.459.
   - No PIN phase: the receiver is a contact.
@@ -3850,7 +3850,7 @@ The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 4
 **But AirDrop got worse.**
 - The owner saw the MacBook appear and disappear in the AirDrop window, even with "Everyone" set.
 - A send waited a long time and the PIN prompt never appeared.
-- Log `build/ask-1091.txt`: the Family posts `Peer Presence` for `52:08:0C:19:04:CB`, then `Peer Absence` 7–20 s later, again and again:
+- Log `build/ask-1091.txt`: the Family posts `Peer Presence` for `<mac-32>`, then `Peer Absence` 7–20 s later, again and again:
 
   | Presence | Absence |
   |---|---|
@@ -3861,7 +3861,7 @@ The mDNS packets that did arrive came in bursts: 8 within 2 ms at 40.989, 9 at 4
   | 47:18.50 | … |
 
   Each re-add starts from `SUI 0 → 1185`, so the peer entry is recreated each time. mDNSResponder follows it with `D2DServiceLost` / `D2DServicePeerLost`.
-- `runElection` keeps us as our own master every ~3 s (`New P:DA:FB:F4:DE:22:64`, our awdl0 address).
+- `runElection` keeps us as our own master every ~3 s (`New P:<mac-102>`, our awdl0 address).
 
 **Counters, this boot vs §10.90:**
 
@@ -3902,7 +3902,7 @@ The `awdl txfree` line prints `bcm=`. With this, A and B can be compared in one 
 
 ### 10.93 A/B of `itl_awdlbcm`, boot 2026-11-25 10:40 (core D2CAADD0), AP on ch 44: PSF/MIF retries brought the MacBook back; the trees do not merge
 
-Same boot, same room. The peer is `72:9D:5E:A9:BF:87`, the MacBook of §10.90. Log: `build/ab-1125.txt`; counters: `build/ab-1125-marks.txt`.
+Same boot, same room. The peer is `<mac-31>`, the MacBook of §10.90. Log: `build/ab-1125.txt`; counters: `build/ab-1125-marks.txt`.
 
 | Phase | `bcm` | Δrx | Δweak | non-weak | Δdrx in/up | Δpm us/other | Presence / Absence of the MacBook |
 |---|---|---|---|---|---|---|---|
@@ -3912,7 +3912,7 @@ Same boot, same room. The peer is `72:9D:5E:A9:BF:87`, the MacBook of §10.90. L
 - **Presence returns at once.** The MacBook was posted present at 10:45:51, one second after the switch to `bcm=2`. It then flickers: absent at 46:35, present at 46:53, absent at 47:06, present at 47:09, absent at 47:28.
 - **A is contaminated.** Our AirDrop browse stopped at 10:44:56 ("No AirDrop browse clients present"), halfway through A.
 - **The trees do not merge.**
-  - The far device `B2:33:07:BE:2E:CB` (−76..−79) is `Not Routable` 130–143 times per phase.
+  - The far device `<mac-33>` (−76..−79) is `Not Routable` 130–143 times per phase.
   - `pm` says the peers mostly name another master (`other`), and we stay our own master (`syncs=0`).
 
 **Reading.** The MacBook follows another tree's master. Our windows are on our own timeline, so its frames and ours meet only by chance. The 15 retries of each PSF/MIF without BCM (§10.91) spread every frame over tens of ms and raised that chance. That is why the old behaviour "worked" and the Linux-correct one flickers.
@@ -3929,15 +3929,15 @@ The retries are not the fix. The fix is to be in the same tree: we must take the
 ### 10.94 Same boot, 11:00–11:03, with an iPhone next to the Mac (AirDrop open): who the peers follow
 
 **The nearby devices follow a far master, not us.**
-- The iPhone (`66:B1:B2:A2:55:32`) and the MacBook (`72:9D:5E:A9:BF:87`) are each posted `Peer Absence` and removed: the iPhone at 11:02:18, the MacBook at 11:02:41. No `Peer Presence` was posted during the capture.
-- `itlmt-awdl-peer-el`: the master they follow is `92:13:b0:fe:5c:8b`. It names itself (hop 0) with:
+- The iPhone (`<mac-34>`) and the MacBook (`<mac-31>`) are each posted `Peer Absence` and removed: the iPhone at 11:02:18, the MacBook at 11:02:41. No `Peer Presence` was posted during the capture.
+- `itlmt-awdl-peer-el`: the master they follow is `<mac-35>`. It names itself (hop 0) with:
   - metric 0x1fe (510);
   - v2 counter 0x01289f (75935).
 - We hear that master only at −83..−87 dBm on ch 149.
 - Our own election TLV:
   - metric 529, higher than its 510;
   - v2 counter 0x1a9 (425), far lower than its 75935.
-- Our Family keeps electing ourselves (`New P:CA:F1:4E:9C:17:EA`, our awdl0 address) every 3.15 s, so we are a one-node tree. The devices next to us live on the other tree's timeline.
+- Our Family keeps electing ourselves (`New P:<mac-103>`, our awdl0 address) every 3.15 s, so we are a one-node tree. The devices next to us live on the other tree's timeline.
 
 **The Family believes awdl0 carries no traffic.**
 - `AWDLStateDump: AWDL on for more than 30 seconds with no TX (1274772 ms) or RX (1274772 ms)`. That is the whole uptime, although `drx`/`dtx` count frames.

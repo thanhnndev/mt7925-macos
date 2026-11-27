@@ -959,7 +959,7 @@ After the reboot (stage b), same signs as the 24H32 rounds plus the new ones:
 ### First load result (2026-10-16): Wi-Fi came up, the scan list was garbled
 
 Stage b did load on Tahoe: `itlmt7925Wifi` init against `IO80211_kexts-1566.5`, role 1, `mk:startWithInfo ok`, service
-registered, `ifnet_attach` gave **en5** (`IOSkywalkLegacyEthernetInterface`, MAC `de:56:7b:34:81:d5`), and the radio path
+registered, `ifnet_attach` gave **en5** (`IOSkywalkLegacyEthernetInterface`, MAC `<mac-36>`), and the radio path
 worked - `APPLE80211_IOC_CARD_CAPABILITIES` GOOD, radio power from System Settings accepted (GET POWER / GET OP MODE on
 en5), the core scanned at boot (`scan finished done=1@2410ms rx=85 bcn=83 aps=48`) and every one of airportd's 84
 `APPLE80211_IOC_SCAN_REQ` calls answered GOOD (13 live core scans, the rest from airportd's cache; `scan:delivered 48 of
@@ -1081,14 +1081,14 @@ Test checklist for the next boot (stage b):
 1. `ioreg -l | grep itlmt_native_trace` — `wcl:lqm post beacons=N delta=D` with N growing; `ctl:faultPipe=1` still there.
 2. Idle ≥2 minutes on the link: no `link_off` / `link recovery` in `log show --last boot` (previously guaranteed at ~60 s),
    no `missed beacons` fault, no new `corecaptured-*.ips`.
-3. Wi-Fi menu: a network on a DFS channel (the "Kefoff Coffee" 5 GHz case) should now be listed; `wdutil scan` welcome.
+3. Wi-Fi menu: a network on a DFS channel (the "<ssid-B>" 5 GHz case) should now be listed; `wdutil scan` welcome.
 4. Still no panic; the usual trace lines (`scan:delivered`, `dp:` counters) unchanged.
 
 ### 2026-10-17 (round 27b): the fixes hold on hardware; NSS ioctl and a trace ring
 
 The 14:33 boot ran both round-27 kexts. Results (full write-up in the same results directory):
 
-* **"Kefoff Coffee" joined on channel 52 — a DFS channel** (`fast: on lvl=6 … bw=3 center=50 nss=2 rate~2402`, 160 MHz
+* **"<ssid-B>" joined on channel 52 — a DFS channel** (`fast: on lvl=6 … bw=3 center=50 nss=2 rate~2402`, 160 MHz
   HE 2x2). The link_off at 14:37:09 is the network switch itself (`AutoJoin: … Join is in progress`), not a drop.
 * No `missed beacons` fault, no `link recovery`, no new `corecaptured-*.ips`; the LQM posts run (`P:27x517` in the call
   ring, ≈1/s) — they were invisible in the trace only because both 1500-byte trace buffers had filled up.
@@ -1132,10 +1132,10 @@ with `scripts/native-wifi-test.sh install build/itlmt7925Native.kext --stage b`.
 
 ### 2026-10-18: group-addressed TX moves to the BSS wcid (two networks that connect but cannot reach the internet)
 
-Thai Apartment (the "weak security" WPA/WPA2 network) and a phone hotspot both fail the same way: association and the
+<ssid-A> (the "weak security" WPA/WPA2 network) and a phone hotspot both fail the same way: association and the
 4-way handshake complete (`assoc-ok`, `hs-ok`, `key(ptk) rc=0`, `key(gtk) rc=0`), DHCP DISCOVERs (`tx udp 68>67`) and
 ARP probes (`tx arp op=1`) go out — and nothing answers (no `rx udp 67>68`, no ARP reply), so the interface falls back
-to 169.254/16. Tiem O Day works fully in the same boot, so the RF/RX path is fine.
+to 169.254/16. <ssid-C> works fully in the same boot, so the RF/RX path is fine.
 
 One difference against mt76 had been left in the TX descriptor: group-addressed data (broadcast/multicast DA = `addr3`)
 went out on wcid 1 (the AP/station entry, where the pairwise key lives), while `mt792x_tx` sends frames without a station
@@ -1149,7 +1149,7 @@ first six group frames of every session log `tx grp len=… wc=19`.
 
 ### First hardware result: wcid 19 alone is not enough — the firmware never had the entry
 
-The first build (wcid 19 in the TXD, nothing else) went on the machine on 2026-10-18: Tiem O Day — the network that
+The first build (wcid 19 in the TXD, nothing else) went on the machine on 2026-10-18: <ssid-C> — the network that
 worked before — lost DHCP as well (`tx grp len=… wc=19` x6, `tx udp 68>67` x4, no `rx udp 67+`), so group TX on wcid 19
 was being dropped, not mis-encrypted. The missing piece is in the firmware's view of wcid 19, and mt76 has it:
 
@@ -1172,7 +1172,7 @@ The log shows the new record as `sta_rec_bss rc=0 st=0` and the BSS phases as `b
 ### Second hardware result: even with every mt76 record, this firmware drops wcid-19 TX
 
 After the reboot every new record was accepted (`bss_info(add)`, `sta_rec_bss rc=0 st=0`, `bss_info(assoc)`,
-`key(gtk) rc=0`) and group TX really used `wc=19` — and Tiem O Day still got no DHCP OFFER (4 DISCOVERs out, one
+`key(gtk) rc=0`) and group TX really used `wc=19` — and <ssid-C> still got no DHCP OFFER (4 DISCOVERs out, one
 broadcast ARP in, then the supervisor gave up). Meanwhile the wcid-1 path has always worked, and it demonstrably uses
 the group key (the AP accepts those frames) — so the hardware picks the BSS group key for group-addressed data no matter
 which of our wcids the descriptor points at. Conclusion: mt76's wcid choice is not the fix, and forcing it needs the
@@ -1182,7 +1182,7 @@ The whole experiment is therefore switchable at run time — `sudo build/itlctl 
 AP-wcid path** (what has always worked, plus the new trace); 1 = mt76's BSS wcid 19 plus its STA_REC records at the next
 reconnect. A/B inside one boot:
 
-1. Boot with the default: Tiem O Day must work again.
+1. Boot with the default: <ssid-C> must work again.
 2. `sudo build/itlctl itl_grp19=1 itl_lvl=6` (the level forces the reconnect so the wcid-19 records go out): the same
    network should stop answering DHCP — that is the control for the hotspot test.
 3. `sudo build/itlctl itl_grp19=0 itl_lvl=6`: back to working.
@@ -1203,7 +1203,7 @@ no panic.
 
 ### Control test on hardware: the `itl_grp19` switch works, and the rejoin path has its own bug
 
-The `itl_grp19` A/B ran on Tiem O Day in one boot (`itl_grp19=1 itl_lvl=6; sleep 30; itl_grp19=0 itl_lvl=6`):
+The `itl_grp19` A/B ran on <ssid-C> in one boot (`itl_grp19=1 itl_lvl=6; sleep 30; itl_grp19=0 itl_lvl=6`):
 
 * grp19=1: the join carried `sta_rec_bss rc=0` and the group frames went out as `tx grp … wc=19` — the switch reaches
   the TXD. grp19=0: the same frames came back as `wc=1`. No DHCP OFFER in either phase, but the DHCP client did not
@@ -1236,7 +1236,7 @@ Reading the code next to the failing-network evidence turned up a real, network-
   encrypted), `key(gtk,c04)` / `key(ptk,c04)` show the cipher that was installed, and the RSN line now carries
   `pick=` (chosen pairwise) and `cap=` (RSN capabilities, PMF bits).
 
-Test order after the reboot: Tiem O Day first (`pulse` must show `bcn` climbing), then the phone hotspot, then Thai
+Test order after the reboot: <ssid-C> first (`pulse` must show `bcn` climbing), then the phone hotspot, then Thai
 Apartment when back in range — the hotspot log now shows the cipher path end to end.
 
 ### The scan list was missing every named 2.4 GHz network (the 48-slot AP table evicted them)
