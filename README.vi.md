@@ -21,8 +21,8 @@ kext). **Bluetooth:** controller chạy và thiết bị BLE kết nối đượ
 |---|---|---|
 | **Chế độ native** (menu Wi-Fi, kết nối từ System Settings) | ✅ **chạy được**: tải xuống 176.6 Mb/s, tải lên 65.0 Mb/s (`networkQuality`), HE 160 MHz 2×2, kênh DFS | ✅ chạy được: 28-36 MB/s một luồng TCP, `networkQuality` 293 / 45 Mb/s |
 | **Chế độ legacy** (hiện là Ethernet, mật khẩu nhét vào kext) | chưa test trên Tahoe | ✅ ổn định, dùng lâu nhất |
-| Lấy ở đâu | Wi-Fi: release **v2.0-beta.1** (nhánh `dev/awdl`). Bluetooth: release **bt-v1.1** (nhánh `fix/bt-waitquiet`) | nhánh `sequoia`, release **v1.1** và **bt-v1.0** |
-| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ chạy trên `25G332` với `MtkBtFw` 0.3.1 + `BtLeDlFix` 1.4.0: chuột BLE (2026-11-05), hết vòng lặp lỗi advertising (2026-11-08), `bluetoothd` không còn lỗi lúc khởi động (2026-11-23). `MtkBtFw` 0.3.1 làm màn hình đăng nhập chậm thêm 4 đến 9 giây. Chưa ghi nhận ghép bàn phím. `BtLeDlFix` vá `bluetoothd`: chạy `tools/btledl-check.py` sau mỗi lần cập nhật macOS | ✅ controller chạy; chuột BLE và tai nghe classic kết nối được. Chưa ghi nhận ghép bàn phím |
+| Lấy ở đâu | Wi-Fi: release **v2.0-beta.1** (nhánh `dev/awdl`). Bluetooth: release **bt-v1.2** (`main`) | nhánh `sequoia`, release **v1.1** và **bt-v1.0** |
+| **Bluetooth** (`MtkBtFw` + `BtLeDlFix`) | ✅ chạy trên `25G332` với `MtkBtFw` 0.3.3 + `BtLeDlFix` 1.4.0: nạp firmware được và không có vòng lặp lỗi advertising (2026-11-27, 0.3.3), chuột BLE đã kiểm tra ngày 2026-11-05 trên MtkBtFw cũ, **chưa test trên 0.3.3**, `bluetoothd` không còn lỗi lúc khởi động từ 2026-11-23. `MtkBtFw` 0.3.1 làm màn hình đăng nhập chậm thêm 4 đến 9 giây; chưa đo lại trên 0.3.3. MT7922 (`0489:e0f6`): thử nghiệm, chưa test trên 0.3.3. Chưa ghi nhận ghép bàn phím. `BtLeDlFix` vá `bluetoothd`: chạy `tools/btledl-check.py` sau mỗi lần cập nhật macOS | ✅ controller chạy; chuột BLE và tai nghe classic kết nối được. Chưa ghi nhận ghép bàn phím |
 | AirDrop / AWDL / Continuity | 🔧 đang làm ở nhánh `dev/awdl` (mặc định tắt) | ❌ |
 
 Kext native gắn với đúng bản build macOS mà nó được viết cho: bản Tahoe mới kiểm tra trên `25G241`, bản Sequoia trên `24H32`.
@@ -66,9 +66,9 @@ Từng bước, cách kiểm tra, sửa lỗi và quay lại: **[docs/GUIDE.vi.m
 
 | Nhánh | Nội dung |
 |---|---|
-| `main` | trạng thái đã phát hành: mã nguồn của `v2.0-beta.1` (Wi-Fi, merge từ `dev/awdl` ngày 2026-11-25) và `bt-v1.1` (`MtkBtFw` 0.3.1). Code AWDL có trong cây nhưng tắt nếu không có `itlmt_awdl=1` |
+| `main` | trạng thái đã phát hành: mã nguồn của `v2.0-beta.1` (Wi-Fi, merge từ `dev/awdl` ngày 2026-11-25) và `bt-v1.2` (`MtkBtFw` 0.3.3). Code AWDL có trong cây nhưng tắt nếu không có `itlmt_awdl=1` |
 | `dev/awdl` | phát triển Wi-Fi, bản đang chạy trên máy test; đang làm AirDrop / AWDL (chưa dùng được). Chỉ chạy khi có `itlmt_awdl=1`. Có thể panic |
-| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x, nguồn của `bt-v1.1` (commit `668f400`; đầu nhánh là 0.4.0, chưa từng chạy) |
+| `fix/bt-waitquiet` | Bluetooth: `MtkBtFw` 0.3.x, nguồn của `bt-v1.1` (commit `668f400`; đầu nhánh là 0.4.0, chưa từng chạy). `bt-v1.2` lấy từ `main` |
 | `sequoia` | nhánh macOS 15 đã đóng băng, nguồn của `v1.0` / `v1.1` |
 
 | Release | macOS | Gồm |
@@ -78,6 +78,7 @@ Từng bước, cách kiểm tra, sửa lỗi và quay lại: **[docs/GUIDE.vi.m
 | `bt-v1.0` | 15 Sequoia | Bluetooth: `MtkBtFw.kext` + `BtLeDlFix.kext`, chép nguyên từ `kext-v1.1` của `ga403wm-hackintosh`. Không dùng cho Tahoe |
 | `v2.0-beta.1` | 26 Tahoe | Wi-Fi: `itlmt7925.kext` + `itlmt7925Native.kext`, pre-release (nhánh `dev/awdl`) |
 | `bt-v1.1` | 26 Tahoe | Bluetooth: `MtkBtFw.kext` 0.3.1 + `BtLeDlFix.kext` 1.4.0 (nhánh `fix/bt-waitquiet`, commit `668f400`) |
+| `bt-v1.2` | 26 Tahoe | Bluetooth: `MtkBtFw.kext` 0.3.3 (thêm id MT7925, MT7922 thử nghiệm) + `BtLeDlFix.kext` 1.4.0 (`main`, commit `fcc0baa`) |
 
 Release được tạo bằng tay; CI chỉ build và chạy test.
 
@@ -96,7 +97,7 @@ Tất cả thuộc cùng một dự án: macOS trên một máy ASUS ROG Zephyru
 | Repo | Là gì | Release mới nhất |
 |---|---|---|
 | [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | Repo chính: EFI OpenCore, ACPI, ghi chú cài đặt, tình trạng và roadmap, các kext phụ | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
-| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | Wi-Fi (`itlmt7925`, `itlmt7925Native`) và Bluetooth (`MtkBtFw`, `BtLeDlFix`) cho MediaTek MT7925 | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
+| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | Wi-Fi (`itlmt7925`, `itlmt7925Native`) và Bluetooth (`MtkBtFw`, `BtLeDlFix`) cho MediaTek MT7925 | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.2](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.2) |
 | [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | App RogControl, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (chế độ hiệu năng, quạt, giới hạn sạc, chế độ GPU, Slash, phím Fn) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
 | [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork của [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | Driver màn hình và Metal cho Radeon 890M của máy này (`NMXGPU` và Metal plugin), giấy phép PolyForm Noncommercial | tag mã nguồn [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
 | [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork của [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | Hypervisor AMD-V cho Docker và Android emulator trên Ryzen, kèm các bản sửa cho máy này | tag mã nguồn [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
