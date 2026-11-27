@@ -2629,6 +2629,12 @@ void itlmt7925::m3Link()
     m3linkUp = true;
     m3sleepy = true;
     uint32_t t0 = nowMs(), lastStat = 0, lastActive = t0;
+    // Pump pacing (WIFI-PUMP-IRQ-DESIGN.md, design B). itlmt_pollbo=0: the old tail (IODelay 200 us for 50 ms after any frame, then
+    // IOSleep 1). Otherwise empty passes back off 50 -> 100 -> ... -> 1000 us inside the 50 ms window, and idle sleeps may coalesce.
+    // The RX data ring (1536 slots) holds ~60 ms of frames at 36 MB/s, so a 1 ms cap cannot overflow it.
+    uint32_t pollBo = 1;
+    PE_parse_boot_argn("itlmt_pollbo", &pollBo, sizeof(pollBo));
+    uint32_t backoffUs = 50, passes = 0, passWinMs = t0;
     linkUpMs = t0;
     lastReorderMs = t0;
     m3lost = false;
@@ -2786,9 +2792,26 @@ void itlmt7925::m3Link()
             wifiLink();
         }
         if (m3stepDown) return;
+        passes++;
+        if (now - passWinMs >= 1000) {                       // passes per second, readable without root (ioreg)
+            setProperty("itlmt_pump_passes_per_s", (unsigned long long)(passes * 1000ull / (now - passWinMs)), 32);
+            passes = 0;
+            passWinMs = now;
+        }
         if (!fastActive) { IOSleep(1); continue; }           // legacy path: exactly as verified (1 ms poll)
-        if (act) { lastActive = now; IODelay(20); }
-        else if (now - lastActive < 50) IODelay(200);       // traffic is bursty (A-MPDUs): keep polling closely for a while
-        else IOSleep(1);
+        if (!pollBo) {
+            if (act) { lastActive = now; IODelay(20); }
+            else if (now - lastActive < 50) IODelay(200);   // traffic is bursty (A-MPDUs): keep polling closely for a while
+            else IOSleep(1);
+        } else if (act) {
+            lastActive = now;
+            backoffUs = 50;
+            IODelay(20);
+        } else if (now - lastActive < 50) {
+            IODelay(backoffUs);                              // 50, 100, 200, 400, 800, 1000 us between empty passes
+            backoffUs = backoffUs >= 500 ? 1000 : backoffUs * 2;
+        } else {
+            IOSleepWithLeeway(1, 1);                         // idle: 1 ms, the timer may coalesce up to 2 ms
+        }
     }
 }
