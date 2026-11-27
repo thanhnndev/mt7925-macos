@@ -394,6 +394,11 @@ void MtkBtFw::run()
         say("MT7922 needs firmware suffix %x; only _1_1 is embedded", (fwVer & 0xff) + 1);
         ok = false;
     }
+    else if (ok && chipId == 0x7922) {
+        // subsysReset() is the MT7925 (CONNV3) sequence; MT7922 resets differently in Linux, so it is never sent there.
+        if (!fwAlive) { say("MT7922 firmware of the previous session is dead; cold boot needed"); ok = false; }
+        else ok = bringUp();
+    }
     else if (ok) {
         if (!fwAlive) { say("firmware of the previous session is dead, resetting"); ok = subsysReset(); }
         if (ok && !bringUp()) {
