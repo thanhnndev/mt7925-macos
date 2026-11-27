@@ -51,6 +51,27 @@ else                             IOSleep(1);
   - the pump's core never stays in CC6;
   - at rest (no traffic) 1000 wakeups/s, about 1 %.
 
+## Measured with root (kt-probe, 20:22, 30 s, 10 ms spindump plus powermetrics)
+
+- kernel_task: 102-118 ms/s in powermetrics (10-12 % of a core), with ~4.66k interrupt wakeups/s. The thread CPU times in the spindump
+  add up to 2.18 s per 30 s (7.3 %); the rest is interrupt time.
+- Busiest threads:
+
+  | thread | CPU |
+  |---|---|
+  | unnamed 0x1b5, priority 81 | 0.427 s (1.4 %) |
+  | `thread call high #9` (NMXGPU) | 0.412 s |
+  | `VoodooI2CDeviceNub` | 0.364 s |
+  | `thread call kernel-high #3` | 0.139 s |
+  | `dlil_input_en1` | 0.096 s |
+  | `IO80211RangingManager` | 0.084 s |
+
+- 0x1b5 spends nearly all its samples blocked in `thread_block_reason`, with a `delay_for_interval` frame (IODelay), and every frame
+  above the kernel is unresolved ([0x0], an AuxKC kext). That matches the pump. The named `itlmt7925Wifi` work-loop thread had not
+  run for 1365 s.
+- So the pump thread itself is **≤ 1.4 % of a core**, plus its share of the timer interrupts. That is lower than the 3-5 % estimate
+  above. Design B saves about 1 %, and A saves that plus the timer wakeups and idle C-state time.
+
 ## Design A: MSI with a NAPI-style loop (the real fix)
 
 What Linux mt7925e does: one MSI vector. The hard IRQ writes `HOST_INT_ENA = 0` and schedules a tasklet. The tasklet reads and
