@@ -27,6 +27,32 @@ standard HCI controller, but only after its RAM code has been downloaded; macOS 
 > shared radio, docs/ROADMAP-AWDL.md §10.29); whether that matters is not known. Recovery: a full shutdown (cold boot) reloads
 > all sections.
 
+## Other MT7925 cards (USB ids)
+
+`MtkBtFw` matches the USB Bluetooth half by vendor/product id and then checks the chip id (`7925`) before it loads anything,
+so a wrong match does nothing. Since 0.3.2 it matches three ids:
+
+| USB id | Card / machine | Tested with this loader |
+|---|---|---|
+| `0489:e11e` | ASUS GA403WM (the reference machine) | yes, daily use |
+| `0e8d:8c38` | HP OEM MT7925 combo card (Wi-Fi subsystem `103c:8c38`), HP laptop with a Ryzen 9 9955HX | yes, by the reporter of [ga403wm-hackintosh#10](https://github.com/thanhnndev/ga403wm-hackintosh/issues/10) on macOS 15.8.1, who changed the ids by hand before 0.3.2 |
+| `0489:e111` | Lenovo Legion 5 15IAX10 | not with this loader; works with watchthelight's loader on the same chip |
+
+**If the firmware loads (`bt-state` = `ready`) but System Information still shows a Broadcom UART placeholder with address
+NULL**, `bluetoothd` is refusing the controller, not the firmware. BlueToolFixup 2.7.x needs two NVRAM values under
+`7C436110-AB2A-4BBB-A880-FE41995C9F82`, listed in both `NVRAM > Add` and `NVRAM > Delete` of `config.plist`:
+
+| Key | Type | Value |
+|---|---|---|
+| `bluetoothExternalDongleFailed` | Data | `00` |
+| `bluetoothInternalControllerInfo` | Data | exactly **14** zero bytes (with 16, `bluetoothd` logs `CFDataGetLength(internalControllerInfoRef) != 14` and falls back to the UART placeholder) |
+
+Check after a reboot with `nvram -p | grep -i bluetooth`. This diagnosis and the exact values come from
+[watchthelight](https://github.com/watchthelight) in ga403wm-hackintosh#10 (notes:
+[watchthelight-labs/mt7925-hackintosh-bluetooth](https://github.com/watchthelight-labs/mt7925-hackintosh-bluetooth#which-cards-match));
+it fixed the HP card above. A warm reboot can leave the firmware half-loaded (section 2 answers `status 255`): use a cold
+boot, see the warm-reboot section below.
+
 ## Status (2026-10-11, first boot with it)
 
 Works as a controller: `bt-state` = ready after 5.2 s (sections 0-2 downloaded: 74 176 + 332 224 + 41 472 bytes, 0 dropped
