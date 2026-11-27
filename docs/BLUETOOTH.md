@@ -130,7 +130,7 @@ module starts (`stack:ON`), but advertising flaps ~20×/s: in 5 min 6290× `Adve
 **Second cause.** bluetoothd's `STATUS 7xx` is 700 + the HCI error code (`701` = 0x01 Unknown Command for VSC 0xFD3C).
 * 718 = 0x12 *Invalid HCI Command Parameters*, from `multipleAdvStartCb`: the callback of command index 0xcf sent with
   (Enable 1, Num_Sets 1, handle, Duration 0, Max events 0), i.e. **LE Set Extended Advertising Enable**. The set being
-  started advertises from a random address (`address: DB:9D:83:0E:07:AE type:1`). Core spec: Enable on a set whose own
+  started advertises from a random address (`address: <mac-1> type:1`). Core spec: Enable on a set whose own
   address type is random and whose random address was never set returns 0x12.
 * The random address is written by `OI_HCI_CMD_LE_SetAdvertisingSetRandomAddress` (command index 0xcb, function
   `__text+0x1f713b`), which sends nothing (and returns success) unless a flag is 1. That flag defaults to 1 and initCoreStack
@@ -209,7 +209,7 @@ stack start answers 0x00 (only the two early 0x2035 still get 0x42, harmless now
 `2037 02 ... ff4c0005 ...` st=00, `2035 02 ...` st=00, `2039 010102000000` st=00. No `result 718` / `result 766` in the log;
 after the first seconds the HCI command rate drops to scan on/off only (~3 commands / 10 s). The mouse could not be checked
 this way: the ad-hoc-signed copy is refused the System keychain item that holds the pairing keys (`Failed to query keychain
-for device Public C6:54:32:2F:69:01 with result -25308`); the kext patches the signed system binary, so that does not
+for device Public <mac-2> with result -25308`); the kext patches the signed system binary, so that does not
 apply after a reboot.
 
 Staged 2026-11-04 23:43: `Kexts/BtLeDlFix.kext` = patches 1-4; the build that was there (no advertising patches) is
@@ -246,10 +246,10 @@ Unique in 25G241. Staged 2026-11-05 10:36: `Kexts/BtLeDlFix.kext` = v1.2.0 (leng
 `LinkReady took 180ms from connectionComplete`, no `No database exists`, `enableBTSpecAdvertisingSets=1`, 0× 718 / 766,
 6× `Started advertising successfully`.
 
-**On air, 2026-11-05 10:54 (nRF Connect, Android):** `57:8F:05:5D:57:87`, -37 dBm, 31 ms interval, Apple data
+**On air, 2026-11-05 10:54 (nRF Connect, Android):** `<mac-3>`, -37 dBm, 31 ms interval, Apple data
 `05 12 40 F5 4A 8E 00 00 00 00 00 03 21 1B C9 E4 88 83 08 0E 00` (AirDrop). Same bytes as the Mac's
 `CMD 2037 02 … ff4c00051240f54a8e…` in the HCI trace, and the address is the one written by `CMD 2035 02 87575d058f57`.
-Also on air: `74:14:C0:D8:50:09` with `09 08 12 02 C0 A8 01 B5 …` (set 0, `4C 00 09`). The Mac's BLE AirDrop advert works.
+Also on air: `<mac-4>` with `09 08 12 02 C0 A8 01 B5 …` (set 0, `4C 00 09`). The Mac's BLE AirDrop advert works.
 Next: iPhone ↔ Mac AirDrop.
 
 ### Next-boot test
@@ -312,7 +312,7 @@ reset on failure.
 **Live recovery 2026-11-08 18:2x (no reboot).** `tools/mtkbtctl recover fw/BT_RAM_CODE_MT7925_1_1_hdr.bin`: CONNV3 subsystem
 reset (`reset done`, dev id 7925), all three sections downloaded again (0 and 1 were no longer "already loaded"), FUNC_CTRL,
 HCI Reset → `0e 04 01 03 0c 00`. Then NVRAM `bluetoothExternalDongleFailed=%00` and one `launchctl kickstart -k
-system/com.apple.bluetoothd`: `Stack Did Start`, System Information `Address DC:56:7B:34:81:D6, State On, THIRD_PARTY_DONGLE,
+system/com.apple.bluetoothd`: `Stack Did Start`, System Information `Address <mac-5>, State On, THIRD_PARTY_DONGLE,
 v9736 c4881`. (The first try needed the kickstart because a Command Complete of a test HCI Reset was still queued in the chip and
 bluetoothd took it as an orphan event; MtkBtFw always consumes its own event.)
 

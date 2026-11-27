@@ -5,7 +5,7 @@ Stage b (`itlmt_native=1 itlmt_native_if=1 itlmt_native_dp=1 itlmt_native_nvtrac
 
 **The Wi-Fi stack came up and worked; the scan list was garbled.** `itlmt7925Wifi` initialized against
 `IO80211_kexts-1566.5`, the interface registered (role 1, `mk:startWithInfo ok`, service registered, `ifnet_attach` gave
-**en5**, `IOSkywalkLegacyEthernetInterface`, station address `de:56:7b:34:81:d5`), radio power from System Settings was
+**en5**, `IOSkywalkLegacyEthernetInterface`, station address `<mac-36>`), radio power from System Settings was
 accepted and the scans ran: the core did 13 live scans (`scan finished done=1@2410ms rx=85 bcn=83 aps=48` and siblings,
 `scan_req rc=0` every time) and all 84 of airportd's `APPLE80211_IOC_SCAN_REQ` calls answered GOOD (the rest of the 84
 results came from airportd's own cache). `scan:delivered 48 of 48` on every delivery.

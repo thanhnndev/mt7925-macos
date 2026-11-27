@@ -65,7 +65,7 @@ timestamps stayed at their link-up values, the 60 s check fired on schedule, and
 The scan request (`itlmt7925_m2.cpp`, `UNI_SCAN_CHANNEL`) listed 2.4 GHz 1–11 and 5 GHz {36, 40, 44, 48, 149, 153,
 157, 161, 165} — while the channel domain (`itlmt7925_m3.cpp`, `UNI_SET_DOMAIN_INFO`) already allowed the whole 5 GHz
 set **including the DFS bands 52–64 and 100–144**. Any AP on a DFS channel (the common pick for 80 MHz in auto mode, and
-the user's case: a phone sees "Kefoff Coffee" at 5 GHz >400 Mb/s, this Mac never did) could not appear. The scan list
+the user's case: a phone sees "<ssid-B>" at 5 GHz >400 Mb/s, this Mac never did) could not appear. The scan list
 now covers 2.4 GHz 1–13 and all of 5 GHz, and the driver's reported supported-channel list
 (`itlmt7925Native` `kScanChannels`, used by 0x1b/0xfe) mirrors it. Whether the firmware probes passively on DFS with
 the scan marked active is a hardware question; Linux's mt7925 sends the same shape and lets the firmware decide.
@@ -86,13 +86,13 @@ Boot with the stage-b build and watch:
 2. `log show --last boot --predicate 'eventMessage CONTAINS "missed beacons"'` — expect nothing.
 3. `/Library/Logs/DiagnosticReports/corecaptured-*.ips` — no new crash after ~2 minutes idle (the crash was the
    malformed core capture from the missed-beacons fault report; without the fault there is nothing to parse).
-4. Wi-Fi list: a network known to be on a DFS channel (e.g. "Kefoff Coffee" 5 GHz) should now appear.
+4. Wi-Fi list: a network known to be on a DFS channel (e.g. "<ssid-B>" 5 GHz) should now appear.
 
 ## Hardware result (boot 2026-10-17 14:33, stage b, both kexts from 2d2c763)
 
 All four points confirmed on the first boot, plus two findings that shaped the follow-up round:
 
-* **The DFS fix is what mattered**: the user connected to "Kefoff Coffee" — previously invisible — and the link came up on
+* **The DFS fix is what mattered**: the user connected to "<ssid-B>" — previously invisible — and the link came up on
   **channel 52, a DFS channel** (`system_profiler SPAirPortDataType`: `Channel: 52 (5GHz, 20MHz)`; the core's fast plan
   log: `fast: on lvl=6 ht=1 vht=1 he=1/1 bw=3 center=50 nss=2 rate~2402` — 160 MHz HE 2x2 negotiated). The link_off at
   14:37:09 is the *switch* to that network (`AutoJoin: _handleLinkEvent: Join is in progress, suppressing link down
@@ -125,7 +125,7 @@ All four points confirmed on the first boot, plus two findings that shaped the f
   delta=9` (the posts were always running; they are visible now).
 * `getNSS` answers: the call ring shows `I:161x1` followed by `S:1fe x1` (slot 510 = 0x1fe) — no retry storm like the
   512 refusals of the previous boot; `itlmt_ioctl_rejected` stays at 65 instead of climbing past 700.
-* Link again on "Kefoff Coffee" ch 52 (DFS), `fast: on lvl=6 … bw=3 center=50 nss=2 rate~2402` (160 MHz HE 2x2),
+* Link again on "<ssid-B>" ch 52 (DFS), `fast: on lvl=6 … bw=3 center=50 nss=2 rate~2402` (160 MHz HE 2x2),
   rx 26066 / tx 26972 with 0 drops; `networkQuality`: down 212.6 / up 73.2 Mb/s, idle 52 ms.
 * Unrelated to Wi-Fi: the same reboot produced one `Kernel-2026-10-17-150228.panic` — a page fault in
   `IOFramebuffer::powerStateWillChangeTo + 0x25` (com.apple.iokit.IOGraphicsFamily) 10.5 s into boot, i.e. the GPU /

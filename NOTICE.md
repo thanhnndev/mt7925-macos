@@ -14,8 +14,9 @@ Author and maintainer: thanhnndev, <https://github.com/thanhnndev>. Everything i
 
 ## Clean room
 
-No code from `itlwm`, `AirportItlwm`, OWL, OpenDrop or opendrop-awdl (all GPL) was read, copied or paraphrased. AWDL protocol
-facts come from published papers and from Apple's own binaries.
+No code from `itlwm`, `AirportItlwm`, OWL, OpenDrop or opendrop-awdl (all GPL) was copied or paraphrased. Since 2026-10-26 (project owner's decision, `docs/ROADMAP-AWDL.md`), OWL and OpenDrop have been
+read for AWDL / AirDrop protocol facts only (frame layouts, TLVs, timing, election, ports); the facts used and the commits read
+are listed in `docs/AWDL-PROTOCOL-REFERENCE.md`. The rest comes from the published papers and from Apple's own binaries.
 
 ## History
 
